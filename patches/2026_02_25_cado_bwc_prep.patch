@@ -1,0 +1,15 @@
+diff --git a/linalg/bwc/prep.cpp b/linalg/bwc/prep.cpp
+index e94d47c9f..249f7c709 100644
+--- a/linalg/bwc/prep.cpp
++++ b/linalg/bwc/prep.cpp
+@@ -465,8 +465,8 @@ struct prep_object {
+          * A better way would probably be to verify the absence of this
+          * phenomenon up to a certain bounded degree.
+          */
+-        unsigned int my_nx = std::max((int)iceildiv(Z.size(), bw->m), 4);
+-        if (my_nx > 4 && tcan_print) {
++        unsigned int my_nx = std::max((int)iceildiv(Z.size(), bw->m), 16);
++        if (my_nx > 16 && tcan_print) {
+             fmt::print("Because of zero columns, we need"
+                        " at least {} coordinates per x vector\n",
+                        my_nx);

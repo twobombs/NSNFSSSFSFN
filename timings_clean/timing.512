@@ -1,0 +1,70 @@
+----Timing Summary-----
+run_precomp:   1035.38s (cputime: 392322.84s)
+        polysel_higheffort_select: Not run
+        polysel_higheffort_ropt: Not run
+        polysel_higheffort_candidates: Not run
+        run_polysel:    215.01s (cputime: 28078.32s)
+                write_polyfile:    214.55s (cputime: 28077.25s)
+        call_algebraic_query_sieving:    328.11s (cputime: 196123.37s)
+                aqrels_slurm_sieving:    251.26s
+                aqrels_extra_slurm_sieving: Not run
+        call_fb_extension_sieving:    350.86s (cputime: 167785.11s)
+                extension_slurm_sieving:    261.89s
+                call_todo_sieving:    110.74s (cputime: 1972.29s)
+        filter_relation_file:     41.01s (cputime: 53.47s)
+                build_killer_rels_dict:     15.92s (cputime: 15.87s)
+run_queries:     78.15s (cputime: 1706.16s)
+        do_rational_queries:     52.82s (cputime: 1416.24s)
+        do_algebraic_queries:     25.33s (cputime: 271.86s)
+run_indiv:   1208.20s (cputime: 8931.62s)
+        call_descents: Not run
+        call_descents_slurm:   1208.11s (cputime: 8929.21s)
+                descent_init:    102.00s
+                descent_middle:    909.00s
+run_linalg:    363.00s (cputime: 5274.88s)
+        construct_S:      2.43s (cputime: 3.50s)
+        run_S_sanity_checks:     11.11s (cputime: 11.10s)
+        run_ST_sanity_checks:     20.97s (cputime: 20.97s)
+        truncate_S:     31.84s (cputime: 41.79s)
+                algebraic_consistency_check: Not run
+                parse_fb_extension_relations:     14.52s
+                convert_to_indexed_relation:      8.65s
+        make_linalg_system:     23.18s (cputime: 160.50s)
+                sm_init:      0.00s
+                compute_sm_block_for_matrix:     18.88s (cputime: 140.92s)
+                maps_from_more_ab:     21.41s (cputime: 390.23s)
+                C_block:      0.00s
+                block_matrix:      3.65s
+                SC_vector:      0.44s
+        solve_filtering_plus_sage: Not run
+        solve_filtering_plus_bwc:    166.38s (cputime: 4745.72s)
+                apply_filtering_to_target:     22.63s (cputime: 404.15s)
+                        killer relations maps_from_more_ab:     21.20s
+                write_tgt_vector:      0.16s
+                linalg/bwc/bwc.pl (complete):     79.26s
+                        bwc prep:      3.54s (cputime: 2.58s)
+                        bwc krylov:     16.38s (cputime: 1266.59s)
+                        bwc lingen:     39.47s (cputime: 1746.64s)
+                        bwc mksol:     12.29s (cputime: 1234.88s)
+                        bwc gather:      5.33s (cputime: 5.07s)
+                        bwc cleanup:      2.26s (cputime: 0.28s)
+                making sol_matrix:      0.19s
+                assert sol_matrix:     52.22s
+                small_matrix_on_the_right:      2.42s
+                second_solve.left_kernel:      0.02s
+                final solve_left:      0.07s
+                sol_f computations:      7.49s
+                recover sol from sol_f:      1.10s
+        solve_filtering_plus_bwc_chars: Not run
+        solve_sage: Not run
+        run_sol_sanity_checks:     21.79s (cputime: 21.79s)
+run_eth_root:   1518.88s (cputime: 2924.11s)
+        CRT_R_alpha: Not run
+        eth_root_montgomery:   1492.99s (cputime: 1478.92s)
+        padic_eth_root:     39.82s (cputime: 39.80s)
+        U reconstruction:      8.10s
+        u/v*S(m)^d:      0.01s
+Queries:
+        Rational: 7603553
+        Algebraic: 617863
+        Extension: 782298

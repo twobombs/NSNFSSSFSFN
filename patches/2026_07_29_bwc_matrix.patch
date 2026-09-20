@@ -1,0 +1,275 @@
+diff --git a/tests/sagemath/cado_sage/bwc/matrix.py b/tests/sagemath/cado_sage/bwc/matrix.py
+index 646573b0d..4ed20d3ff 100644
+--- a/tests/sagemath/cado_sage/bwc/matrix.py
++++ b/tests/sagemath/cado_sage/bwc/matrix.py
+@@ -3,6 +3,10 @@ import re
+ import sys
+ import math
+ import copy
++import mmap
++import tqdm
++
++from concurrent.futures import ProcessPoolExecutor
+ 
+ from sage.matrix.constructor import matrix
+ from sage.rings.finite_rings.finite_field_constructor import GF
+@@ -18,6 +22,53 @@ from .balancing import BwcBalancing, BwcShuffling
+ 
+ from sage.rings.integer_ring import ZZ
+ 
++import numpy as np
++from scipy.sparse import csr_array
++
++class M_wrapper(object):
++    # Wrapper around the expected M sage matrix.
++    # We call nrows() and ncols() frequently.
++    # Otherwise it's a scipy 64-bit-integer matrix.
++
++    def __init__(self, scipy_matrix, nrows, ncols):
++
++        self._nrows = nrows
++        self._ncols = ncols
++        self._scipy_M = scipy_matrix
++
++    def nrows(self):
++        return self._nrows
++
++    def ncols(self):
++        return self._ncols
++
++    def scipy_M(self):
++        return self._scipy_M
++
++def b2i(b, signed=False):
++    return int.from_bytes(b, 'little', signed=signed)
++
++def fast_col_parse_process(args):
++    batch_inline_data = []
++    batch_inline_col_weights = []
++    row_idx, rows = args
++    for row in rows:
++        byte_idx = 0
++        row_nbytes = len(row)
++        while byte_idx < row_nbytes:
++            col_bytes = row[byte_idx : byte_idx + 8]
++            col_idx = b2i(col_bytes[:4])
++            if col_idx >= len(batch_inline_col_weights):
++                pad = col_idx + 1 - len(batch_inline_col_weights)
++                batch_inline_col_weights += [0] * pad
++            batch_inline_col_weights[col_idx] += 1
++            val = b2i(col_bytes[4:], signed=True)
++            byte_idx += 8
++            batch_inline_data.append((row_idx, col_idx, val))
++        row_idx += 1
++
++    return batch_inline_col_weights, batch_inline_data
++
+ 
+ class BwcMatrix(object):
+     """
+@@ -41,9 +92,13 @@ class BwcMatrix(object):
+                  params: BwcParameters,
+                  matrix=None,
+                  wdir=None,
+-                 balancing_filename=None):
++                 balancing_filename=None,
++                 nthreads=1,
++                 sage_or_scipy=True):
+         self.params = params
++        self.nthreads = nthreads
+         self.filename = matrix
++        self.sage_or_scipy = sage_or_scipy
+         if wdir is None:
+             self.wdir = os.path.dirname(self.filename)
+         else:
+@@ -106,7 +161,7 @@ class BwcMatrix(object):
+             # We're really in bad shape if an exception occurs here.
+             # We're not even trying to salvage the BwcMatrix object, as
+             # the error is most probably obvious.
+-            print("Exception while reading {self.filename} {NOK}",
++            print(f"Exception while reading {self.filename} {NOK}",
+                   file=sys.stderr)
+             raise e
+ 
+@@ -198,6 +253,7 @@ class BwcMatrix(object):
+         self.row_weights = []
+         try:
+             fn = re.sub(r"\.bin$", ".rw.bin", self.filename)
++            print(f"Starting to read row weights from {fn}")
+             self.nrows_orig = os.stat(fn).st_size // 4
+             self.row_weights_filename = fn
+             with open(self.row_weights_filename, 'rb') as fm:
+@@ -210,6 +266,7 @@ class BwcMatrix(object):
+         self.col_weights = []
+         try:
+             fn = re.sub(r"\.bin$", ".cw.bin", self.filename)
++            print(f"Starting to read col weights from {fn}")
+             self.ncols_orig = os.stat(fn).st_size // 4
+             self.col_weights_filename = fn
+             with open(self.col_weights_filename, 'rb') as fm:
+@@ -222,6 +279,7 @@ class BwcMatrix(object):
+         inline_data = []
+         inline_col_weights = []
+         inline_row_weights = []
++        print(f"Starting to parse {self.filename} for self.params.p = {self.params.p}")
+         if self.params.p == 2:
+             with open(self.filename, "rb") as fm:
+                 i = 0
+@@ -242,32 +300,68 @@ class BwcMatrix(object):
+                     where = f"at byte 0x{fm.tell():04x} in matrix file"
+                     raise ValueError(f"Cannot set {what} {where} {NOK}")
+         else:
+-            with open(self.filename, "rb") as fm:
+-                i = 0
+-                j = 0
+-                v = 0
+-                try:
+-                    while (length := u32(fm, may_fail=True)) is not None:
+-                        for jj in range(length):
+-                            j = u32(fm)
+-                            if j >= len(inline_col_weights):
+-                                pad = j + 1 - len(inline_col_weights)
+-                                inline_col_weights += [0] * pad
+-                            v = s32(fm)
+-                            inline_col_weights[j] += 1
+-                            inline_data.append((i, j, v))
+-                        i += 1
+-                        inline_row_weights.append(length)
+-                except IndexError:
+-                    what = f"entry {i},{j} in matrix"
+-                    where = f"at byte 0x{fm.tell():04x} in matrix file"
+-                    raise ValueError(f"Cannot set {what} {where} {NOK}")
++            mem_total_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
++            if self.nthreads > 1 and 2 * os.path.getsize(self.filename) < mem_total_bytes:
++                print(f"loading {self.filename} into memory")
++
++                # Simpler version of u32 and s32 from cado_sage.tools (with fewer conditionals)
++                def u32_simple(f):
++                    data = f.read(4)
++                    if not data:
++                        return None
++                    return int.from_bytes(data, 'little')
++
++                with open(self.filename, mode="r", encoding="ascii") as matrix_fp:
++                    with mmap.mmap(matrix_fp.fileno(), length=0, access=mmap.ACCESS_READ) as matrix_mmap:
++                        print(f"Starting to parse rows of {self.filename}.")
++                        rows = []
++                        while (length := u32_simple(matrix_mmap)) is not None:
++                            rows.append(matrix_mmap.read(8 * length))
++                            inline_row_weights.append(length)
++                    print(f"Finished parsing rows of {self.filename}.")
++
++                    print(f"Start to parse columns of {self.filename} with {self.nthreads} processes.")
++                    with ProcessPoolExecutor(max_workers=self.nthreads) as executor:
++                        batchsize = math.ceil(len(inline_row_weights) / self.nthreads)
++                        batch_args = [(i * batchsize, rows[i * batchsize : (i+1) * batchsize]) for i in range(self.nthreads)]
++                        for batch_icw, inline_data_batch in tqdm.tqdm(executor.map(fast_col_parse_process, batch_args)):
++                            icw_len = len(inline_col_weights)
++                            batch_icw_len = len(batch_icw)
++                            for col_idx in range(min(icw_len, batch_icw_len)):
++                                inline_col_weights[col_idx] += batch_icw[col_idx]
++                            inline_col_weights += batch_icw[icw_len:]
++                            inline_data += inline_data_batch
++                    print(f"Done parsing columns")
++            else:
++                with open(self.filename, "rb") as fm:
++                    i = 0
++                    j = 0
++                    v = 0
++                    try:
++                        while (length := u32(fm, may_fail=True)) is not None:
++                            for jj in range(length):
++                                j = u32(fm)
++                                if j >= len(inline_col_weights):
++                                    pad = j + 1 - len(inline_col_weights)
++                                    inline_col_weights += [0] * pad
++                                v = s32(fm)
++                                inline_col_weights[j] += 1
++                                inline_data.append((i, j, v))
++                            i += 1
++                            inline_row_weights.append(length)
++                    except IndexError:
++                        what = f"entry {i},{j} in matrix"
++                        where = f"at byte 0x{fm.tell():04x} in matrix file"
++                        raise ValueError(f"Cannot set {what} {where} {NOK}")
++        print("done parsing weights")
+         if self.row_weights:
++            print("assert self.row_weights == inline_row_weights")
+             assert self.row_weights == inline_row_weights
+         else:
+             self.row_weights = inline_row_weights
+             self.nrows_orig = len(self.row_weights)
+ 
++        print("starting col_weights asserts")
+         if self.col_weights:
+             icw = inline_col_weights
+             assert self.col_weights[:len(icw)] == icw
+@@ -295,6 +389,7 @@ class BwcMatrix(object):
+ 
+         self.ncoeffs = len(inline_data)
+ 
++        print("compute r2")
+         if self.nrows_orig:
+             r2 = sum([float(x * x) for x in inline_row_weights]) / self.nrows_orig
+             rmean = float(self.ncoeffs / self.nrows_orig)
+@@ -303,6 +398,7 @@ class BwcMatrix(object):
+             rmean = 0
+             rsdev = 0
+ 
++        print("compute c2")
+         if self.ncols_orig:
+             c2 = sum([float(x * x) for x in inline_col_weights]) / self.ncols_orig
+             cmean = float(self.ncoeffs / self.ncols_orig)
+@@ -323,23 +419,43 @@ class BwcMatrix(object):
+             self.nrows = max(self.nrows_orig, self.ncols_orig)
+             self.ncols = max(self.nrows_orig, self.ncols_orig)
+ 
+-        self.MZ = matrix(ZZ, self.nrows, self.ncols, sparse=True)
+-        if self.params.p == 2:
+-            for i, j in inline_data:
+-                if self.MZ[i, j] != 0:
+-                    print(f"Warning: repeated entry in matrix data {EXCL}")
+-                self.MZ[i, j] += 1
+-        else:
++        print("assume p > 2")
++        assert self.params.p > 2
++
++        if self.sage_or_scipy:
++            self.MZ = matrix(ZZ, self.nrows, self.ncols, sparse=True)
+             for i, j, v in inline_data:
+                 if self.MZ[i, j] != 0:
+                     print(f"Warning: repeated entry in matrix data {EXCL}")
+                 self.MZ[i, j] += v
++
++            self.M = self.MZ
++            #self.M = self.MZ.change_ring(GF(self.params.p))
++
++        else:
++            shape = (self.nrows_orig, self.ncols_orig)
++            l = self.ncoeffs
++
++            rows = [None] * l
++            cols = [None] * l
++            data = [None] * l
++            i = 0
++
++            for r, c, v in inline_data:
++                rows[i] = r
++                cols[i] = c
++                data[i] = v
++                i += 1
++
++            self.M = M_wrapper(
++                csr_array((data, (rows, cols)), shape=shape, dtype=np.float64),
++                self.nrows, self.ncols)
++            self.MZ = None
++
+         if self.balancing is not None:
+             self.balancing.read()
+             self.S = BwcShuffling(self.params, self)
+ 
+-        self.M = self.MZ.change_ring(GF(self.params.p))
+-
+     def __subM(self, i, j):
+         return self.submatrices[i][j].M
+ 

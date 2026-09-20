@@ -1,0 +1,31 @@
+---------------------
+---- n768 timing ----
+---- =========== ----
+total_polyselect                           2,255.62 (cpu h)            2.01 (wall h)
+   polysel                                    26.40 (cpu h)            0.01 (wall h)
+   polyropt                                  633.60 (cpu h)            0.25 (wall h)
+   poly_las_estimates                      1,595.62 (cpu h)            1.75 (wall h)
+algebraic_sieving                         25,813.61 (cpu h)           16.52 (wall h)
+total_filter                                   0.77 (cpu h)            0.59 (wall h)
+   killer_rels                                 0.17 (cpu h)            0.20 (wall h)
+extension_sieving                        459,553.46 (cpu h)          480.00 (wall h)
+total_descent                            364,573.53 (cpu h)          251.72 (wall h)
+   descent_ecm_init                       10,560.00 (cpu h)            4.33 (wall h)
+   descent_large_q                            98.22 (cpu h)            1.34 (wall h)
+   descent_large_las                         278.61 (cpu h)            2.33 (wall h)
+   descent_bottom                        353,636.70 (cpu h)          243.72 (wall h)
+run_linalg                                   837.59 (cpu h)            5.25 (wall h)
+   run_sol_sanity_checks                       0.20 (cpu h)            0.20 (wall h)
+   solve_filtering_plus_bwc                  834.81 (cpu h)            4.07 (wall h)
+run_eth_root                                  79.70 (cpu h)           39.01 (wall h)
+   eth_root_montgomery                        41.20 (cpu h)           38.42 (wall h)
+   padic_eth_root                              3.21 (cpu h)            3.21 (wall h)
+update_coll_of_unlinked_ideals                 6.17 (cpu h)            5.04 (wall h)
+---- ============ ----
+---- n768 queries ----
+---- ============ ----
+Total queries                                156,389,306
+   Algebraic                                   4,471,625
+   Extension                                  46,820,116
+   Rational                                  105,097,565
+----------------------

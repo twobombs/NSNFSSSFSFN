@@ -1,0 +1,4 @@
+requests
+six
+git+https://github.com/gemalto/pycryptoki
+psutil

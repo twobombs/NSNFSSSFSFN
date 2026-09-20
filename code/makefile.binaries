@@ -1,0 +1,74 @@
+
+MPI?=0
+
+cado_targets:=
+cado_targets+=polyselect
+cado_targets+=las las_descent makefb
+cado_targets+=freerel debug_renumber
+cado_targets+=sm_simple sm_append
+cado_targets+=dup1 dup2 purge merge-dl replay-dl
+cado_targets+=explain_indexed_relation
+cado_targets+=antebuffer
+cado_targets+=skewness
+cado_targets+=numbertheory_tool
+cado_targets+=mf_scan2 bwc_full_gfp lingen_p1
+cado_targets+=polyselect polyselect_ropt
+
+ncpus:=$(shell nproc)
+
+all::
+
+clean:
+	rm -rf build
+	find . -type d -name "__pycache__" -exec rm -rf {} \; || true
+
+cado-target-%:
+	mkdir -p build || :
+	MPI=${MPI} force_build_tree=$$PWD/build make -C ./cado -j$(ncpus) $*
+
+all:: clean $(patsubst %,cado-target-%,$(cado_targets)) lib-deps elf-hack
+
+
+SHELL:=bash
+
+patchelf:=$(shell type -p patchelf)
+ifneq ($(findstring sage,$(patchelf)),)
+$(info Not using patchelf from sage)
+patchelf:=
+else
+$(info patchelf is $(patchelf))
+endif
+
+
+ifneq ($(patchelf),)
+
+lib-deps:
+	mkdir -p libs || :
+	cp -f /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 libs/
+	cp -f /lib/x86_64-linux-gnu/libc.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libstdc++.so.6* libs/
+	cp -f /lib/x86_64-linux-gnu/libfmt.so* libs/ || :
+	cp -f /lib/x86_64-linux-gnu/libhwloc.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libgomp.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libpthread.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libgcc_s.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libudev.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libdl.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libgmp.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libm.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libudev.so* libs/
+	cp -f /lib/x86_64-linux-gnu/libdl.so* libs/
+
+
+elf-hack:
+	find build/ \( -name CMakeFiles -o -name gf2x \) -a -prune -o -type f -a -perm -001 -a \! \( -name \*.a -o -name \*.pl -o -name \*.py \) -a -print | while read f ; do echo $$f ; patchelf --add-rpath $$PWD/libs $$f ; done
+	find libs/ \( -name CMakeFiles -o -name gf2x \) -a -prune -o -type f -a \! \( -name \*.a -o -name \*.pl -o -name \*.py \) -a \! -size -1024c -a \! -name ld-linux\* -a -print | while read f ; do echo $$f ; patchelf --add-rpath $$PWD/libs $$f ; done
+	find build/ \( -name CMakeFiles -o -name gf2x \) -a -prune -o -type f -a -perm -001 -a \! \( -name \*.a -o -name \*.pl -o -name \*.py -o -name \*.so \) -a -print | while read f ; do echo $$f ; patchelf --set-interpreter $$PWD/libs/ld-linux-x86-64.so.2 $$f ; done
+else
+lib-deps::
+
+elf-hack::
+	@echo NOTE: "patchelf not found, the binaries in $$PWD/build may not be transportable to other machines"
+	@echo NOTE: "(but if you use them on this host only, it should be ok!)"
+
+endif

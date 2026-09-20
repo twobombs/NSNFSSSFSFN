@@ -1,0 +1,19 @@
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_name hsm-api.domain.example;
+
+    # Allow large batch sizes
+    client_max_body_size 200M;
+
+    location / {
+            root /var/www/html/hsm-api;
+
+            if ($http_authorization != "Bearer <TODO: replace>") {
+                return 401;
+            }
+
+            proxy_pass http://localhost:6800;
+    }
+}

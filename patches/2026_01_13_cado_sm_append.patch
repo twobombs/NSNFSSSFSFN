@@ -1,0 +1,17 @@
+# This patch fixes a bug in cado 457bd11 caused by an extra
+# colon in a newer version of sm-append. It can be applied
+# by running the following in the cado submodule:
+# git apply ../../patches/2026_01_13_cado_sm_append.patch
+diff --git a/filter/sm_append.cpp b/filter/sm_append.cpp
+index f9e150343..1c1eb88d8 100644
+--- a/filter/sm_append.cpp
++++ b/filter/sm_append.cpp
+@@ -140,7 +140,7 @@ ab_pair::ab_pair(char const * p)
+     std::istringstream is(S);
+     is.imbue(std::locale(std::locale(), new relation_locale()));
+ 
+-    if (!(is >> std::hex >> a() >> expect(",") >> b() >> expect(":")))
++    if (!(is >> std::hex >> a() >> expect(",") >> b()))
+         throw std::runtime_error(fmt::format("parse error on {}", S));
+ }
+ 

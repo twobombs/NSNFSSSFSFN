@@ -1,0 +1,41 @@
+----------------------
+---- n1024 timing ----
+---- ============ ----
+total_polyselect                          39,992.01 (cpu h)           20.17 (wall h)
+   polysel                                   760.49 (cpu h)            0.31 (wall h)
+   polyropt                               34,694.71 (cpu h)           12.31 (wall h)
+   poly_las_estimates                      4,536.82 (cpu h)            7.55 (wall h)
+algebraic_sieving                      1,311,975.08 (cpu h)        2,760.00 (wall h)
+total_filter                                  24.08 (cpu h)            7.85 (wall h)
+   killer_rels                                 3.04 (cpu h)            3.05 (wall h)
+   read_renumberfile                           1.19 (cpu h)            1.19 (wall h)
+extension_sieving                      9,240,757.82 (cpu h)        2,640.00 (wall h)
+total_descent                          1,421,195.45 (cpu h)        1,027.39 (wall h)
+   descent_ecm_init                       17,141.54 (cpu h)           19.82 (wall h)
+   descent_large_q                             0.00 (cpu h)            0.00 (wall h)
+   descent_large_las                      18,811.00 (cpu h)          268.36 (wall h)
+   descent_bottom                      1,385,242.92 (cpu h)          739.21 (wall h)
+run_linalg                               146,263.96 (cpu h)          447.04 (wall h)
+   load_matrix                               492.80 (cpu h)            5.60 (wall h)
+   make_linalg_system                         37.36 (cpu h)            5.73 (wall h)
+   bwc_prep                                    0.43 (cpu h)            0.19 (wall h)
+   bwc_krylov                             74,579.78 (cpu h)          208.88 (wall h)
+   bwc_lingen                                 75.96 (cpu h)            1.72 (wall h)
+   bwc_mksol                              71,073.63 (cpu h)          221.42 (wall h)
+   bwc_gather                                  0.51 (cpu h)            0.01 (wall h)
+   bwc_cleanup                                 0.00 (cpu h)            0.00 (wall h)
+   second_solve                                0.47 (cpu h)            0.47 (wall h)
+   run_sol_sanity_checks                       3.03 (cpu h)            3.03 (wall h)
+run_eth_root                               2,210.93 (cpu h)          147.16 (wall h)
+   montgomery_ll                           1,305.79 (cpu h)          130.58 (wall h)
+   montgomery_seq                              1.15 (cpu h)            1.15 (wall h)
+   hybrid_eth_root                           896.20 (cpu h)           11.09 (wall h)
+   forgery_assembly                            7.80 (cpu h)            4.35 (wall h)
+---- ============= ----
+---- n1024 queries ----
+---- ============= ----
+Total queries                              4,067,419,331
+   Algebraic                                 144,973,282
+   Extension                               1,048,047,534
+   Rational                                2,874,398,515
+-----------------------

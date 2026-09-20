@@ -1,0 +1,5 @@
+# Optional but improve performance
+mr4mp
+numpy
+scipy
+sparse_dot_mkl

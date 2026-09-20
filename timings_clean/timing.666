@@ -1,0 +1,73 @@
+----Timing Summary-----
+run_precomp:  71976.39s (cputime: 111480128.85s)
+        polysel_higheffort_select: Not run
+        polysel_higheffort_ropt: Not run
+        polysel_higheffort_candidates: Not run
+        run_polysel:    288.16s (cputime: 48756.95s)
+                write_polyfile:    287.67s (cputime: 48755.57s)
+        call_algebraic_query_sieving:  20352.60s (cputime: 17645051.84s)
+                aqrels_slurm_sieving:  18639.29s
+                aqrels_extra_slurm_sieving: Not run
+        call_fb_extension_sieving:  48409.76s (cputime: 93776888.16s)
+                extension_slurm_sieving:  46973.36s
+                call_todo_sieving:   1951.49s (cputime: 9099.53s)
+        filter_relation_file:   1322.51s (cputime: 2288.09s)
+                swap_parts_of_relations: Not run
+                build_killer_rels_dict:    911.89s (cputime: 911.14s)
+run_queries:   1952.22s (cputime: 38564.49s)
+        do_rational_queries:    326.35s (cputime: 10948.42s)
+        do_algebraic_queries:   1625.87s (cputime: 26924.49s)
+run_indiv:
+    Did large descent for this run!
+        function run_descent_ecm_init took 3641.1037s wall clock time (406147.0113s cputime)
+        function call_descent_large_q_slurm took 1613.7528s wall clock time (103079.0440s cputime)
+        2025-12-05 09:11:34: function start_descent_large_las took 4066.3105s wall clock time (1120599.3840s cputime)
+        2025-12-05 19:46:19: function finish_descent_large_las took 0.1260s wall clock time (0.0118s cputime)
+        (no descent bottom needed)
+run_linalg:  16421.78s (cputime: 528224.16s)
+        construct_S:    378.49s (cputime: 393.62s)
+        run_S_sanity_checks:    512.15s (cputime: 512.13s)
+        run_ST_sanity_checks:    157.64s (cputime: 157.63s)
+        truncate_S:    987.07s (cputime: 1333.88s)
+                algebraic_consistency_check: Not run
+                parse_fb_extension_relations:    467.60s
+                convert_to_indexed_relation:    264.27s
+        make_linalg_system:   6615.69s (cputime: 13211.55s)
+                sm_init:      0.11s
+                compute_sm_block_for_matrix:   6596.98s (cputime: 6596.48s)
+                maps_from_more_ab:   3148.71s (cputime: 3148.55s)
+                C_block:      0.00s
+                block_matrix:     14.19s
+                SC_vector:      3.42s
+        solve_filtering_plus_sage: Not run
+        solve_filtering_plus_bwc:   5277.77s (cputime: 496433.26s)
+                apply_filtering_to_target:   3168.33s (cputime: 6316.71s)
+                        killer relations maps_from_more_ab:   3148.71s
+                write_tgt_vector:      2.16s
+                linalg/bwc/bwc.pl (complete):   1695.14s
+                        bwc prep:      6.59s (cputime: 24.40s)
+                        bwc krylov:    295.62s (cputime: 109350.18s)
+                        bwc lingen:    293.31s (cputime: 18581.57s)
+                        bwc mksol:   1087.31s (cputime: 358501.22s)
+                        bwc gather:      6.13s (cputime: 49.20s)
+                        bwc cleanup:      6.17s (cputime: 0.28s)
+                making sol_matrix:      8.93s
+                assert sol_matrix:    277.03s
+                small_matrix_on_the_right:     31.11s
+                second_solve.left_kernel:      0.02s
+                final solve_left:      2.46s
+                sol_f computations:     39.42s
+                recover sol from sol_f:     27.24s
+        solve_filtering_plus_bwc_chars: Not run
+        solve_sage: Not run
+        run_sol_sanity_checks:   1584.93s (cputime: 1584.78s)
+run_eth_root:  19483.89s (cputime: 39030.48s)
+        CRT_R_alpha: Not run
+        eth_root_montgomery:  18621.70s (cputime: 20208.79s)
+        padic_eth_root:    802.40s (cputime: 802.32s)
+        U reconstruction:    679.61s
+        u/v*S(m)^d:     58.09s
+Queries:
+        Rational: 28192750
+        Algebraic: 44751123
+        Extension: 24232816

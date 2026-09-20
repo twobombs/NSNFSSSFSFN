@@ -1,0 +1,3 @@
+[submodule "cado"]
+	path = code/cado
+	url = https://gitlab.inria.fr/cado-nfs/cado-nfs.git
