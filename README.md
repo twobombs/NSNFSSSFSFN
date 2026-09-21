@@ -2,7 +2,7 @@
 
 *Alternative title: Nearly SNFS-Speed Signature Forgery Sans Factoring N (NSNFSSSFSFN)*
 
-This repository contains a paper (eprint 2026/XXXX) and code implementing a variant of the number field sieve (NFS) algorithm.
+This repository contains a [paper](paper.pdf) (eprint 2026/XXXX) and code implementing a variant of the number field sieve (NFS) algorithm.
 It shows that an attacker can use *temporary* access to a raw, unpadded RSA signing/decryption oracle to gain the *permanent* ability to forge signatures / decrypt ciphertexts. In other words, the attacker can steal what is effectively the secret key (in that it can be used to sign/decrypt offline), but without actually factoring the public key, and using much less computation than factoring the public key would have taken.
 This demonstrates that factoring-based estimates for RSA security may be too optimistic and should be revised, but likely does not pose an immediate operational threat to most deployed RSA in the real world.
 
