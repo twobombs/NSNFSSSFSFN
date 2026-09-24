@@ -8,15 +8,15 @@ Paper: https://eprint.iacr.org/2026/2131.pdf (eprint 2026/2131)
 GENERATED FILE -- do not edit by hand. Regenerate with:
     python3 tools/make_single_python.py
 
-Generated from commit 5a91da2f44cacddfc81aa51f7cbdea6eaa208c9b
+Generated from commit 6f5385d8dfb58c06a664482f935858dacc9412aa
 Embedded: 113 files (969876 bytes) from code/ and patches/,
 plus the code/cado submodule pin and the code/cado_sage symlink.
 
 This one file holds every source in code/ (run.py, helpers.py, descent,
 root, linear-algebra and oracle modules, search_extqueries.cpp), the configs
 and hint files, the build pipeline (cado_build*.sh, makefile.binaries) and
-the CADO-NFS patches. The embedded files are verbatim "#| " comment lines at
-the bottom of this file; search for "#@ FILE code/run.py" to read one.
+the CADO-NFS patches. The embedded files are verbatim comment lines at the
+bottom of this file; search for "#@ FILE code/run.py" to read one.
 
 Why not concatenate the modules? The pipeline starts its helper scripts as
 separate processes ("sage polyselect_helper.py ...", run from code/, possibly
@@ -28,24 +28,32 @@ install()).
 COMMANDS
     python3 nsnfsssfsfn.py list                 list embedded files
     python3 nsnfsssfsfn.py cat code/run.py      print one file
-    python3 nsnfsssfsfn.py unpack [DIR] [--force] [--with-cado]
+    python3 nsnfsssfsfn.py unpack [DIR] [--force] [--force-all] [--with-cado]
         write code/, patches/ and .gitmodules into DIR (default ./nsnfsssfsfn).
-        Existing files are kept unless --force. --with-cado clones CADO-NFS
-        at the pinned commit into DIR/code/cado and applies patches/*.
-    python3 nsnfsssfsfn.py verify [DIR]         compare an unpacked tree
+        Existing files are kept unless --force; --force still keeps your
+        edited code/locations.config (--force-all replaces it too).
+        --with-cado clones CADO-NFS at the pinned commit into DIR/code/cado
+        and applies patches/*; it is safe to rerun after a failure.
+    python3 nsnfsssfsfn.py verify [DIR]
+        compare an unpacked tree with this file: contents, executable bits,
+        symlinks, the CADO-NFS commit and patches (if fetched). Extra files
+        and an edited locations.config are listed as notes.
     sage nsnfsssfsfn.py run [--dir DIR] RUN.PY-ARGS...
         unpack missing files into DIR (default ./nsnfsssfsfn, or $NSNF_DIR),
-        then run code/run.py there with the current interpreter. Paths in
-        the arguments are relative to DIR/code, as in code/README.md:
+        refuse to start if files there differ from this file (stale tree:
+        refresh with "unpack DIR --force"), then run code/run.py there with
+        the current interpreter. Paths in the arguments are relative to
+        DIR/code, as in code/README.md:
           sage nsnfsssfsfn.py run -l locations.config config/n192.config precomp
           sage nsnfsssfsfn.py run -l locations.config config/n192.config queries
           sage nsnfsssfsfn.py run -l locations.config --padic-root config/n192.config indiv
-        Edit DIR/code/locations.config first (run never overwrites it).
+        Edit DIR/code/locations.config first (it is never overwritten).
     sage nsnfsssfsfn.py script [--dir DIR] SCRIPT ARGS...
         same as run, for any other script, e.g. oracles/sage_oracle.py
     sage nsnfsssfsfn.py exec SCRIPT ARGS...
         run an embedded script as __main__ straight from memory (no files
-        written); its imports of other embedded modules resolve from memory.
+        written); its imports of other embedded modules resolve from memory,
+        ahead of installed packages, like a script's own directory would.
         Good for standalone tools (wait_for_file.py, search_rqueries.py,
         oracles/sage_oracle.py, ...). Not for run.py, which needs a tree.
 
@@ -53,6 +61,9 @@ LIBRARY USE
     import nsnfsssfsfn
     nsnfsssfsfn.install()          # "import helpers", "import relations", ...
     nsnfsssfsfn.install("oracles") # resolve like a script in code/oracles/
+    install() appends to sys.meta_path, so installed packages with generic
+    names (helpers, timing, constants, webserver, ...) keep priority; pass
+    first=True to prefer the embedded modules.
 
 SETUP (see code/README.md): SageMath 10.7, a CADO-NFS build (unpack
 --with-cado, then "make -f makefile.binaries" in DIR/code), the python
@@ -64,15 +75,20 @@ import importlib.abc
 import importlib.util
 import linecache
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import types
+from urllib.parse import unquote
 
 __all__ = ["files", "read", "unpack", "verify", "install", "run_embedded"]
 
 _SELF = os.path.abspath(__file__)
 _CODE = "code/"
 _DEFAULT_DIR = "nsnfsssfsfn"
+# Files users are expected to edit after unpacking.
+_EDITABLE = frozenset(["code/locations.config"])
 
 
 class Entry(object):
@@ -82,6 +98,15 @@ class Entry(object):
         self.kind, self.path = kind, path
         self.perm = self.size = self.sha = self.target = self.enc = None
         self.lines = []
+
+
+def _check_rel(path, what="path"):
+    """Reject absolute paths and '..' so nothing lands outside the tree."""
+    parts = path.split("/")
+    if (not path or path.startswith("/") or "\\" in path or "\0" in path
+            or any(p in ("", ".", "..") for p in parts)):
+        raise ValueError("unsafe embedded %s: %r" % (what, path))
+    return path
 
 
 _ENTRIES = None
@@ -102,18 +127,24 @@ def _load():
     cur = None
     for line in raw[pos:].split(b"\n"):
         if line.startswith(b"#@ "):
-            f = line[3:].decode("utf-8").split(" ")
-            cur = Entry(f[0], f[1])
+            f = [unquote(x) for x in line[3:].decode("utf-8").split(" ")]
+            cur = Entry(f[0], _check_rel(f[1]))
             entries[cur.path] = cur
             if f[0] == "FILE":
                 cur.perm, cur.size, cur.sha, cur.enc = int(f[2], 8), int(f[3]), f[4], f[5]
-            elif f[0] in ("LINK", "SUBMODULE"):
+            elif f[0] == "LINK":
+                cur.target = f[2:]
+                link = os.path.normpath(os.path.join(os.path.dirname(cur.path), f[2]))
+                _check_rel(link.replace(os.sep, "/"), "symlink target")
+            elif f[0] == "SUBMODULE":
                 cur.target = f[2:]
         elif cur is not None and cur.kind == "FILE":
             if line.startswith(b"#| ") or line.startswith(b"#= "):
                 cur.lines.append(line[3:])
-            elif line in (b"#|", b"#="):  # trailing space stripped by an editor
+            elif line in (b"#|", b"#=", b"#| "):
                 cur.lines.append(b"")
+            elif line.startswith(b"#$ ") and line.endswith(b"$"):
+                cur.lines.append(line[3:-1])
     _ENTRIES = entries
     return entries
 
@@ -128,7 +159,9 @@ def read(path):
     e = _load().get(path)
     if e is None or e.kind != "FILE":
         raise KeyError(path)
-    if e.enc == "b64":
+    if e.enc.startswith("dup:"):
+        data = read(e.enc[4:])
+    elif e.enc == "b64":
         import base64
         data = base64.b64decode(b"".join(e.lines))
     else:
@@ -138,13 +171,20 @@ def read(path):
     return data
 
 
+def _inside(dest, path):
+    root = os.path.realpath(dest)
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+
 def _write(dest, e, force):
     out = os.path.join(dest, e.path)
     if os.path.lexists(out) and not force:
         return False
     d = os.path.dirname(out)
-    if d:
-        os.makedirs(d, exist_ok=True)
+    os.makedirs(d, exist_ok=True)
+    if not _inside(dest, d):
+        raise ValueError("refusing to write %s: it resolves outside %s" % (e.path, dest))
     if os.path.lexists(out):
         os.remove(out)
     if e.kind == "LINK":
@@ -156,29 +196,106 @@ def _write(dest, e, force):
     return True
 
 
-def unpack(dest=_DEFAULT_DIR, force=False, with_cado=False, quiet=False):
-    """Write the embedded tree into dest. Returns the number of files written."""
+def _git(sub, *args, **kw):
+    return subprocess.run(["git", "-C", sub] + list(args), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, universal_newlines=True, **kw)
+
+
+def _patch_files():
+    """Write the embedded patches to a temp dir (the tree may hold stale copies)."""
+    tmp = tempfile.mkdtemp(prefix="nsnf-patches-")
+    out = []
+    for p in sorted(x for x in _load() if x.startswith("patches/") and _load()[x].kind == "FILE"):
+        fn = os.path.join(tmp, os.path.basename(p))
+        with open(fn, "wb") as fh:
+            fh.write(read(p))
+        out.append((p, fn))
+    return tmp, out
+
+
+def _submodule_state(sub, commit):
+    """Return (problems, notes) for a CADO-NFS checkout."""
+    if not os.path.exists(os.path.join(sub, ".git")):
+        if os.path.isdir(sub) and os.listdir(sub):
+            return ["submodule dir is not a git checkout: " + sub], []
+        return [], ["submodule not fetched (use unpack --with-cado): " + sub]
+    if shutil.which("git") is None:
+        return [], ["git not found; submodule not checked"]
+    head = _git(sub, "rev-parse", "HEAD").stdout.strip()
+    if head != commit:
+        return ["submodule at %s, expected %s: %s" % (head[:10], commit[:10], sub)], []
+    problems = []
+    tmp, patches = _patch_files()
+    try:
+        for p, fn in patches:
+            if _git(sub, "apply", "--reverse", "--check", fn).returncode != 0:
+                problems.append("patch not applied in submodule: " + p)
+    finally:
+        shutil.rmtree(tmp)
+    return problems, []
+
+
+def _ensure_cado(dest, e):
+    """Clone, check out and patch CADO-NFS; idempotent and resumable."""
+    sub = os.path.join(dest, e.path)
+    url, commit = e.target
+    if not os.path.exists(os.path.join(sub, ".git")):
+        if os.path.isdir(sub) and os.listdir(sub):
+            raise SystemExit("%s exists, is not empty and is not a git checkout; "
+                             "move it away and rerun" % sub)
+        if os.path.isdir(sub):
+            os.rmdir(sub)
+        partial = sub + ".partial"
+        if os.path.exists(partial):
+            shutil.rmtree(partial)
+        subprocess.check_call(["git", "clone", "--no-checkout", url, partial])
+        subprocess.check_call(["git", "-C", partial, "checkout", "-q", commit])
+        os.rename(partial, sub)  # only a complete checkout gets the real name
+    head = _git(sub, "rev-parse", "HEAD").stdout.strip()
+    if head != commit:
+        if _git(sub, "status", "--porcelain").stdout.strip():
+            raise SystemExit("%s is at %s with local changes; expected %s"
+                             % (sub, head[:10], commit[:10]))
+        if _git(sub, "checkout", "-q", commit).returncode != 0:
+            subprocess.check_call(["git", "-C", sub, "fetch", "origin"])
+            subprocess.check_call(["git", "-C", sub, "checkout", "-q", commit])
+    tmp, patches = _patch_files()
+    try:
+        for p, fn in patches:
+            if _git(sub, "apply", "--reverse", "--check", fn).returncode == 0:
+                continue  # already applied
+            r = _git(sub, "apply", fn)
+            if r.returncode != 0:
+                raise SystemExit("patch %s does not apply in %s:\n%s" % (p, sub, r.stderr))
+    finally:
+        shutil.rmtree(tmp)
+
+
+def unpack(dest=_DEFAULT_DIR, force=False, with_cado=False, quiet=False, force_all=False):
+    """Write the embedded tree into dest. Returns the number of files written.
+
+    force replaces existing files except an edited locations.config;
+    force_all replaces that too.
+    """
     written = 0
-    # Files first, so patches/ exists before the submodule is patched.
+    kept = []
+    # Files first, so patches/ exists before the submodule is handled.
     for e in sorted(_load().values(), key=lambda e: e.kind == "SUBMODULE"):
         if e.kind == "SUBMODULE":
-            sub = os.path.join(dest, e.path)
-            if with_cado and not os.path.exists(os.path.join(sub, ".git")):
-                url, commit = e.target
-                if os.path.isdir(sub) and not os.listdir(sub):
-                    os.rmdir(sub)
-                subprocess.check_call(["git", "clone", url, sub])
-                subprocess.check_call(["git", "-C", sub, "checkout", "-q", commit])
-                for p in sorted(x for x in _load() if x.startswith("patches/")):
-                    subprocess.check_call(["git", "-C", sub, "apply",
-                                           os.path.abspath(os.path.join(dest, p))])
+            if with_cado:
+                _ensure_cado(dest, e)
             else:
-                os.makedirs(sub, exist_ok=True)
+                os.makedirs(os.path.join(dest, e.path), exist_ok=True)
             continue
-        if _write(dest, e, force):
+        overwrite = force_all or (force and e.path not in _EDITABLE)
+        if force and not overwrite and os.path.lexists(os.path.join(dest, e.path)):
+            kept.append(e.path)
+        if _write(dest, e, overwrite):
             written += 1
     if not quiet:
         print("unpacked %d file(s) into %s" % (written, dest))
+        for p in kept:
+            print("kept your %s (use --force-all to replace it)" % p)
         if not with_cado:
             sub = [e for e in _load().values() if e.kind == "SUBMODULE"][0]
             print("note: %s is the CADO-NFS submodule (%s @ %s); use --with-cado to fetch it"
@@ -187,21 +304,55 @@ def unpack(dest=_DEFAULT_DIR, force=False, with_cado=False, quiet=False):
 
 
 def verify(dest=_DEFAULT_DIR):
-    """Compare an unpacked tree with the embedded files; return a list of problems."""
-    problems = []
-    for e in _load().values():
+    """Compare an unpacked tree with the embedded files.
+
+    Returns (problems, notes). Problems: missing or differing files, wrong
+    executable bit, wrong symlink, wrong CADO-NFS commit or missing patches.
+    Notes: an edited locations.config, extra files, submodule not fetched.
+    """
+    problems, notes = [], []
+    entries = _load()
+    for e in entries.values():
         out = os.path.join(dest, e.path)
         if e.kind == "FILE":
-            if not os.path.isfile(out):
+            if not os.path.isfile(out) or os.path.islink(out):
                 problems.append("missing: " + e.path)
-            else:
-                with open(out, "rb") as fh:
-                    if fh.read() != read(e.path):
-                        problems.append("differs: " + e.path)
+                continue
+            with open(out, "rb") as fh:
+                same = fh.read() == read(e.path)
+            if not same:
+                if e.path in _EDITABLE:
+                    notes.append("edited (expected): " + e.path)
+                else:
+                    problems.append("differs: " + e.path)
+            if bool(os.stat(out).st_mode & 0o111) != bool(e.perm & 0o111):
+                problems.append("mode differs (want %o): %s" % (e.perm, e.path))
         elif e.kind == "LINK":
             if not os.path.islink(out) or os.readlink(out) != e.target[0]:
                 problems.append("symlink differs: " + e.path)
-    return problems
+        elif e.kind == "SUBMODULE":
+            p, n = _submodule_state(out, e.target[1])
+            problems += p
+            notes += n
+    subs = [e.path + "/" for e in entries.values() if e.kind == "SUBMODULE"]
+    extra = []
+    for top in ("code", "patches"):
+        for root, dirs, fnames in os.walk(os.path.join(dest, top)):
+            rel_root = os.path.relpath(root, dest).replace(os.sep, "/")
+            dirs[:] = [d for d in dirs if d != "__pycache__"
+                       and rel_root + "/" + d + "/" not in subs]
+            for d in list(dirs):  # symlinked dirs (cado_sage) are entries, not extras
+                if os.path.islink(os.path.join(root, d)):
+                    dirs.remove(d)
+                    if rel_root + "/" + d not in entries:
+                        extra.append(rel_root + "/" + d)
+            extra += [rel_root + "/" + f for f in fnames
+                      if rel_root + "/" + f not in entries and not f.endswith(".pyc")]
+    for p in sorted(extra)[:10]:
+        notes.append("extra: " + p)
+    if len(extra) > 10:
+        notes.append("... and %d more extra file(s)" % (len(extra) - 10))
+    return problems, notes
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +420,21 @@ def _exec_source(path, namespace):
 _INSTALLED = None
 
 
-def install(subdir=""):
-    """Make embedded modules importable (as if code/<subdir> were sys.path[0])."""
+def install(subdir="", first=False):
+    """Make embedded modules importable (as if code/<subdir> were on sys.path).
+
+    By default the importer goes last in sys.meta_path, so installed packages
+    with the same names win; first=True puts the embedded modules first.
+    """
     global _INSTALLED
     base = _CODE + (subdir.strip("/") + "/" if subdir.strip("/") else "")
-    if _INSTALLED is not None:
+    if _INSTALLED is not None and _INSTALLED in sys.meta_path:
         sys.meta_path.remove(_INSTALLED)
     _INSTALLED = _EmbeddedImporter([base])
-    sys.meta_path.insert(0, _INSTALLED)
+    if first:
+        sys.meta_path.insert(0, _INSTALLED)
+    else:
+        sys.meta_path.append(_INSTALLED)
     return _INSTALLED
 
 
@@ -285,7 +443,8 @@ def run_embedded(script, args):
     path = script if script.startswith(_CODE) else _CODE + script
     if path not in _load():
         raise SystemExit("no embedded script %s (see 'list')" % script)
-    install(os.path.dirname(path)[len(_CODE):])
+    # A script's own directory comes first on sys.path, so embedded modules win.
+    install(os.path.dirname(path)[len(_CODE):], first=True)
     main = types.ModuleType("__main__")
     main.__file__ = _virtual(path)
     main.__builtins__ = __builtins__
@@ -294,11 +453,26 @@ def run_embedded(script, args):
     _exec_source(path, main.__dict__)
 
 
-def _run_on_disk(script, argv):
+def _split_dir(argv, usage):
     dest = os.environ.get("NSNF_DIR", _DEFAULT_DIR)
     if argv[:1] == ["--dir"]:
+        if len(argv) < 2:
+            raise SystemExit(usage)
         dest, argv = argv[1], argv[2:]
+    return dest, argv
+
+
+def _run_on_disk(dest, script, argv):
     unpack(dest, quiet=True)
+    problems, _notes = verify(dest)
+    if problems:
+        sys.stderr.write("refusing to run: %s does not match this file (stale tree?)\n" % dest)
+        for p in problems:
+            sys.stderr.write("  " + p + "\n")
+        sys.stderr.write("refresh it with: %s %s unpack %s --force\n"
+                         "(your code/locations.config is kept)\n"
+                         % (os.path.basename(sys.executable), sys.argv[0], dest))
+        raise SystemExit(2)
     code_dir = os.path.join(dest, "code")
     if not os.path.isfile(os.path.join(code_dir, script)):
         raise SystemExit("no script %s in %s" % (script, code_dir))
@@ -320,25 +494,40 @@ def main(argv=None):
             else:
                 print("%-4s %9s  %s -> %s" % (e.kind.lower()[:4], "", p, " @ ".join(e.target)))
     elif cmd == "cat":
+        if not rest:
+            raise SystemExit("usage: cat PATH...")
         for p in rest:
-            sys.stdout.buffer.write(read(p if p in _load() else _CODE + p))
+            path = p if p in _load() else _CODE + p
+            if path not in _load() or _load()[path].kind != "FILE":
+                raise SystemExit("no embedded file %s (see 'list')" % p)
+            sys.stdout.buffer.write(read(path))
     elif cmd == "unpack":
         pos = [a for a in rest if not a.startswith("--")]
+        unknown = [a for a in rest if a.startswith("--")
+                   and a not in ("--force", "--force-all", "--with-cado")]
+        if unknown or len(pos) > 1:
+            raise SystemExit("usage: unpack [DIR] [--force] [--force-all] [--with-cado]")
         unpack(pos[0] if pos else _DEFAULT_DIR, force="--force" in rest,
-               with_cado="--with-cado" in rest)
+               force_all="--force-all" in rest, with_cado="--with-cado" in rest)
     elif cmd == "verify":
-        problems = verify(rest[0] if rest else _DEFAULT_DIR)
+        problems, notes = verify(rest[0] if rest else _DEFAULT_DIR)
         for p in problems:
-            print(p)
-        print("OK" if not problems else "%d problem(s)" % len(problems))
-        return 1 if problems else 0
+            print("PROBLEM " + p)
+        for n in notes:
+            print("note    " + n)
+        if problems:
+            print("%d problem(s)" % len(problems))
+            return 1
+        print("OK" + (" (%d note(s))" % len(notes) if notes else ""))
     elif cmd == "run":
-        _run_on_disk("run.py", rest)
+        dest, rest = _split_dir(rest, "usage: run [--dir DIR] RUN.PY-ARGS...")
+        _run_on_disk(dest, "run.py", rest)
     elif cmd == "script":
-        if rest[:1] == ["--dir"]:
-            _run_on_disk(rest[2], rest[:2] + rest[3:])
-        else:
-            _run_on_disk(rest[0], rest[1:])
+        usage = "usage: script [--dir DIR] SCRIPT [ARGS...]"
+        dest, rest = _split_dir(rest, usage)
+        if not rest:
+            raise SystemExit(usage)
+        _run_on_disk(dest, rest[0], rest[1:])
     elif cmd == "exec":
         if not rest:
             raise SystemExit("usage: exec SCRIPT [ARGS...]")
@@ -352,8 +541,9 @@ if __name__ == "__main__":
     sys.exit(main())
 
 # ===== EMBEDDED FILES =====
-# Format: '#@ FILE <path> <octal perm> <size> <sha256> <text|b64>' followed by
-# the file's lines, each prefixed with '#| ' (or '#= ' base64 for binaries).
+# Format: '#@ FILE <path> <octal perm> <size> <sha256> <text|b64|dup:<path>>'
+# followed by the file's lines: '#| <line>' ('#|' if empty), '#$ <line>$' for
+# a line ending in whitespace, or '#= <base64>'. Header fields are %-encoded.
 
 #@ FILE .gitmodules 644 90 5dfa7504ffa4297db6ce66d4c79c7dc15c1a566281824ab66c8976312883f371 text
 #| [submodule "cado"]
@@ -364,23 +554,23 @@ if __name__ == "__main__":
 #| This folder contains an implementation of the full algorithm.
 #| It should be reproducible on a single machine up to a 512-bit modulus.
 #| Beyond that, a cluster and custom setup is likely required (and, there is not a simple command to run everything in one go).
-#| 
+#|
 #| To run it, do the following in the `code` folder (this one).
-#| 
+#|
 #| ## Getting started
-#| 
+#|
 #| ### Step 0: install dependencies
-#| 
+#|
 #| Install sagemath 10.7; newer versions may work but we have not tested them.
-#| 
+#|
 #| The cado build process will require the python packages `flask` and `requests` be installed for some reason, so install those if needed (in a venv, if desired).
-#| 
+#|
 #| We need the `patch` utility to be able to apply our cado patches.
-#| 
+#|
 #| Our code currently relies on the existence of `/usr/bin/time`, as opposed to just the `time` shell builtin in bash.
-#| 
+#|
 #| ### Step 1: prepare the config file
-#| 
+#|
 #| Edit `locations.config` and change the directories to your local installation.
 #| A minimal locations file looks like:
 #| ```
@@ -388,47 +578,47 @@ if __name__ == "__main__":
 #| TEMP_OUTPUT_DIR=/path/to/data/
 #| SAGE=/usr/local/sagemath/10.7/bin/sage
 #| ```
-#| 
+#|
 #| Paths can be relative to the current directory if you wish.
 #| `TEMP_OUTPUT_DIR` must be an existing directory (the script won't create it).
 #| The slash at the end of `CADO_BUILD_DIR` and `TEMP_OUTPUT_DIR` is mandatory!
-#| 
+#|
 #| ### Step 2: build cado-nfs
-#| 
-#| You need a cado-nfs build as well as sage. 
-#| 
+#|
+#$ You need a cado-nfs build as well as sage. $
+#|
 #| #### Simple build
-#| 
+#|
 #| For 666 bits and lower, the following should suffice:
 #| ```bash
 #| bash cado_build.sh
 #| ```
 #| This will take care of initializing the cado submodule, applying our patches, and building cado.
-#| 
+#|
 #| #### Build all variants
-#| 
+#|
 #| For the larger parameters (768-bit and 1024-bit), we also provide a script to build four variants:
 #| 1. cado no mpi, regular lpb
 #| 2. cado with mpi, regular lpb
 #| 3. cado no mpi, large lpb
 #| 4. cado with mpi, large lpb
-#| 
+#|
 #| This step is unnecessary if you're only running 666-bit parameters or lower. Also note that this requires an MPI setup.
-#| 
+#|
 #| Run this command from the `code` folder:
 #| ```bash
 #| bash cado_build_all_variants.sh
 #| ```
-#| 
+#|
 #| Then edit your `locations.config` to point to the cado variant you want to use
-#| 
+#|
 #| #### Manual build
-#| 
+#|
 #| Note that even if you already have a cado build, cado's default scripts do not automatically build some
 #| programs like `misc/debug_renumber` and `misc/explain_indexed_relation` which we require.
 #| Moreover, the cado build must be based on the linked commit in the submodule (457bd11).
 #| You must also apply the patches in `patches`.
-#| 
+#|
 #| Make sure to initialize the cado submodule and apply our patches, if you haven't already:
 #| ```bash
 #| git submodule update --init
@@ -437,21 +627,21 @@ if __name__ == "__main__":
 #| 	patch -p1 < $patch_file
 #| done
 #| ```
-#| 
+#|
 #| To compile the simplest version, run
 #| ```bash
 #| make -f makefile.binaries
 #| ```
-#| 
+#|
 #| which essentially just runs `rm -rf build/` followed by
-#| 
+#|
 #| ```bash
 #| force_build_tree=$PWD/build make -C cado -j$(nproc) polyselect las las_descent makefb freerel debug_renumber sm_simple sm_append dup1 dup2 purge merge-dl replay-dl explain_indexed_relation antebuffer skewness numbertheory_tool mf_scan2 bwc_full_gfp lingen_p1 polyselect_ropt
 #| ```
-#| 
+#|
 #| If you are unable to build cado (for example, we occasionally encountered errors on macOS),
 #| you may find more information in [cado's build instructions](https://gitlab.inria.fr/cado-nfs/cado-nfs).
-#| 
+#|
 #| ### Step 3: Run the attack
 #| To run on the 192 bit parameters, run
 #| ```bash
@@ -460,42 +650,42 @@ if __name__ == "__main__":
 #| <sage> run.py -l locations.config --padic-root config/n192.config indiv
 #| ```
 #| replacing `<sage>` with the path to your sage 10.7 installation.
-#| 
+#|
 #| If, despite our advice, you're using a newer version of sage than 10.7, it's possible this command will do nothing or just show the usage message for sage.
 #| In this case try replacing `sage` with `python3` in the above command, and replace the path to sage in your `locations.config` with the path to `python3`.
 #| The python you use must be able to successfully `import sage`.
-#| 
+#|
 #| You can choose a different config file (see the `config/` directory), and the step can be any of `{all, precomp, queries, indiv}`.
 #| If running the steps one by one, please do run them in the correct order---there's not proper checking that the expected files exist before running a step.
 #| Also if *re*running anything (e.g., if you want to run indiv twice), you unfortunately need to start over completely by removing the old data directory for the computation (e.g. `rm -r data/n192/`).
-#| 
+#|
 #| Instead of the config file, you can also pass environment variables, which take precedence.
-#| 
+#|
 #| There are a variety of other steps and flags that are somewhat documented in `code/run.py` and `code/helpers.py`. However they should not be necessary for computations on small moduli.
-#| 
+#|
 #| You may select your own moduli and targets. The moduli and exponents should be updated in the relevant `config/nNBITS.config` file. Notice that you do need to provide both `(N,e)` and `d`. `d` is only used for the software-simulated signing oracle. The target can be put into a file as `TEMP_OUTPUT_DIR/nNBITS/thetarget`. The target is expected to appear at some point before you run the `indiv` option.
-#| 
+#|
 #| #### It didn't work, what do I do?
 #| A few common pitfalls:
 #|  - In general, make sure you delete the old data directory (e.g. `data/n192`) before rerunning a computation
 #|  - The Montgomery root sometimes gets stuck in an infinite loop; pass `--padic-root`, which works fine for small parameters
 #|  - The very smallest parameters (`n60`, `n90`, `n128`) aren't well optimized and often fail; you may need to re-run them a few times
-#| 
+#|
 #| ## Understanding config parameters
-#| 
+#|
 #| Some of the most important config parameters:
 #| - `LPB0` is the rational prime bound.
 #| - `LPB1` is the algebraic bound --- for the individual computation. That is, descent will ensure smoothness with respect to `LPB1`.
 #| - `LPB1_queries` is the algebraic bound --- for the actual queries. The "extension factor base" is an additional step that relates `LPB1`-smooth items to `LPB1_queries`-smooth items. By setting `LPB1_queries < LPB1` we keep the individual smoothness bound the same while making fewer queries, but doing some more sieving in precomputation.
 #| - `A_sieving` is used in precomputation sieving.
 #| - `I_sieving` is used in descent sieving, which requires `I` to be used rather than `A` for some reason.
-#| 
+#|
 #| See `code/what_do_parameters_do.md` for more.
-#| 
+#|
 #| ## Advanced usage
-#| 
+#|
 #| ### OpenMPI
-#| 
+#|
 #| In order to be able to run our the algorithm with `--mpi`, you need to do the following:
 #| - Have a working installation of OpenMPI (this depends on your hardware/fabric interconnect and can be pretty time consuming to set up).
 #| - Install the `mpi4py` package in the sage environment:
@@ -505,20 +695,20 @@ if __name__ == "__main__":
 #| - Compile cado-nfs with MPI support. Note that once using a cado-nfs MPI build, not passing `--mpi` to `run.py` **does not** fully deactivate MPI. Make sure that `CADO_BUILD_DIR` in `locations.config` points to a cado build that was done with MPI enabled.
 #| - [Optional] Configure the number of processes in your allocation. The default is to set `mpi.thr` to the total number of virtual cores available in the slurm reservation minus one (the last one is used for the server).
 #| - MPI needs to learn which nodes are available. In our cluster, it learns this from the Slurm resource allocation, which means `run.py` needs to be executed from **within** an interactive slurm allocation (see `salloc` man page). This may differ for other system setups.
-#| 
+#|
 #| ### Running linalg with MPI and Slurm
-#| 
+#|
 #| Running this part of the code with MPI is somewhat complicated, because we both launch embarassingly parallel computations on several nodes with slurm, while also allowing each computation to run across multiple machines with MPI.
-#| 
+#|
 #| For BWC to work, you need a slurm partition with a homogeneous number of cores.
-#| Set `BWC_SLURM_JOB_PARTITION` in `locations.config` to that partition name. 
-#| 
+#$ Set `BWC_SLURM_JOB_PARTITION` in `locations.config` to that partition name. $
+#|
 #| Make a slurm allocation for the nodes to run linalg over that has a _lower_ priority than the one specified in `BWC_SLURM_JOB_PARTITION`.
 #| This is so that slurm jobs launched inside the script can take precedence over the allocation and still run, while MPI learns about all available nodes from the allocation.
 
 #@ FILE code/algebraic_query_sieving_helper.py 644 2575 3cccf0d88989e6756d17e2c410d5433a8ae5d347afe53a8e2ac55cb3a93cafbd text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| import argparse
 #| import json
@@ -526,10 +716,10 @@ if __name__ == "__main__":
 #| from cado_sage import CadoPolyFile
 #| from relations import strip_rational_part_of_relations
 #| from helpers import do_algebraic_query_sieving
-#| 
+#|
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| # def do_algebraic_query_sieving(params,jobnum,q0,q1):
 #| #     BOUNDA_queries = params.BOUNDA_queries
 #| #     AQRELS_FILE_jobnum = params.files['AQRELS_FILE']+"."+jobnum
@@ -539,12 +729,12 @@ if __name__ == "__main__":
 #| #     LPB0 = params.parameters['LPB0']
 #| #     LPB1_queries = params.parameters['LPB1_queries']
 #| #     A_sieving = params.parameters['A_sieving']
-#| 
+#|
 #| #     c0 = 1/4 # 1/2 # Magic constants
 #| #     c1 = 1 #4
-#| 
+#|
 #| #     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #| #     CadoNFS("sieve/las",
 #| #             "-sqside 1",
 #| #             "-A", A_sieving,
@@ -568,12 +758,12 @@ if __name__ == "__main__":
 #| #                 'POLY': POLYFILE,
 #| #             }
 #| #             )
-#| 
+#|
 #| #     strip_rational_part_of_relations(AQRELS_FILE_jobnum)
-#| 
+#|
 #| #     return
-#| 
-#| 
+#|
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='algebraic_query_sieving_helper.py')
 #|     topparser.add_argument('--params',dest='params')
@@ -581,14 +771,14 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--q0',dest='q0')
 #|     topparser.add_argument('--q1',dest='q1')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     # Doing horrible things to fake the params object from a json exportable object
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
 #|     POLYFILE = params.files['POLYFILE']
 #|     poly = CadoPolyFile(POLYFILE); poly.read()
 #|     params.poly = poly
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #|     do_algebraic_query_sieving(params,jobnum=topargs.jobnum,q0=topargs.q0,q1=topargs.q1)
 
 #@ FILE code/bwc_helpers.py 644 15480 ef526bf57cb100ef8a4b5656f6511766236c38ce219a29bb336f01b75af51824 text
@@ -602,7 +792,7 @@ if __name__ == "__main__":
 #| from time import time
 #| from cado_nfs_binaries import CadoNFS
 #| from timing import overall_cputime, extract_time, extract_time_from_file, timing
-#| 
+#|
 #| def write_binary_matrix(filename, M, BWCBINDIR):
 #|     """
 #|     Write a matrix M to a file in the binary format bwc.pl expects. Also write the auxiliary files bwc.pl needs.
@@ -624,25 +814,25 @@ if __name__ == "__main__":
 #|         "-mfile", filename
 #|     ], stderr=subprocess.PIPE, text=True)
 #|     overall_cputime.add(extract_time(p.stderr))
-#| 
-#| 
+#|
+#|
 #| def write_ascii_vector(filename, vector, modulus):
 #|     with open(filename, 'w') as f:
 #|         f.write(f"{len(vector)} 1 {modulus}\n") # nrows ncols modulus
 #|         for coeff in vector:
 #|             f.write(f"{coeff % modulus}\n")
-#| 
+#|
 #| def make_and_clean(WORKDIR):
 #|     shutil.rmtree(WORKDIR)
 #|     Path(WORKDIR).mkdir(exist_ok=True)
-#| 
+#|
 #| @timing
 #| def solve_linalg_system(params, matrix_filename, vector_filename, m=4, n=4, left=False):
 #|     """
 #|     Given matrix M and vector y, solve for x such that M*x = -y (mod the given modulus)
 #|     i.e., find linear combination of *columns* of M that give -y. (Note the minus sign!)
 #|     For now, bwc.pl fails when M has more columns than rows, but works for square M.
-#| 
+#|
 #|     Note: m and n are parameters for the Block-Wiedemann algorithm. Not sure the optimal values.
 #|     """
 #|     BWCBINDIR = params.dirs['BWCBINDIR']
@@ -656,7 +846,7 @@ if __name__ == "__main__":
 #|         left_str = "nullspace=LEFT"
 #|     else:
 #|         left_str = ""
-#| 
+#|
 #|     bwc_cmd = [
 #|         "time", "-p",
 #|         BWCBINDIR + "/bwc.pl",
@@ -672,25 +862,25 @@ if __name__ == "__main__":
 #|         "verbose_flags=^all-cmdline,^bwc-timing-grids",
 #|         f"thr={thr}"
 #|     ]
-#| 
+#|
 #|     if params.mpi:
 #|         print("Run bwc.pl from solve_linalg_system with MPI enabled.")
-#| 
+#|
 #|         bwc_cmd += [
 #|             f"mpi={params.parameters['bwc.mpi']}",
 #|             "mpi_extra_args='--mca usnic ucx'"
 #|         ]
-#| 
+#|
 #|     print(f"Running bwc command: {' '.join(bwc_cmd)}")
-#| 
+#|
 #|     with open(os.path.join(WORKDIR,"bwc.out"),"w") as outfile, \
 #|          open(os.path.join(WORKDIR,"bwc.err"),"w") as errfile:
 #|         print(f"Writing bwc stdout to {outfile.name}")
 #|         print(f"Writing bwc stderr to {errfile.name}")
-#| 
+#|
 #|         subprocess.call(bwc_cmd,stdout=outfile,stderr=errfile)
 #|         cputime += extract_time_from_file(errfile)
-#| 
+#|
 #|         # output gets written as ascii to {WORKDIR}/K.sols0-1.0.txt
 #|         with open(f"{WORKDIR}K.sols0-1.0.txt",'r') as f:
 #|             # One coefficient per line, with an extra "1" coefficient at the end
@@ -700,13 +890,13 @@ if __name__ == "__main__":
 #|             sol = vector(Zmod(modulus), sol[:-1])
 #|             sol /= Zmod(modulus)(scalar)
 #|             return sol
-#| 
+#|
 #| def remove_redundant_rows(M):
 #|     """
 #|     Return a largest subset of rows of M that are linearly independent.
 #|     i.e., if M is rank d, return d linearly independent rows of M.
 #|     Also return the indices of said rows.
-#| 
+#|
 #|     This function is used for working around the issue where bwc fails on non-square matrices.
 #|     """
 #|     out = None
@@ -725,12 +915,12 @@ if __name__ == "__main__":
 #|         if out and out.rank() == M.rank():
 #|             return out, out_indices
 #|     raise ValueError("M is zero (otherwise this should be unreachable)")
-#| 
+#|
 #| def remove_redundant_columns(M):
 #|     """ Same as remove_redundant_rows, but for columns """
 #|     M2, indices = remove_redundant_rows(M.T)
 #|     return M2.T, indices
-#| 
+#|
 #| @timing
 #| def squarify(M,params):
 #|     """
@@ -768,7 +958,7 @@ if __name__ == "__main__":
 #|           set(range(M.ncols()))-set(col_indices))
 #|     # Maybe this is already good enough?
 #|     return Mnew, row_indices, col_indices
-#| 
+#|
 #| def solve_system_allatonce(params, M, v, ensure_full_rank=False, **kwargs):
 #|     """
 #|     Solve linear system x*M = -v mod e, doing so all at once: start from a sage matrix and vector rather than from files.
@@ -779,19 +969,19 @@ if __name__ == "__main__":
 #|     FILES_DIR = params.dirs['TEMP_OUTPUT_DIR']
 #|     BWCBINDIR = params.dirs['CADO_BUILD_DIR']+"linalg/bwc"
 #|     params.dirs['BWCBINDIR'] = BWCBINDIR
-#| 
+#|
 #|     if ensure_full_rank:
 #|         ### First: work around the issue with non-square M
-#| 
+#|
 #|         print("Remove redudant rows starting")
 #|         ts = time()
 #|         # We're solving x*M = -v
 #|         M_fewerrows, row_indices = remove_redundant_rows(M)
 #|         print("Redundant rows",time()-ts)
-#| 
+#|
 #|         recover_x = lambda x_smaller : vector(Zmod(e), M.nrows(), {ri: xi for (ri,xi) in zip(row_indices, x_smaller)})
 #|         # Now we're solving x_smaller * M_fewerrows = -v
-#| 
+#|
 #|         # check that the above code is correct:
 #|         ##xsmaller_test = vector(Zmod(e), [randint(0,e-1) for _ in range(M_fewerrows.nrows())])
 #|         ##assert xsmaller_test * M_fewerrows == recover_x(xsmaller_test) * M
@@ -801,7 +991,7 @@ if __name__ == "__main__":
 #|         v_smaller = vector(Zmod(e), [v[i] for i in col_indices])
 #|         # Now we're solving x_smaller * M_square = -v_smaller
 #|         print("Redundant columns",time()-ts)
-#| 
+#|
 #|         assert M_square.is_square()
 #|         assert not M_square.is_singular()
 #|         ### Hooray, we've worked around the non-square M issue
@@ -812,15 +1002,15 @@ if __name__ == "__main__":
 #|         print("Squarify",time()-ts)
 #|         recover_x = lambda x_smaller : vector(Zmod(e), M.nrows(), {ri: xi for (ri,xi) in zip(row_indices, x_smaller)})
 #|         v_smaller = vector(Zmod(e), [v[i] for i in col_indices])
-#| 
+#|
 #|     MATRIX_FILE = FILES_DIR + "/M.bin"
 #|     RHS_FILE = FILES_DIR + "/rhs.txt"
-#| 
+#|
 #|     ts = time()
 #|     write_binary_matrix(MATRIX_FILE, M_square, BWCBINDIR)
 #|     write_ascii_vector(RHS_FILE, v_smaller, e)
 #|     print("Writing matrix files",time()-ts)
-#| 
+#|
 #|     print("Calling solve_linalg_system")
 #|     xsmaller = solve_linalg_system(params, MATRIX_FILE, RHS_FILE, **kwargs)
 #|     if not vector(Zmod(e), xsmaller * M_square) == -v_smaller:
@@ -832,7 +1022,7 @@ if __name__ == "__main__":
 #|         print(f"Difference has hamming weight {vector(Zmod(e), xsmaller * M_square + v_smaller).hamming_weight()}")
 #|         print(); print(); print()
 #|         raise AssertionError("Linalg error 1. bwc gave a wrong solution.")
-#| 
+#|
 #|     if ensure_full_rank and not vector(Zmod(e), xsmaller * M_fewerrows) == -vector(Zmod(e), v):
 #|         print("*** Linalg error ***")
 #|         print(f"xsmaller * M_fewerrows: {list(xsmaller * M_fewerrows)[:20]}...")
@@ -845,7 +1035,7 @@ if __name__ == "__main__":
 #|         print("Target vector in row span of M:", vector(Zmod(e), v) in M.row_space())
 #|         print(); print(); print()
 #|         raise AssertionError("Linalg error 2. Target vector might not be in span of M.")
-#| 
+#|
 #|     x = recover_x(xsmaller)
 #|     assert len(x) == M.nrows()
 #|     if not vector(Zmod(e), x * M) == -vector(Zmod(e), v):
@@ -856,32 +1046,32 @@ if __name__ == "__main__":
 #|         print(); print(); print()
 #|         print((x*M+v).sparse_vector().dict())
 #|         raise AssertionError("Linalg error 3")
-#| 
+#|
 #|     return x
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def solve_system_bwc_from_filtered(params,
 #|                                    MM, ST_alg_vector,
 #|                                    S_block, C_block,
 #|                                    ST_list):
-#| 
+#|
 #|     # We default to m=n=6, because we want as least as many as the rank
 #|     # of the unit group, which is less than len(C_block).
 #|     m = MM.M.params.m
 #|     n = MM.M.params.n
-#| 
+#|
 #|     FILES_DIR = params.dirs['TEMP_OUTPUT_DIR']
 #|     WORKDIR = os.path.join(FILES_DIR,"bwc/")
 #|     RHS_FILE = os.path.join(FILES_DIR, "rhs.txt")
 #|     e = int(params.parameters['e'])
 #|     Path(WORKDIR).mkdir(exist_ok=True)
 #|     make_and_clean(WORKDIR)
-#| 
+#|
 #|     rhs = vector([ST_alg_vector[xj] for xj in MM.column_expand_map()])
-#| 
+#|
 #|     write_ascii_vector(RHS_FILE, rhs, e)
-#| 
+#|
 #|     # XXX: untested code path for mpi=True
 #|     bwc_add_args = []
 #|     if params.mpi:
@@ -890,13 +1080,13 @@ if __name__ == "__main__":
 #|             f"--mpi {params.parameters['bwc.mpi']}",
 #|             "mpi_extra_args='--mca usnic ucx'"
 #|         ]
-#| 
+#|
 #|     with open(os.path.join(WORKDIR,"bwc.out"),"w") as outfile, \
 #|          open(os.path.join(WORKDIR,"bwc.err"),"w") as errfile:
-#| 
+#|
 #|         print(f"Writing bwc stdout to {outfile.name}")
 #|         print(f"Writing bwc stderr to {errfile.name}")
-#| 
+#|
 #|         CadoNFS("linalg/bwc/bwc.pl",
 #|                 ":complete",
 #|                 "--matrix", os.path.realpath(MM.get_matrix_file(params)),
@@ -913,18 +1103,18 @@ if __name__ == "__main__":
 #|                 capture=outfile,
 #|                 stderr=errfile
 #|             )
-#| 
+#|
 #|     Ze = MM.base_ring()
-#| 
+#|
 #|     sol_matrix_rows = []
 #|     for j in range(len(C_block)):
 #|         with open(f"{WORKDIR}/K.sols{j}-{j+1}.0.txt",'r') as f:
 #|             sol_matrix_rows.append([int(line) for line in f])
-#| 
+#|
 #|     # we now have a space of solutions to v * vjoin(M,RHS) = 0. Check which
 #|     # of those happen to also be in the left nullspace of vjoin(S_block,
 #|     # C_block).
-#| 
+#|
 #|     sol_matrix = matrix(Ze, sol_matrix_rows)
 #|     SC = block_matrix(2,1,[S_block, matrix([C_block])])
 #|     print(sol_matrix * SC)
@@ -941,19 +1131,19 @@ if __name__ == "__main__":
 #|     ## B.fetch_balancing(nh, nv)
 #|     assert sol_matrix * block_matrix(2, 1, [MM.M.M, matrix([rhs])]) == 0
 #|     print(sol_matrix[:,-1:])
-#| 
-#| 
+#|
+#|
 #|     # I'm confused. I _think_ that there _has_ to be a solution, and so
 #|     # this matrix can't be full rank. And yet, it is.
-#| 
+#|
 #|     raise NotImplementedError("TBC")
-#| 
+#|
 #|     # rhs = [Ze(c) for c in open('data/rhs.txt').readlines()[1:]]
 #|     # S = matrix(Integers(67), [vector([int(x) for x in open(f"data/bwc/K.sols{j}-{j+1}.0.txt")]) for j in range(5)])
-#| 
-#| 
-#| 
-#| 
+#|
+#|
+#|
+#|
 #| if __name__ == "__main__":
 #|     print("Testing with a random dense 30-by-30 matrix mod 65537...")
 #|     M = random_matrix(Zmod(65537), 30, 30)
@@ -969,7 +1159,7 @@ if __name__ == "__main__":
 #|         #sol = solve_linalg_system(WORKDIR+"/MT.bin", WORKDIR+"/vec.txt", 65537)
 #|         #assert sol * M == -target, "solution incorrect"
 #|         #print("Success!")
-#| 
+#|
 #|         sol = solve_system_allatonce(params, M, target, 65537, WORKDIR)
 #|         assert sol * M == -target, "solution incorrect"
 #|         print("Success!")
@@ -978,13 +1168,13 @@ if __name__ == "__main__":
 
 #@ FILE code/cado_build.sh 755 404 baddfe1ed5ecdf3a0e61018bb0e86211f1c828dfb06e36682be7539e6d6cdc2d text
 #| #!/bin/bash
-#| 
+#|
 #| set -e
-#| 
+#|
 #| echo "Make sure cado submodule is initialized and updated"
 #| cd ..
 #| git submodule update --init
-#| 
+#|
 #| cd code/cado
 #| git stash
 #| CURRENT_COMMIT=$(git rev-parse --short HEAD)
@@ -993,20 +1183,20 @@ if __name__ == "__main__":
 #|     patch -p1 < $patch_file
 #| done
 #| cd ..
-#| 
+#|
 #| MPI="0" CFLAGS="-O2 -DSUPPORT_LARGE_Q" CXXFLAGS="-O2 -DSUPPORT_LARGE_Q" make -f makefile.binaries
 
 #@ FILE code/cado_build_all_variants.sh 755 1536 723b2e5d4376094be65b4846a755f77c004433f11247c99cc7c46d587989e821 text
 #| #!/bin/bash
-#| 
+#|
 #| MPI_PATH="/usr/local/openmpi-5.0.8"
-#| 
+#|
 #| set -e
-#| 
+#|
 #| echo "Make sure cado submodule is initialized and updated"
 #| cd ..
 #| git submodule update --init
-#| 
+#|
 #| cd code/cado
 #| git stash
 #| CURRENT_COMMIT=$(git rev-parse --short HEAD)
@@ -1015,17 +1205,17 @@ if __name__ == "__main__":
 #|     patch -p1 < $patch_file
 #| done
 #| cd ..
-#| 
+#|
 #| rm -rf $CURRENT_COMMIT_DIR
 #| echo "Compiling all variants of cado for commit ${CURRENT_COMMIT_DIR}"
 #| mkdir $CURRENT_COMMIT_DIR
-#| 
+#|
 #| if [ -d "build" ]; then
 #|     echo "Backing up current build folder"
 #|     rm -rf build.bkp
 #|     mv build build.bkp
 #| fi
-#| 
+#|
 #| build () {
 #|     BUILD_NAME=$2
 #|     FINAL_BUILD_DIR="${1}/${BUILD_NAME}"
@@ -1038,17 +1228,17 @@ if __name__ == "__main__":
 #|     mv "${LOG_FILE}.log" "${LOG_FILE}.err" "${FINAL_BUILD_DIR}"
 #|     echo "Finished building, stored in: ${FINAL_BUILD_DIR}"
 #| }
-#| 
+#|
 #| build "$CURRENT_COMMIT_DIR" build-no-mpi-regular-lpb "0" ""
 #| build "$CURRENT_COMMIT_DIR" build-with-mpi-regular-lpb "${MPI_PATH}" ""
 #| build "$CURRENT_COMMIT_DIR" build-no-mpi-large-lpb "0" "-DSIZEOF_P_R_VALUES=8 -DSIZEOF_INDEX=8"
 #| build "$CURRENT_COMMIT_DIR" build-with-mpi-large-lpb "${MPI_PATH}" "-DSIZEOF_P_R_VALUES=8 -DSIZEOF_INDEX=8"
-#| 
+#|
 #| if [ -d "build.bkp" ]; then
 #|     echo "Restoring previous build folder"
 #|     mv build.bkp build
 #| fi
-#| 
+#|
 
 #@ FILE code/cado_nfs_binaries.py 644 6258 f9835d719c7958abe25b946704a4b4705ef66ade37a32d16c800f9c4e7a5b6c7 text
 #| import argparse
@@ -1059,26 +1249,26 @@ if __name__ == "__main__":
 #| from candy import print_command_line
 #| from misc_tools import find_factors_close_to_square_root
 #| from timing import *
-#| 
+#|
 #| class Singleton(type):
 #|     _instances = {}
 #|     def __call__(cls, *args, **kwargs):
 #|         if cls not in cls._instances:
 #|             cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
 #|         return cls._instances[cls]
-#| 
+#|
 #| class CadoNFSBinaries(metaclass=Singleton):
 #|     def __init__(self):
 #|         self.cado_build_dir = None
-#| 
+#|
 #|     def set_build_dir(self, path):
 #|         if not os.path.exists(path):
 #|             raise RuntimeError(f"{path} does not exist")
 #|         self.cado_build_dir = path
-#| 
+#|
 #|     class BinaryNotFound(Exception):
 #|         pass
-#| 
+#|
 #|     def __call__(self, binary, *args,
 #|                  mpi_exec=[],
 #|                  outputs={},
@@ -1097,7 +1287,7 @@ if __name__ == "__main__":
 #|         if not os.path.exists(bin_fullpath):
 #|             raise CadoNFSBinaries.BinaryNotFound(bin_fullpath)
 #|         new_args = [ bin_fullpath ]
-#| 
+#|
 #|         outputs_to_move = dict()
 #|         using_mpi = len(mpi_exec) > 0 or "OMPI_VERSION" in os.environ
 #|         if using_mpi:
@@ -1105,10 +1295,10 @@ if __name__ == "__main__":
 #|             for name, path in outputs.items():
 #|                 outputs[name] = os.path.join(tmp_out_path, os.path.basename(path) + "_tmp")
 #|                 outputs_to_move[outputs[name]] = path
-#| 
+#|
 #|         my_inputs = deepcopy(inputs)
 #|         my_outputs = deepcopy(outputs)
-#| 
+#|
 #|         for c in args:
 #|             if (path := my_inputs.get(c)) is not None:
 #|                 if type(path) == str:
@@ -1139,33 +1329,33 @@ if __name__ == "__main__":
 #|         if len(my_inputs):
 #|             print(new_args)
 #|             raise RuntimeError(f"Unconsumed inputs: {my_inputs}")
-#| 
+#|
 #|         # It's okay to have an output that is exactly the same as an
 #|         # input file. We'll still check that it hasn't disappeared on
 #|         # exit.
 #|         if any([v for v in my_outputs.values() if v not in inputs.values()]):
 #|             raise RuntimeError(f"Unconsumed outputs: {my_outputs}")
-#| 
+#|
 #|         print_command_line(new_args[0], *new_args[1:])
-#| 
+#|
 #|         capture_kwargs = {}
 #|         if capture:
 #|             capture_kwargs["stdout"] = subprocess.PIPE if capture is True else capture
 #|             if stderr:
 #|                 capture_kwargs["stderr"] = stderr
-#| 
+#|
 #|         if not stderr:
 #|             capture_kwargs["stderr"] = subprocess.PIPE
-#| 
+#|
 #|         sp = subprocess.run("time -p " + " ".join(new_args), shell=True, **capture_kwargs)
-#| 
+#|
 #|         if stderr:
 #|             cputime_sp = extract_time_from_file(stderr.name, parse_multiple=using_mpi)
 #|         else:
 #|             cputime_sp = extract_time(sp.stderr.decode(), parse_multiple=using_mpi)
 #|         overall_cputime.add(cputime_sp)
 #|         timeprint(f"CadoNFS call took {cputime_sp}s cputime.")
-#| 
+#|
 #|         rc = sp.returncode
 #|         if rc != 0 and not may_fail:
 #|             if stderr:
@@ -1173,32 +1363,32 @@ if __name__ == "__main__":
 #|             else:
 #|                 stderr_str = sp.stderr.decode()
 #|             raise RuntimeError(f"{os.path.basename(binary)} failed with return code {rc}; stderr:\n{stderr_str}")
-#| 
+#|
 #|         for src_path, dest_path in outputs_to_move.items():
 #|             if not os.path.exists(src_path):
 #|                 raise RuntimeError(f"After calling {binary}: expected output {src_path} (to be moved to {dest_path}) not found")
-#| 
+#|
 #|             shutil.move(src_path, dest_path)
-#| 
+#|
 #|         # Note: this returns bytes!
 #|         if capture is True:
 #|             return sp.stdout
-#| 
-#| 
+#|
+#|
 #| def CadoNFS(*args, **kwargs):
 #|     return CadoNFSBinaries()(*args, **kwargs)
-#| 
+#|
 #| if __name__ == "__main__":
 #|     parser = argparse.ArgumentParser(prog='cado_nfs_binaries.py',
 #|         description='This wrapper is an ugly hack that only works if none of the arguments has a space and doesn\'t support all keyword arguments. The proper way is to import CadoNFS')
-#| 
+#|
 #|     parser.add_argument('--thr', type=str,
 #|         help="2d mapping of threads <n>x<m> (i.e., n*m threads in total) to pass as argument 'thr=' to executed binary.")
 #|     parser.add_argument('--cado-build-dir', type=str, required=True,
 #|             help="Directory with cado-nfs build.")
-#| 
+#|
 #|     args, inner_args = parser.parse_known_args()
-#| 
+#|
 #|     if args.thr:
 #|         if args.thr == "auto":
 #|             if "SLURM_NTASKS_PER_NODE" in os.environ:
@@ -1211,11 +1401,11 @@ if __name__ == "__main__":
 #|                 )
 #|         else:
 #|             thr = args.thr
-#| 
+#|
 #|         inner_args.append(f"thr={thr}")
-#| 
+#|
 #|     CadoNFSBinaries().set_build_dir(args.cado_build_dir)
-#| 
+#|
 #|     CadoNFS(*inner_args)
 
 #@ LINK code/cado_sage cado/tests/sagemath/cado_sage
@@ -1226,7 +1416,7 @@ if __name__ == "__main__":
 #| EXCL = "❗"
 #| NOTHING_TO_DO = "💤"
 #| HURRAH = "🥳"
-#| 
+#|
 #| class ANSI(object):
 #|     """ Class defining some ANSI control sequences, for example for
 #|     changing text color """
@@ -1260,26 +1450,26 @@ if __name__ == "__main__":
 #|             text = text[:width]
 #|             pad = ' ' * (width - len(text))
 #|         return "{0};;{1}\x07{2}{0};;\x07".format(ANSI.OSC, target, text) + pad
-#| 
-#| 
-#| 
+#|
+#|
+#|
 #| def print_command_line(what, *args):
 #|     line = " ".join([what] + list(args))
 #|     print(f"{ANSI.YELLOW}{what} command line: {line}{ANSI.NORMAL}")
-#| 
+#|
 #| def major_message(msg, *args, **kwargs):
 #|     print(ANSI.BRIGHTBLUE + str(msg), *args, ANSI.NORMAL, **kwargs)
-#| 
+#|
 #| def warning_message(*args, **kwargs):
 #|     print(ANSI.RED + "Warning:", *args, ANSI.NORMAL, **kwargs)
-#| 
+#|
 #| def error_message(*args, **kwargs):
 #|     print(ANSI.BRIGHTRED + "Error:", *args, ANSI.NORMAL, **kwargs)
-#| 
+#|
 
 #@ FILE code/config/n1024.config 644 5107 8521e24ecd8606bd2dda189ff4ceea6456fbb33a8fbf2033ce5d562393a48449 text
 #| [DEFAULT]
-#| 
+#|
 #| # Global things
 #| # -------------
 #| # Changing any of these means RESTARTING the whole computation!
@@ -1299,7 +1489,7 @@ if __name__ == "__main__":
 #| LAS_DESCENT_UNTIL_LPB1 = 38
 #| current_desc_rb_lpb0 = 36
 #| current_desc_rb_lpb1 = 35
-#| 
+#|
 #| # Parallelism
 #| # -----------
 #| slurm.numjobs = 800
@@ -1321,7 +1511,7 @@ if __name__ == "__main__":
 #| desc.large_las.numjobs = 50
 #| desc_ecm_init.numjobs = 500
 #| desc.lq.nthreads = 44
-#| 
+#|
 #| # Polyselect
 #| # ----------
 #| poly.P = 5000000
@@ -1334,11 +1524,11 @@ if __name__ == "__main__":
 #| poly.ropteffort = 3
 #| poly.nq = 1000
 #| poly.keep = 10
-#| 
+#|
 #| # Post-polyselect
 #| # ---------------
 #| poly.skew = 267925
-#| 
+#|
 #| # Algebraic and extension sieving
 #| # -------------------------------
 #| A_sieving = 30
@@ -1356,13 +1546,13 @@ if __name__ == "__main__":
 #| sieve.powlim = 128
 #| sieve.bkthresh1 = 67108864
 #| sieve.bkmult = 1.8
-#| 
+#|
 #| merge.target_density = 210
 #| purge.keep = 100
-#| 
+#|
 #| extra_alg.q0 = 400000000
 #| extra_alg.q1 = 600000000
-#| 
+#|
 #| # Descent: las_descent step
 #| # -------------------------
 #| I_sieving = 19
@@ -1375,7 +1565,7 @@ if __name__ == "__main__":
 #| desc.bkmult = 1.477
 #| desc.bkthresh1 = 536870912
 #| desc.lim = 2147483648
-#| 
+#|
 #| # Descent: ECM (init) step
 #| # ------------------------
 #| desc.ecm.q0 = 2147483648
@@ -1396,7 +1586,7 @@ if __name__ == "__main__":
 #| desc.ecm.B1 = 500000
 #| desc.ecm.cofacB_log = 260
 #| desc.ecm.smoothB_log = 135
-#| 
+#|
 #| # Descent: Large-q step
 #| # ---------------------
 #| desc.lq.lim = 2147483648
@@ -1411,7 +1601,7 @@ if __name__ == "__main__":
 #| desc.lq.nq = 200
 #| desc.lq.q0 = 30
 #| desc.lq.skewmin = 0.1
-#| 
+#|
 #| # Descent: Bottom-q steps
 #| # -----------------------
 #| desc.botq.lim0 = 268435456
@@ -1434,7 +1624,7 @@ if __name__ == "__main__":
 #| desc.botq.memory_margin = 60
 #| desc.botq.bkthresh1 = 134217728
 #| desc.botq.bkmult = 1.551,1l:1.980
-#| 
+#|
 #| desc.compq.0.nprimes = 200
 #| desc.compq.0.lim0 = 268435456
 #| desc.compq.0.lim1 = 1073741824
@@ -1447,7 +1637,7 @@ if __name__ == "__main__":
 #| desc.compq.0.memory_margin = 60
 #| desc.compq.0.bkthresh1 = 134217728
 #| desc.compq.0.bkmult = 1.365
-#| 
+#|
 #| desc.compq.1.nprimes = 200
 #| desc.compq.1.lim0 = 268435456
 #| desc.compq.1.lim1 = 1073741824
@@ -1460,11 +1650,11 @@ if __name__ == "__main__":
 #| desc.compq.1.memory_margin = 60
 #| desc.compq.1.bkthresh1 = 134217728
 #| desc.compq.1.bkmult = 1.365
-#| 
+#|
 #| # Linalg
 #| # ------
 #| bwc.numsols = 10
-#| 
+#|
 #| # Root: Montgomery only for n1024
 #| # -------------------------------
 #| MONTGOMERY_ROOT_PRECISION = 2000
@@ -1477,9 +1667,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n128.config 644 827 5656e3d898490ffc22d8b03163bae98150aa3013e8cf73d803e068e3f6f96bc4 text
 #| # Run with:
 #| # time sage run.py -P --slurm -l locations.config config/n128.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 128
 #| POLY_DEG = 5
 #| N = 304137846200727043191218881779829950269
@@ -1519,9 +1709,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n192.config 644 977 148def0616cf7dc12fcb610240875340e6ada088d20699fc6421c6567aaeb8e5 text
 #| # Run with:
 #| # time sage run.py -P --slurm -l locations.config config/n192.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 192
 #| POLY_DEG = 5
 #| N = 3958467124829191585457078087510675825057644279232546664283
@@ -1565,9 +1755,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n256.config 644 1459 0c3844e2fe66da94a7887190d6757bff4c28c31b546871d64b3d6153dd4a486b text
 #| # Run with:
 #| # time sage run.py -P --slurm --descent-slurm -l locations.config config/n256.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 256
 #| POLY_DEG = 5
 #| N = 44381972256420161689173941265882320680652129342310833164679746817541796561451
@@ -1611,7 +1801,7 @@ if __name__ == "__main__":
 #| mpi.thr = auto
 #| desc.hintfile=hintfiles/n256.hint
 #| slurm.numjobs = 6
-#| 
+#|
 #| # Below is for testing functionality,
 #| # and is not necessary for a successful n256 run.
 #| desc.botq.lim = 1048576
@@ -1627,9 +1817,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n320.config 644 1117 e7f555e381f966a3fe664c7e1abcb215cd2e2e0678cb532d0798ff11c19445b5 text
 #| # Run with:
 #| # time sage run.py -P --slurm --descent-slurm -l locations.config config/n320.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 320
 #| POLY_DEG = 5
 #| N = 1829183769955520173757039599738624451694860540582759363661280241944093828122445883419577602817941
@@ -1673,7 +1863,7 @@ if __name__ == "__main__":
 
 #@ FILE code/config/n320exponent65537.config 644 922 475e68deabf9e50de7da2cd84df821f1ca4040592951d78a4d72669e309b5186 text
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 320
 #| POLY_DEG = 5
 #| N = 1829183769955520173757039599738624451694860540582759363661280241944093828122445883419577602817941
@@ -1715,9 +1905,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n384.config 644 1325 7baa712b0aff3771521029c66462c45528fb6687c0bae4fb8a99352f323ed4e4 text
 #| # Run with:
 #| # time sage run.py -M --slurm --descent-slurm --bwc-slurm -l locations.config config/n384.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 384
 #| POLY_DEG = 5
 #| N = 18139451072522360018254053428894265444247450052067382340358212285267156379932207324867100779377536420127703349827837
@@ -1769,9 +1959,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n448.config 644 1403 6481d9dd149f6459384f35ad7bc8c183308e1949b037789fac20d2ee8d21d033 text
 #| # Run with:
 #| # time sage run.py -M --slurm --descent-slurm --bwc-slurm -l locations.config config/n448.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 448
 #| POLY_DEG = 5
 #| N = 437876930449829324568710421640415946721117275704070176567286801026163350200323685308785227335307878461473462266861443424253488162945959
@@ -1810,7 +2000,7 @@ if __name__ == "__main__":
 #| mpi.thr = auto
 #| desc.hintfile=hintfiles/n448.hint
 #| slurm.numjobs = 16
-#| 
+#|
 #| # these parameters haven't been optimized, but they're way better than the defaults:
 #| montgomery.max_norm_bits = 4000
 #| montgomery.cpucount = 20
@@ -1821,9 +2011,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n512.config 644 2460 5e481562348cfe3344b74dae1bb835a43b2ee6965e9b3705d10b581c52946977 text
 #| # Run with:
 #| # time sage run.py -M --slurm --descent-slurm --bwc-slurm -l locations.config config/n512.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 512
 #| POLY_DEG = 5
 #| N = 6303571096668388543907135877498786600375588844161979327075551069886620229248815527199304883317464389004367047463515306581886865580782694026437601650033149
@@ -1883,7 +2073,7 @@ if __name__ == "__main__":
 #| descent_init.I = 16
 #| descent_max_increase_A = 3
 #| descent_max_increase_lpb = 6
-#| 
+#|
 #| # Descent: Bottom-q steps
 #| # -----------------------
 #| desc.botq.lim = 1048576
@@ -1895,7 +2085,7 @@ if __name__ == "__main__":
 #| desc.botq.I_sieving = 16
 #| desc.botq.nq = 1000
 #| desc.botq.q0 = 30
-#| 
+#|
 #| desc.compq.0.nprimes = 1000
 #| desc.compq.0.lim0 = 16777216
 #| desc.compq.0.lim1 = 16777216
@@ -1904,7 +2094,7 @@ if __name__ == "__main__":
 #| desc.compq.0.ncurves0 = 20
 #| desc.compq.0.ncurves1 = 100
 #| desc.compq.0.I = 14
-#| 
+#|
 #| desc.compq.1.nprimes = 1000
 #| desc.compq.1.lim0 = 16777216
 #| desc.compq.1.lim1 = 16777216
@@ -1917,9 +2107,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n60.config 644 913 f82cfa6fb0c9b02667d3f2afbc5f49cdf40b6db8dbf1e6cba808276600e7f8c1 text
 #| # Run with:
 #| # time sage run.py -P --slurm -l locations.config config/n60.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 60
 #| POLY_DEG = 4
 #| e = 67
@@ -1963,7 +2153,7 @@ if __name__ == "__main__":
 
 #@ FILE code/config/n666.config 644 3037 c4fd39be76b743b5bcab9c34e4bc55d0a35c6deebabe71e429d56aa89d9b4a3f text
 #| [DEFAULT]
-#| 
+#|
 #| # Global things
 #| # -------------
 #| # Changing any of these means RESTARTING the whole computation!
@@ -1979,7 +2169,7 @@ if __name__ == "__main__":
 #| LPB1_queries = 26
 #| LPB0 = 29
 #| LARGEQ = 95
-#| 
+#|
 #| # Parallelism
 #| # -----------
 #| las.hwloc_job_binding_policy = auto
@@ -1993,7 +2183,7 @@ if __name__ == "__main__":
 #| desc.memory_margin = 50
 #| desc.ecm.ecm_nthreads = 24
 #| desc.large_las.numjobs = 30
-#| 
+#|
 #| # Polyselect
 #| # ----------
 #| poly.P = 12000
@@ -2003,7 +2193,7 @@ if __name__ == "__main__":
 #| poly.Bf = 16777216
 #| poly.Bg = 1048576
 #| poly.ropteffort = 3
-#| 
+#|
 #| # Algebraic and extension sieving
 #| # -------------------------------
 #| A_sieving = 28
@@ -2020,7 +2210,7 @@ if __name__ == "__main__":
 #| extension_sieving.never_discard = 0
 #| sieve.mfb1 = 95
 #| sieve.powlim = 128
-#| 
+#|
 #| # Descent: las_descent step
 #| # -------------------------
 #| I_sieving = 17
@@ -2030,14 +2220,14 @@ if __name__ == "__main__":
 #| desc.hintfile=hintfiles/n666.hint
 #| descent_max_increase_A = 1
 #| descent_max_increase_lpb = 6
-#| 
+#|
 #| # Descent: Default "init" step
 #| # ----------------------------
 #| descent_init.lim = 2147483648
 #| descent_init.I = 18
 #| descent_init.lpb = 101
 #| descent_init.mfb = 160
-#| 
+#|
 #| # Descent: ECM (init) step
 #| # ------------------------
 #| desc.ecm.q0 = 2147483648
@@ -2058,7 +2248,7 @@ if __name__ == "__main__":
 #| desc.ecm.B1 = 500000
 #| desc.ecm.cofacB_log = 260
 #| desc.ecm.smoothB_log = 135
-#| 
+#|
 #| # Descent: Large-q step
 #| # ---------------------
 #| desc.lq.lim = 2000000000
@@ -2072,11 +2262,11 @@ if __name__ == "__main__":
 #| desc.lq.I_sieving = 16
 #| desc.lq.nq = 1000
 #| desc.lq.q0 = 30
-#| 
+#|
 #| # Linalg
 #| # ------
 #| bwc.numsols = 20
-#| 
+#|
 #| # Root: Montgomery only for n666
 #| # ------------------------------
 #| MONTGOMERY_ROOT_PRECISION = 160
@@ -2087,7 +2277,7 @@ if __name__ == "__main__":
 
 #@ FILE code/config/n768.config 644 4359 be7cdbc5ac29c7736a1259c22c2e7a5983db9fa5581035cb108de03700976e65 text
 #| [DEFAULT]
-#| 
+#|
 #| # Global things
 #| # -------------
 #| # Changing any of these means RESTARTING the whole computation!
@@ -2105,7 +2295,7 @@ if __name__ == "__main__":
 #| LARGEQ = 95
 #| LAS_DESCENT_UNTIL_LPB0 = 33
 #| LAS_DESCENT_UNTIL_LPB1 = 33
-#| 
+#|
 #| # Parallelism
 #| # -----------
 #| slurm.numjobs = 90
@@ -2128,7 +2318,7 @@ if __name__ == "__main__":
 #| desc.large_las.numjobs = 16
 #| desc_ecm_init.numjobs = 240
 #| desc.lq.nthreads = 8
-#| 
+#|
 #| # Polyselect
 #| # ----------
 #| poly.P = 5000000
@@ -2141,11 +2331,11 @@ if __name__ == "__main__":
 #| poly.ropteffort = 3
 #| poly.nq = 625
 #| poly.keep = 200
-#| 
+#|
 #| # Post-polyselect
 #| # ---------------
 #| poly.skew = 20342
-#| 
+#|
 #| # Algebraic and extension sieving
 #| # -------------------------------
 #| A_sieving = 32
@@ -2164,10 +2354,10 @@ if __name__ == "__main__":
 #| sieve.bkmult = 1.8
 #| merge.target_density = 210
 #| purge.keep = 100
-#| 
+#|
 #| extra_alg.q0 = 53687091
 #| extra_alg.q1 = 57713623
-#| 
+#|
 #| # Descent: las_descent step
 #| # -------------------------
 #| I_sieving = 18
@@ -2180,7 +2370,7 @@ if __name__ == "__main__":
 #| desc.bkmult = 1.3
 #| desc.bkthresh1 = 268435456
 #| desc.lim = 536870912
-#| 
+#|
 #| # Descent: ECM (init) step
 #| # ------------------------
 #| desc.ecm.q0 = 2147483648
@@ -2201,7 +2391,7 @@ if __name__ == "__main__":
 #| desc.ecm.B1 = 500000
 #| desc.ecm.cofacB_log = 260
 #| desc.ecm.smoothB_log = 135
-#| 
+#|
 #| # Descent: Large-q step
 #| # ---------------------
 #| desc.lq.lim = 2000000000
@@ -2216,7 +2406,7 @@ if __name__ == "__main__":
 #| desc.lq.nq = 1000
 #| desc.lq.q0 = 30
 #| desc.lq.skewmin = 0.1
-#| 
+#|
 #| # Descent: Bottom-q steps
 #| # -----------------------
 #| desc.botq.lim = 1073741824
@@ -2229,7 +2419,7 @@ if __name__ == "__main__":
 #| desc.botq.nq = 1000
 #| desc.botq.q0 = 30
 #| desc.botq.sqside = 1
-#| 
+#|
 #| desc.compq.0.nprimes = 1000
 #| desc.compq.0.lim0 = 2147483648
 #| desc.compq.0.lim1 = 1073741824
@@ -2239,7 +2429,7 @@ if __name__ == "__main__":
 #| desc.compq.0.ncurves1 = 110
 #| desc.compq.0.A = 33
 #| desc.compq.0.randsize = 16
-#| 
+#|
 #| desc.compq.1.nprimes = 50
 #| desc.compq.1.lim0 = 2147483648
 #| desc.compq.1.lim1 = 1073741824
@@ -2249,11 +2439,11 @@ if __name__ == "__main__":
 #| desc.compq.1.ncurves1 = 95
 #| desc.compq.1.A = 33
 #| desc.compq.1.randsize = 16
-#| 
+#|
 #| # Linalg
 #| # ------
 #| bwc.numsols = 10
-#| 
+#|
 #| # Root: Montgomery only for n768
 #| # ------------------------------
 #| MONTGOMERY_ROOT_PRECISION = 2000
@@ -2266,9 +2456,9 @@ if __name__ == "__main__":
 #@ FILE code/config/n90.config 644 776 1097f2e79735202d6230b7502347250586968eeb27d5d92c3cdc9ec4efab0d21 text
 #| # Run with:
 #| # time sage run.py -P --slurm -l locations.config config/n90.config
-#| 
+#|
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 90
 #| POLY_DEG = 5
 #| e = 67
@@ -2306,7 +2496,7 @@ if __name__ == "__main__":
 
 #@ FILE code/config/sn538.config 644 1387 d7c03c4053805f7fc4c310f8aff9661cae3776278006a1ece5ef070895ee3df8 text
 #| [DEFAULT]
-#| 
+#|
 #| MODULUS_BITS = 538
 #| POLY_DEG = 5
 #| N = 822196205286597019526601207430761004273909243570733965516770339373353207430502358024273032756332005408066894606696792219545093967127330845624462896060630268212317
@@ -2360,46 +2550,46 @@ if __name__ == "__main__":
 #@ FILE code/crt_ethroot.py 644 5743 2115d1955db947ea329737c11f046ad98351bbb34e2c08015fbb1b83f4a6a814 text
 #| from sage.all import *
 #| import itertools
-#| 
-#| 
+#|
+#|
 #| """
 #| eth roots in a number field using the CRT approach.
 #| (Note that this is not what we did in the paper, for that see montgomery_*.py and hybrid_root_*.py.)
 #| """
-#| 
+#|
 #| """
 #| Let alpha be the root of f in our number field.
 #| Let P be the root of f mod N. (alpha maps to P).
-#| 
+#|
 #| We want to compute an eth root of S(alpha) = prod_i (a_i + b_i alpha)^(m_i).
 #| Eventually we want an eth root of S(P) mod N.
-#| 
+#|
 #| Assume all the m_i are positive, so that S(alpha) is in Z[alpha], and assume the eth root is also in Z[alpha].
-#| 
+#|
 #| The idea is this: Take everything mod p, where p is inert in our the number field.
 #| We start with Z[alpha], which is an extension of Z, namely Z[x]/(f(x))).
 #| So we map to an extension of F_p, namely F_p[x]/(f(x)).
 #| Since f(x) is irreducible mod p and has degree d, we get F_{p^d}.
 #| Let beta be the root of f(x) in F_{p^d}.
-#| 
+#|
 #| Where does S(alpha) map to? It maps to S(beta). We can compute it explicitly as prod_i (a_i + b_i beta)^(m_i).
-#| 
+#|
 #| Then we take the eth root in F_{p^d}. (If e is relatively prime to p^d-1, it should be unique.)
 #| i.e., find roots in F_{p^d} of (x^e - S(beta))
-#| 
+#|
 #| We now know the coefficients mod p of the eth root of S(alpha).
-#| 
+#|
 #| From here, we have two options:
 #| 1) Use Hensel lifting to compute the coefficients mod p^2, p^3, p^4, and so on; or
 #| 2) Repeat with other inert primes p, and CRT the results together to compute the coefficients mod p1*p2*p3*...
-#| 
+#|
 #| Here we do the latter.
-#| 
+#|
 #| Either way, eventually we know the coefficients of the eth root of S(alpha) over the integers.
 #| """
-#| 
+#|
 #| x = polygen(ZZ)
-#| 
+#|
 #| def polyselect(N, d):
 #|     """
 #|     Find a polynomial f of degree d and an integer P such that f(P) = 0 (mod N).
@@ -2412,7 +2602,7 @@ if __name__ == "__main__":
 #|     assert f(P) % N == 0 and f.degree() == d
 #|     assert f.is_irreducible() # if not, we've already factored N.
 #|     return f, P
-#| 
+#|
 #| def find_good_primes(f, e, num=1000, start=2**41, stop=2**42):
 #|     """Generate primes p satisfying the following:
 #|         1. gcd(p^(deg f) - 1, e) = 1 (so that eth roots are unique in F_p^d)
@@ -2427,7 +2617,7 @@ if __name__ == "__main__":
 #|             if len(prime_list) > num:
 #|                 return prime_list
 #|     return prime_list
-#| 
+#|
 #| def ethroot(abms, f, e, N):
 #|     """
 #|     Find an eth root of S(alpha) in Z[alpha], or at least find its coefficients mod p for a bunch of primes p.
@@ -2447,7 +2637,7 @@ if __name__ == "__main__":
 #|         root = (y**e - Sbeta).roots()[0][0]
 #|         # The root, as a polynomial in beta, has coefficients that agree mod p with those of the eth root of S(alpha).
 #|         yield (p, [c.lift() for c in root.list()])
-#| 
+#|
 #| def ethroot_p(abms, f, e, N, p):
 #|     """
 #|     Unyield above function
@@ -2461,15 +2651,15 @@ if __name__ == "__main__":
 #|     root = (y**e - Sbeta).roots()[0][0]
 #|     # The root, as a polynomial in beta, has coefficients that agree mod p with those of the eth root of S(alpha).
 #|     return (p, [c.lift() for c in root.list()])
-#| 
+#|
 #| def do_test(nbits=1000, e=3):
 #|     N = random_prime(2**(nbits//2)) * random_prime(2**(nbits//2 + 1))
 #|     f, P = polyselect(N, 5)
 #|     print(f)
-#| 
+#|
 #|     Zalpha = ZZ.extension(f, 'alpha')
 #|     alpha = Zalpha.gen(1)
-#| 
+#|
 #|     abms = [(randint(-1000,1000), randint(-1000,1000), randint(1,4)) for _ in range(10)]
 #|     solution = prod((a + b*alpha)**m for (a,b,m) in abms)
 #|     target = prod((a + b*alpha)**(e*m) for (a,b,m) in abms)
@@ -2498,8 +2688,8 @@ if __name__ == "__main__":
 #|         print("p:", p)
 #|         print("sol % p:", [c % p for c in solution.list()])
 #|         print("coefflist:", coefflist)
-#| 
-#| 
+#|
+#|
 #| # do_test()
 
 #@ FILE code/descent_ecm_utils.py 644 7344 f7407cee35439a7a88709d4732d82bfeb481c8c99929487a03dd417ef040e30b text
@@ -2508,7 +2698,7 @@ if __name__ == "__main__":
 #| import concurrent.futures
 #| from concurrent.futures import ProcessPoolExecutor as ProcessPool
 #| import multiprocessing
-#| 
+#|
 #| def isqrt(n):
 #|     x = n
 #|     y = (x + 1) // 2
@@ -2516,7 +2706,7 @@ if __name__ == "__main__":
 #|         x = y
 #|         y = (x + n // x) // 2
 #|     return x
-#| 
+#|
 #| def myxgcd(a, b, T):
 #|     '''
 #|     I believe this stands for "multiplicative" gcd.
@@ -2545,7 +2735,7 @@ if __name__ == "__main__":
 #|         lasty = y
 #|         y = newy
 #|     return [[b, x], [a, lastx]]
-#| 
+#|
 #| def filter_with_ecm(N, B1, ncurves):
 #|     '''
 #|     Return two lists: the "prime" factors of N, and the remaining cofactors.
@@ -2569,7 +2759,7 @@ if __name__ == "__main__":
 #|                 return (list_p, list_c)
 #|     list_c.append(current_comp)
 #|     return (list_p, list_c)
-#| 
+#|
 #| def filter_both_with_ecm(N1, N2, smooth_bound, cofac_bound, B1, ncurves):
 #|     output = []
 #|     primes = []
@@ -2587,7 +2777,7 @@ if __name__ == "__main__":
 #|         output.append(outN[1])
 #|         primes.append(outN[0]);
 #|     return (True, output, primes)
-#| 
+#|
 #| def try_pair(N1, N2, smooth_bound, cofac_bound, B1, ncurves, line):
 #|     print("***** trying a new pair *****")
 #|     print("ECM filtering:")
@@ -2611,10 +2801,10 @@ if __name__ == "__main__":
 #|                     return (False, None)
 #|                 for fac in ret:
 #|                     out[2][side].append(fac[0])
-#| 
+#|
 #|     print("Youpi!")
 #|     return (True, out[2], line)
-#| 
+#|
 #| def try_file(filename, smooth_bound, cofac_bound, B1, ncurves, nthreads=1):
 #|     '''
 #|     filename should contain a list of (a,b) pairs.
@@ -2634,17 +2824,17 @@ if __name__ == "__main__":
 #|             cofac_side1 = Integer(abcd[3].strip())
 #|             list_of_cofacs.append((cofac_side0, cofac_side1))
 #|             survivor_lines.append(line)
-#| 
+#|
 #|     print(f"Number of candidates is {len(list_of_cofacs)}")
 #|     ctx = multiprocessing.get_context('fork')
-#| 
+#|
 #|     batchsize = 44
 #|     num_processed = 0
 #|     winner = (False, None, "")
-#| 
+#|
 #|     while num_processed < len(list_of_cofacs):
 #|         this_batch = range(num_processed, min(num_processed + batchsize, len(list_of_cofacs)))
-#| 
+#|
 #|         with ProcessPool(mp_context=ctx, max_workers=nthreads) as executor:
 #|             futures = [
 #|                 executor.submit(try_pair, list_of_cofacs[i][0], list_of_cofacs[i][1], smooth_bound, cofac_bound, B1, ncurves, survivor_lines[i])
@@ -2666,7 +2856,7 @@ if __name__ == "__main__":
 #|             except Exception:
 #|                 # This is where the timeout is caught
 #|                 continue
-#| 
+#|
 #|             print("broke out of the loop...")
 #|             if winner[0] == True:
 #|                 print("trying to shut down...")
@@ -2677,42 +2867,42 @@ if __name__ == "__main__":
 #|                     except Exception:
 #|                         continue
 #|                 return winner
-#| 
+#|
 #|             # Else keep going (?)
 #|             # TODO: could also continue the not_done processes
 #|             num_processed += len(this_batch)
-#| 
+#|
 #|     return False, None, ""
-#| 
+#|
 #| def transform_polys_by_q(g, f, q, rho, side):
 #|     # Given the original polynomial pair, we can create a modified pair that will
 #|     # let us account for one large special-q. This q will not show up in sieving or
 #|     # relations, but we will add it back in to relations under the original polynomials.
 #|     # For our purposes, g is the rational side and f is the algebraic side.
-#| 
+#|
 #|     # q must be prime.
 #|     # rho should be (for side 0) a root g.roots(GF(q)).
 #|     # Our new polynomials newg, newf should have a shared root mod newg.resultant(newf). Note that
 #|     # this root is easy to compute assuming newg is linear (the resultant is often composite).
 #|     # In fact this method only works assuming g, newg are linear.
-#| 
+#|
 #|     assert (side in [0,1])
 #|     coeff = myxgcd(int(rho), int(q), 1)
 #|     a0 = coeff[0][0]
 #|     b0 = coeff[0][1]
 #|     a1 = coeff[1][0]
 #|     b1 = coeff[1][1]
-#| 
+#|
 #|     R = parent(f)
 #|     x = R.gen()
 #|     num = a0*x+a1
 #|     den = b0*x+b1
-#| 
+#|
 #|     ff = f(num/den)*(den**f.degree())
 #|     ffn = ff.numerator()
 #|     gg = g(num/den)*(den**g.degree())
 #|     ggn = gg.numerator()
-#| 
+#|
 #|     if side == 0:
 #|         c = ggn.content()   # gcd of all coefficients
 #|         assert c % q == 0
@@ -2723,12 +2913,12 @@ if __name__ == "__main__":
 #|         assert c % q == 0
 #|         newg = ggn
 #|         newf = R(ffn / q)
-#| 
+#|
 #|     return (newg, newf, coeff)
 
 #@ FILE code/descent_helper.py 644 16543 8a715010f6991b174cd46b536e12e5f3d80e9fbb52fef51abec6eb0236b89c28 text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| from cado.scripts import descent
 #| from helpers import timeprint
@@ -2746,69 +2936,69 @@ if __name__ == "__main__":
 #| from cado_nfs_binaries import CadoNFS,CadoNFSBinaries
 #| import time
 #| import descent_ecm_utils
-#| 
+#|
 #| from run import LuckySplitException
-#| 
-#| 
+#|
+#|
 #| # XXX This is not unified with Params in run.py, which is unfortunate.
 #| # This type definition is quite like argparse.Namespace, by the way.
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| class ConstructSError(Exception):
 #|     def __init__(self, missed, *args, **kwargs):
 #|         super().__init__(*args, **kwargs)
 #|     def __str__(self):
 #|         return "Error in constructing S"
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='descent_helper.py')
 #|     topparser.add_argument('--params',dest='params')
 #|     topparser.add_argument('--seed',dest='seedval')
 #|     topparser.add_argument('--existing-init-data',dest='existing_init_data',required=False)
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
-#| 
+#|
 #|     e = params.parameters['e']
 #|     N = params.parameters['N']
 #|     ZN = Integers(N)
-#| 
+#|
 #|     target = generate_or_load_target(params)
-#| 
+#|
 #|     # the initial u,v are both about half the modulus bits, and we'll ask
 #|     # that they factor into primes that are smaller than that by a factor
 #|     # u. The rule of thumb is that this means that we'll have to do
 #|     # 1/dickman_rho(u)^2 trials before we find a winning candidate.
-#| 
+#|
 #|     ratio = params.parameters.get('initial_descent_smoothness_ratio', 2.25)
 #|     ratio = float(ratio)
 #|     initial_smoothness_maxbits = params.parameters['MODULUS_BITS'] / 2 / ratio
-#| 
+#|
 #|     #
 #|     # with seed(topargs.seedval):
 #|     #     for spin in itertools.count():
 #|     #         mask, h, u, v = masked_target(target, e)
-#| 
+#|
 #|     #         print(ZZ(u)/ZZ(v))
 #|     #         special_qs = [p for p,k in factor(ZZ(u)/ZZ(v)) if p > params.BOUNDR]
-#| 
+#|
 #|     #         if Integer(max(special_qs, default=0)).ndigits(2) < initial_smoothness_maxbits:
 #|     #             break
-#| 
+#|
 #|     inside_parser = argparse.ArgumentParser(prog='scripts/descent.py')
 #|     inside_parser.add_argument("--target",
 #|                                help="Element whose DL is wanted",
 #|                                type=str,
 #|                                required=True)
-#| 
+#|
 #|     descent.GeneralClass.declare_args(inside_parser)
 #|     descent.DescentUpperClass.declare_args(inside_parser)
 #|     descent.DescentMiddleClass.declare_args(inside_parser)
 #|     descent.DescentLowerClass.declare_args(inside_parser)
-#| 
+#|
 #|     cpu_count = multiprocessing.cpu_count()
-#| 
+#|
 #|     inside_inputs = [
 #|         "--poly", params.files['POLYFILE'],
 #|         "--fb1", params.files['FBFILE'],
@@ -2831,16 +3021,16 @@ if __name__ == "__main__":
 #|         "--prefix", "descent",
 #|         "--no-logs",
 #|     ]
-#| 
+#|
 #|     # All parameters of descent_upper_class can be passed here.
-#| 
+#|
 #|     par = params.parameters
 #|     init_mfb = par.get('descent_init.mfb', int(par['MODULUS_BITS'] / 2 - 60))
 #|     init_I   = par.get('descent_init.I',  14)
 #|     init_lim = par.get('descent_init.lim', 2**26)
 #|     init_lpb = par.get('descent_init.lpb', int(initial_smoothness_maxbits))
 #|     init_tkewness = par.get('descent_init.tkewness', int(2**min(30, init_lpb-1)))
-#| 
+#|
 #|     # This is a local change to the environment variable and should not be reflected outside this script.
 #|     if 'desc.thr' in par:
 #|         timeprint(f"Setting environment variable CADO_NFS_MAX_THREADS to desc.thr from config file (used to set '-t' binding policy of las_descent).")
@@ -2851,7 +3041,7 @@ if __name__ == "__main__":
 #|     else:
 #|         timeprint(f"Setting environment variable CADO_NFS_MAX_THREADS={cpu_count} (used to determine threads of las_descent)")
 #|         os.environ["CADO_NFS_MAX_THREADS"] = str(cpu_count)
-#| 
+#|
 #|     #
 #|     # XXX it might make sense to also pass --init-lim. Currently we use
 #|     # the default value of 2^26, which might be too large for small
@@ -2864,21 +3054,21 @@ if __name__ == "__main__":
 #|         "--init-lim", init_lim,
 #|         "--init-tkewness", init_tkewness
 #|     ]
-#| 
+#|
 #|     # TODO: what is descent_upper_class's `--slaves`? Is it useful?
-#| 
+#|
 #|     args = inside_parser.parse_args([str(c)
 #|                                      for c in inside_inputs + more_inside_inputs])
 #|     general = descent.GeneralClass(args)
-#| 
+#|
 #|     timeprint("Args passed to CADO descent scripts:", args)
-#| 
+#|
 #|     init = descent.DescentUpperClass(general, args)
-#| 
+#|
 #|     assert target == general.target()
-#| 
+#|
 #|     init_starttime = time.time()
-#| 
+#|
 #|     if topargs.existing_init_data is not None and 'init' in topargs.existing_init_data:
 #|         # Should be a legitimate file containing:
 #|         # todofile (string filename)
@@ -2887,11 +3077,11 @@ if __name__ == "__main__":
 #|         # u_fac (list of Integers)
 #|         # v_fac (list of Integers)
 #|         # mask (Integer)
-#| 
+#|
 #|         try:
 #|             with open(topargs.existing_init_data, "r") as fp:
 #|                 init_dict = json.load(fp)
-#| 
+#|
 #|             todofilename = init_dict['todofilename']
 #|             u = Integer(init_dict['u'])
 #|             v = Integer(init_dict['v'])
@@ -2900,7 +3090,7 @@ if __name__ == "__main__":
 #|             mask = Integer(init_dict['mask'])
 #|             firstrelsfile = None    # Note this is always None anyway
 #|             largeq_rels_file = init_dict['largeq_rels_file']
-#| 
+#|
 #|             init_data = (todofilename,
 #|                         [u, v, u_fac, v_fac],
 #|                         None,
@@ -2915,62 +3105,62 @@ if __name__ == "__main__":
 #|                                             topargs.seedval,
 #|                                             randomize_multiplicatively=int(e))
 #|         largeq_rels_file = None
-#| 
+#|
 #|     init_endtime = time.time()
 #|     descent_init_time = round(init_endtime-init_starttime)
-#| 
+#|
 #|     # I don't know why this check isn't working.
 #|     if not init_data:
 #|         raise RuntimeError("init.do_descent_for_real returned None, quitting")
-#| 
+#|
 #|     todofile, uv_fac, firstrelsfile, mask = init_data
-#| 
+#|
 #|     if uv_fac is None:
 #|         timeprint(init_data)
 #|         raise RuntimeError(f"init.do_descent_for_real(target={target}, seed={topargs.seedval}) failed for some reason, quitting")
-#| 
+#|
 #|     todofile, (u, v, u_fac, v_fac), firstrelsfile, mask = init_data
-#| 
+#|
 #|     mask = ZN(mask)
 #|     u = ZZ(u)
 #|     v = ZZ(v)
 #|     u_fac = Factorization([(ZZ(p),1) for p in u_fac])
 #|     v_fac = Factorization([(ZZ(p),1) for p in v_fac])
-#| 
+#|
 #|     h = (pow(mask, e, N) * target) % N
-#| 
+#|
 #|     print("target", str(target))
 #|     print("mask", str(mask))
 #|     print("h", str(h))
 #|     print("N", str(N))
 #|     print("e",str(e))
-#| 
+#|
 #|     assert h == ZN(u/v)
-#| 
+#|
 #|     fac = Factorization(u_fac) / Factorization(v_fac)
-#| 
+#|
 #|     special_qs = [p for p,k in fac if p > params.BOUNDR]
-#| 
+#|
 #|     u_prefix = str(u)[:40]
 #|     v_prefix = str(v)[:40]
 #|     DESCENT_PREFIX = f"desc.{u_prefix}.{v_prefix}"
-#| 
+#|
 #|     for ext in ["todo", "err", "out", "badideals", "badidealinfo",
 #|                 "descent.tgt.middle.rels", "json"]:
 #|         path = params.dirs['DESC']+DESCENT_PREFIX+'.'+ext
 #|         if os.path.exists(path):
 #|             warning_message(f"Removing {path}")
 #|             os.unlink(path)
-#| 
+#|
 #|     path = params.files['TGT_INFO']+"."+DESCENT_PREFIX
 #|     if os.path.islink(path):
 #|         warning_message(f"Removing {path}")
 #|         os.unlink(path)
-#| 
+#|
 #|     output_name = params.dirs['DESC'] + DESCENT_PREFIX + ".descent.tgt.middle.rels"
 #|     descent_info = dict(tgt=target, mask=mask, h=h, u=u,
 #|                         v=v,lucky=False,DRELS_FILE=output_name,init_time=descent_init_time,middle_time=0)
-#| 
+#|
 #|     if len(special_qs) == 0:
 #|         major_message("Got lucky with the initial split! No descent necessary.")
 #|         del descent_info['DRELS_FILE']
@@ -2985,44 +3175,44 @@ if __name__ == "__main__":
 #|         timeprint(descent_info)
 #|         u_fac = factor(Integer(u))
 #|         v_fac = factor(Integer(v))
-#| 
+#|
 #|         json_custom.dump(descent_info,
 #|                          open(params.dirs['DESC']+DESCENT_PREFIX + ".json","w"),
 #|                          indent=True)
-#| 
+#|
 #|         # In reality we can get rid of the exception now, I think.
 #|         # raise LuckySplitException(mask, u_fac, v_fac, u, v, h)
 #|         sys.exit(0)
-#| 
+#|
 #|     json_custom.dump(descent_info,
 #|                      open(params.dirs['DESC']+DESCENT_PREFIX + ".json","w"),
 #|                      indent=True)
-#| 
+#|
 #|     timeprint(f"Initializing descent with seed={topargs.seedval}"
 #|           f" tgt=(u,v): {target}={u}/{v}")
 #|     # f" (target found after {spin} factorization attemps)"
-#| 
+#|
 #|     with open(params.dirs['DESC']+DESCENT_PREFIX+'.todo', "w") as file:
 #|         for q in reversed(sorted(special_qs)):
 #|             # 0 for the rational side
 #|             print(f"0 {q}", file=file)
-#| 
+#|
 #|     sq_desc = " ".join([f"{q.ndigits(2)}@0" for q in special_qs])
 #|     len_sq = len(special_qs)
-#| 
+#|
 #|     if topargs.existing_init_data is not None:
 #|         with open(todofile, 'r') as f:
 #|             sq_desc = [x.strip() for x in f.readlines()]
 #|             len_sq = len(sq_desc)
-#| 
+#|
 #|     timeprint(f"Descent initialized {len_sq} special-q's: {sq_desc}")
-#| 
+#|
 #|     # prepare these files so that cado doesn't recompute them
 #|     os.symlink(os.path.realpath(params.files['POLYFILE']) + ".badideals",
 #|                params.dirs['DESC'] + DESCENT_PREFIX + ".badideals")
 #|     os.symlink(os.path.realpath(params.files['POLYFILE']) + ".badidealinfo",
 #|                params.dirs['DESC'] + DESCENT_PREFIX + ".badidealinfo")
-#| 
+#|
 #|     parser = argparse.ArgumentParser(description="Descent sieving")
 #|     parser.add_argument("--target",
 #|                         help="Element whose DL is wanted",
@@ -3030,12 +3220,12 @@ if __name__ == "__main__":
 #|                         required=True)
 #|     descent.GeneralClass.declare_args(parser)
 #|     descent.DescentMiddleClass.declare_args(parser)
-#| 
-#| 
+#|
+#|
 #|     timeprint("output_name:", output_name)
 #|     silent_remove(output_name)
 #|     silent_remove(output_name+".cond")
-#| 
+#|
 #|     inputs = [
 #|         "--poly", params.files['POLYFILE'],
 #|         "--fb1", params.files['FBFILE'],
@@ -3060,19 +3250,19 @@ if __name__ == "__main__":
 #|         "--no-logs",
 #|         "--target", "tgt"
 #|     ]
-#| 
+#|
 #|     if topargs.existing_init_data is not None:
 #|         real_todofile = todofile
 #|     else:
 #|         real_todofile = params.dirs['DESC']+DESCENT_PREFIX+".todo"
-#| 
+#|
 #|     with open(real_todofile, "r") as tdf:
 #|         for line in tdf.readlines():
 #|             hopefully_prime = Integer(line.split()[1])
 #|             if not is_prime(hopefully_prime):
 #|                 err = f"The todofile {real_todofile} includes a composite q {hopefully_prime}. Sad!"
 #|                 raise RuntimeError(err)
-#| 
+#|
 #|     descent_middle_time = 0
 #|     descent_middle_start = time.time()
 #|     outfile = params.dirs['DESC']+DESCENT_PREFIX
@@ -3094,7 +3284,7 @@ if __name__ == "__main__":
 #|                     warning_message(str(ex))
 #|                     timeprint("Failed")
 #|                     sys.exit(1)
-#| 
+#|
 #|     if largeq_rels_file is not None:
 #|         # During initialization, we collected relations for the very large qs,
 #|         # which need to be accounted for in constructing S, and so on.
@@ -3102,28 +3292,28 @@ if __name__ == "__main__":
 #|             with open(largeq_rels_file, "r") as infile:
 #|                 for line in infile.readlines():
 #|                     outfile.write("\n" + line)
-#| 
+#|
 #|     try:
 #|         if topargs.existing_init_data is not None:
 #|             used_todofile = todofile
 #|         else:
 #|             used_todofile = params.dirs['DESC']+DESCENT_PREFIX+".todo"
-#| 
+#|
 #|         # Doing horrible things to fake the params object from a json exportable object
 #|         POLYFILE = params.files['POLYFILE']
 #|         poly = CadoPolyFile(POLYFILE); poly.read()
 #|         params.poly = poly
-#| 
+#|
 #|         sanity_check_descent_outfile(poly.f[0], relsfile, todofile=used_todofile)
-#| 
+#|
 #|         RENUMFILE = params.files['EXPLAIN_RENUMBER_FILE']
 #|         renum = CadoExplainRenumberFile(poly, RENUMFILE) ; renum.read()
 #|         params.R = renum
 #|         CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #|         S_list, S_alg_vector, S_rat_vector = construct_S(params, relsfile, relsfile+".cond.indexed.0", u, v)
 #|         truncate_S(params, S_list, S_alg_vector)
-#| 
+#|
 #|         descent_info['middle_time'] = descent_middle_time
 #|         os.symlink(os.path.realpath(params.dirs['DESC']+DESCENT_PREFIX +
 #|                                     ".json"),
@@ -3152,7 +3342,7 @@ if __name__ == "__main__":
 
 #@ FILE code/descent_large_init.py 644 12094 1e3442c0f5c85fa7f0041b9a34900808d84445432c94c9cd7ee064083da58c7e text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| from cado.scripts import descent
 #| from helpers import timeprint
@@ -3175,37 +3365,37 @@ if __name__ == "__main__":
 #| import time
 #| import descent_ecm_utils
 #| import functools
-#| 
-#| 
+#|
+#|
 #| # XXX This is not unified with Params in run.py, which is unfortunate.
 #| # This type definition is quite like argparse.Namespace, by the way.
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='descent_large_init.py')
 #|     topparser.add_argument('--params',dest='params')
 #|     topparser.add_argument('--seed',dest='seedval')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
 #|     # assert(params.descent_ecm_init)
-#| 
+#|
 #|     e = params.parameters['e']
 #|     N = params.parameters['N']
 #|     ZN = Integers(N)
 #|     target = generate_or_load_target(params)
-#| 
+#|
 #|     init_starttime = time.time()
 #|     timeprint("Starting large descent initialization!")
-#| 
+#|
 #|     q0 = params.parameters.get('desc.ecm.q0', 2147483648)
 #|     max_ecm_trials = params.parameters.get('desc.ecm.max_ecm_trials', 50)
 #|     nq = params.parameters.get('desc.ecm.nq', 10)
 #|     qdiff = params.parameters.get('desc.ecm.qdiff', 10000000)
 #|     ecm_nthreads = params.parameters.get('desc.ecm.ecm_nthreads', 24)
 #|     init_tkewness = params.parameters.get('desc.ecm.tkewness', 2000000000)
-#| 
+#|
 #|     ecminit_lim0 = params.parameters.get('desc.ecm.lim0', 2147483648)
 #|     ecminit_lim1 = params.parameters.get('desc.ecm.lim1', 2147483648)
 #|     ecminit_lpb0 = params.parameters.get('desc.ecm.lpb0', 110)
@@ -3219,23 +3409,23 @@ if __name__ == "__main__":
 #|     ecm_cofacB = 2 ** params.parameters.get('desc.ecm.cofacB_log', 260)
 #|     ecm_B1 = params.parameters.get('desc.ecm.B1', 500000)
 #|     ecm_ncurves = params.parameters.get('desc.ecm.ncurves', 600)
-#| 
+#|
 #|     found = False
 #|     out = None
 #|     ntrial = 1
-#| 
+#|
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #|     init_poly_bound = N.bit_length() // 2 + 20
-#| 
+#|
 #|     random.seed(topargs.seedval)
-#| 
+#|
 #|     init_polyfile = params.dirs['DESC'] + 'ecminit.' + str(topargs.seedval)[:10] + '.poly'
 #|     init_fbfile = params.dirs['DESC'] + 'ecminit.' + str(topargs.seedval)[:10] + '.fb'
 #|     mask = 1
 #|     zz = 1
 #|     gg = None
-#| 
+#|
 #|     while True:
 #|         mask = random.randrange(N)
 #|         zz = (pow(mask, e, N) * target) % N
@@ -3247,7 +3437,7 @@ if __name__ == "__main__":
 #|             # we're happy
 #|             break
 #|         print("Skewed reconstruction. Let's randomize the input.")
-#| 
+#|
 #|     with open(init_polyfile, 'w') as f:
 #|         f.write("n: %d\n" % N)
 #|         f.write("skew: 1\n")
@@ -3255,18 +3445,18 @@ if __name__ == "__main__":
 #|         f.write("c0: %d\n" % gg[1][0])
 #|         f.write("Y1: %d\n" % gg[0][1])
 #|         f.write("Y0: %d\n" % gg[1][1])
-#| 
+#|
 #|     init_poly = CadoPolyFile(init_polyfile); init_poly.read()
 #|     og_poly = CadoPolyFile(params.files['POLYFILE']); og_poly.read()
 #|     timeprint("Successfully chose an initialization polynomial.")
 #|     timeprint("Beginning las and ecm filtering...")
-#| 
+#|
 #|     while not found:
 #|         las_outfile = params.dirs['DESC'] + 'ecminit.' + str(topargs.seedval)[:10] + '.las.trial' + str(ntrial)
 #|         print("**** Trial number " + str(ntrial) + " ****")
 #|         q = q0 + ZZ.random_element(qdiff)
 #|         print(f"Trying with {nq} q's after {q}")
-#| 
+#|
 #|         CadoNFS("sieve/las",
 #|             "-poly", 'POLY',
 #|             '-lim0', str(ecminit_lim0),
@@ -3291,7 +3481,7 @@ if __name__ == "__main__":
 #|                 'POLY': init_polyfile,
 #|             }
 #|         )
-#| 
+#|
 #|         # May produce a bunch of .int output files
 #|         wildcard = las_outfile + '.survivors*'
 #|         for filename in glob.glob(wildcard):
@@ -3300,23 +3490,23 @@ if __name__ == "__main__":
 #|                                                                     ecm_smoothB, ecm_cofacB,
 #|                                                                     ecm_B1, ecm_ncurves,
 #|                                                                     44)
-#| 
+#|
 #|             good_large_qs = False
-#| 
+#|
 #|             if found:
 #|                 n1 = out[0]
 #|                 n2 = out[1]
-#| 
+#|
 #|                 cofac0 = Integer(survivor_line.split()[2].strip())
 #|                 cofac1 = Integer(survivor_line.split()[3].strip())
-#| 
+#|
 #|                 abcd = survivor_line.strip().split()
 #|                 a = int(abcd[0], 10)
 #|                 b = int(abcd[1], 10)
-#| 
+#|
 #|                 Num = a * gg[0][0] + b * gg[1][0]
 #|                 Den = a * gg[0][1] + b * gg[1][1]
-#| 
+#|
 #|                 factNum = []
 #|                 for ff in n2:
 #|                     if ff.is_prime():
@@ -3326,7 +3516,7 @@ if __name__ == "__main__":
 #|                         for fff in ff.factor():
 #|                             for mult in range(0, fff[1]):
 #|                                 factNum.append(fff[0])
-#| 
+#|
 #|                 factDen = []
 #|                 for ff in n1:
 #|                     if ff.is_prime():
@@ -3336,28 +3526,28 @@ if __name__ == "__main__":
 #|                         for fff in ff.factor():
 #|                             for mult in range(0, fff[1]):
 #|                                 factDen.append(fff[0])
-#| 
+#|
 #|                 for ff in (Num/cofac1).factor():
 #|                     for mult in range(0, ff[1]):
 #|                         factNum.append(ff[0])
-#| 
+#|
 #|                 for ff in (Den/cofac0).factor():
 #|                     for mult in range(0, ff[1]):
 #|                         factDen.append(ff[0])
-#| 
+#|
 #|                 large_q = []
 #|                 for fact in factNum + factDen:
 #|                     if fact.nbits() > params.parameters.get('LARGEQ', 90):
 #|                         large_q.append(fact)
-#| 
+#|
 #|                 og_polyfile = params.files['POLYFILE']
 #|                 og_poly = CadoPolyFile(og_polyfile); og_poly.read()
 #|                 m = og_poly.m
 #|                 f = og_poly.f[1]
 #|                 g = og_poly.f[0]
-#| 
+#|
 #|                 good_large_qs = True
-#| 
+#|
 #|                 for q in large_q:
 #|                     rho = ZZ(g.roots(GF(q))[0][0])
 #|                     newg, newf, coeff = descent_ecm_utils.transform_polys_by_q(g, f, q, rho, side=0)
@@ -3367,49 +3557,49 @@ if __name__ == "__main__":
 #|                     if gcd(c1, rr) > 1:
 #|                         # sad
 #|                         good_large_qs = False
-#| 
+#|
 #|             if found and good_large_qs:
 #|                 break
-#| 
+#|
 #|         ntrial = ntrial+1
 #|         if ntrial >= max_ecm_trials:
 #|             timeprint(f"Uh oh! Failed over {ntrial-1} attempts at descent ecm init.")
 #|             sys.exit(0)
-#| 
+#|
 #|     time_ecm_done = time.time()
 #|     timeprint(f"Finished ecm filtering! So far we've taken time {time_ecm_done-init_starttime}")
-#| 
+#|
 #|     print("found", str(found))
 #|     print("out", str(out))
 #|     print("survivor_line", survivor_line)
-#| 
+#|
 #|     n1 = out[0]
 #|     n2 = out[1]
-#| 
+#|
 #|     cofac0 = Integer(survivor_line.split()[2].strip())
 #|     cofac1 = Integer(survivor_line.split()[3].strip())
-#| 
+#|
 #|     assert(prod(n1) == cofac0)
 #|     assert(prod(n2) == cofac1)
-#| 
+#|
 #|     abcd = survivor_line.strip().split()
 #|     a = int(abcd[0], 10)
 #|     b = int(abcd[1], 10)
-#| 
+#|
 #|     timeprint(f"The winning (a,b) pair is: {a},{b}")
-#| 
+#|
 #|     #Num = ZZ(init_poly.f[0](a/b)*b)
 #|     #Den = ZZ(init_poly.f[1](a/b)*b)
 #|     #assert ((mask**e * target)*Den-Num) % N == 0
-#| 
+#|
 #|     Num = a * gg[0][0] + b * gg[1][0]
 #|     Den = a * gg[0][1] + b * gg[1][1]
 #|     # zz = Num/Den mod N
-#| 
+#|
 #|     assert (Num % cofac1) == 0
 #|     assert (Den % cofac0) == 0
 #|     assert (zz * Den - Num) % N == 0
-#| 
+#|
 #|     factNum = []
 #|     for ff in n2:
 #|         if ff.is_prime():
@@ -3419,9 +3609,9 @@ if __name__ == "__main__":
 #|             for fff in ff.factor():
 #|                 for mult in range(0, fff[1]):
 #|                     factNum.append(fff[0])
-#| 
+#|
 #|     assert prod(factNum) == prod(n2)
-#| 
+#|
 #|     factDen = []
 #|     for ff in n1:
 #|         if ff.is_prime():
@@ -3431,29 +3621,29 @@ if __name__ == "__main__":
 #|             for fff in ff.factor():
 #|                 for mult in range(0, fff[1]):
 #|                     factDen.append(fff[0])
-#| 
+#|
 #|     assert prod(factDen) == prod(n1)
-#| 
+#|
 #|     for ff in (Num/cofac1).factor():
 #|         for mult in range(0, ff[1]):
 #|             factNum.append(ff[0])
-#| 
+#|
 #|     for ff in (Den/cofac0).factor():
 #|         for mult in range(0, ff[1]):
 #|             factDen.append(ff[0])
-#| 
+#|
 #|     print("factNum", str(factNum))
 #|     print("factDen", str(factDen))
-#| 
+#|
 #|     assert(prod(factNum) == abs(Num))
 #|     assert(prod(factDen) == abs(Den))
-#| 
+#|
 #|     factNum.sort()
 #|     factDen.sort()
 #|     print("bits in factors")
 #|     print(str([ x.nbits() for x in factNum ]))
 #|     print(str([ x.nbits() for x in factDen ]))
-#| 
+#|
 #|     large_q = []
 #|     small_q = []
 #|     for fact in factNum + factDen:
@@ -3461,7 +3651,7 @@ if __name__ == "__main__":
 #|             large_q.append(fact)
 #|         else:
 #|             small_q.append(fact)
-#| 
+#|
 #|     todofile = params.dirs['DESC'] + 'ecminit.' + str(topargs.seedval)[:10] + '.todo'
 #|     init_dict = dict()
 #|     init_dict['todofilename'] = todofile
@@ -3476,26 +3666,26 @@ if __name__ == "__main__":
 #|     # Note that desc.total.rels should contain all Taken lines from
 #|     # 1. All the largeq descents
 #|     # 2. All the rounds of las_descent
-#| 
+#|
 #|     largeq_rels_file = params.dirs['DESC'] + 'ecminit.' + str(topargs.seedval)[:10] + '.largeq.rels'
 #|     init_dict['largeq_rels_file'] = largeq_rels_file
-#| 
+#|
 #|     init_dict_file = params.dirs['DESC'] + 'ecminit.' + str(topargs.seedval)[:10] + '.initdata'
 #|     with open(init_dict_file, "w") as fp:
 #|         json_custom.dump(init_dict, fp, indent=True)
-#| 
+#|
 #|     with open(todofile, "w") as f:
 #|         for sq in small_q:
 #|             if sq > params.BOUNDR:
 #|                 f.write(f"{0} {sq}")
 #|                 f.write("\n")
-#| 
+#|
 #|     timeprint("Saved initial split and data in: " + str(init_dict_file))
 #|     timeprint("Next large qs need to be handled by descent_large_q.")
 
 #@ FILE code/descent_large_las.py 644 24948 17d449648b114cbabe363c20e218349eef5486b0d2ee3a88b8a7a1ebc530a1b7 text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| from cado.scripts import descent
 #| from helpers import timeprint, TakenLineMissing
@@ -3522,13 +3712,13 @@ if __name__ == "__main__":
 #| from pathlib import Path
 #| from helpers import slurm_wait
 #| from timing import *
-#| 
-#| 
+#|
+#|
 #| def get_las_descent_cmd_str(params, todofile):
-#| 
+#|
 #|     las_descent_lpb0 = params.parameters.get('LAS_DESCENT_UNTIL_LPB0', 'LPB0')
 #|     las_descent_lpb1 = params.parameters.get('LAS_DESCENT_UNTIL_LPB1', 'LPB1')
-#| 
+#|
 #|     commandlist = [
 #|         params.dirs['CADO_BUILD_DIR'] + 'sieve/las_descent',
 #|         '--recursive-descent',
@@ -3555,8 +3745,8 @@ if __name__ == "__main__":
 #|     ]
 #|     command = ' '.join(commandlist)
 #|     return command
-#| 
-#| 
+#|
+#|
 #| # Yes, it's annoying to have a second slurmit.
 #| # However we want to save these files in the desc/ directory, not the slurm/ one.
 #| def descent_slurmit(params, command, job_jobfile_name, job_name, job_outfile_name, job_errfile_name):
@@ -3577,36 +3767,36 @@ if __name__ == "__main__":
 #|         f.writelines("\n")
 #|         f.writelines('srun time -p ' + command)
 #|         f.writelines("\n")
-#| 
+#|
 #|     result = subprocess.run(["sbatch", job_jobfile_name],stdout=subprocess.PIPE)
 #|     timeprint("Submitted slurm job:")
 #|     major_message(command)
-#| 
+#|
 #|     pattern = rb'Submitted batch job (\d+)'
 #|     match = re.search(pattern,result.stdout)
 #|     if match:
 #|         jobnum = int(match.group(1))
 #|         timeprint("job number is",jobnum)
 #|     return jobnum, job_errfile_name
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def start_descent_large_las(params, specified_descent_init_file):
 #|     with open(specified_descent_init_file, "r") as fp:
 #|         init_dict = json.load(fp)
-#| 
+#|
 #|     seed_ten = str(init_dict['seed'])[:10]
 #|     working_dir = params.dirs['DESC'] + 'seed' + seed_ten
 #|     Path(working_dir).mkdir(exist_ok=True)
 #|     working_dir += "/"
-#| 
+#|
 #|     numjobs = params.parameters['desc.large_las.numjobs']
 #|     all_todo_filename = init_dict['todofilename']
 #|     all_todo_qs = []
-#| 
+#|
 #|     las_descent_lpb0 = params.parameters.get('LAS_DESCENT_UNTIL_LPB0', 'LPB0')
 #|     las_descent_lpb1 = params.parameters.get('LAS_DESCENT_UNTIL_LPB1', 'LPB1')
-#| 
+#|
 #|     with open(all_todo_filename, 'r') as f:
 #|         for line in f.readlines():
 #|             line = line.strip()
@@ -3626,81 +3816,81 @@ if __name__ == "__main__":
 #|                     all_todo_qs.append((1, int(lineinfo[1]), int(lineinfo[2])))
 #|                 else:
 #|                     continue
-#| 
+#|
 #|     todo_jobs = dict()
-#| 
+#|
 #|     numjobs = len(all_todo_qs)  # makes things simpler
-#| 
+#|
 #|     if len(all_todo_qs) <= numjobs:
 #|         # Easy: 1 q for each job (and todofile)
 #|         for i in range(len(all_todo_qs)):
 #|             todo_jobs[i] = [ all_todo_qs[i] ]
-#| 
+#|
 #|     if len(all_todo_qs) > numjobs:
 #|         qs_per_job = ceil(len(all_todo_qs) / numjobs)
-#| 
+#|
 #|         for j in range(numjobs):
 #|             todo_jobs[j] = all_todo_qs[ j*qs_per_job : min(len(all_todo_qs), (j+1)*qs_per_job) ]
-#| 
+#|
 #|     slurmlist = []
-#| 
+#|
 #|     for jobi in todo_jobs.keys():
 #|         job_todofile_name = working_dir + 'startlas.job.' + str(jobi) + '.todo'
 #|         job_outfile_name = working_dir + 'startlas.job.' + str(jobi) + '.out'
 #|         job_errfile_name = working_dir + 'startlas.job.' + str(jobi) + '.err'
 #|         job_jobfile_name = working_dir + 'startlas.job.' + str(jobi) + '.job'
 #|         job_name = 'llas-' + str(jobi)
-#| 
+#|
 #|         with open(job_todofile_name, 'w') as tdf:
 #|             for todoitem in todo_jobs[jobi]:
 #|                 line = " ".join([str(x) for x in todoitem])
 #|                 tdf.write(line)
 #|                 tdf.write("\n")
-#| 
+#|
 #|         command = get_las_descent_cmd_str(params, job_todofile_name)
 #|         jobnum, errfile = descent_slurmit(params, command, job_jobfile_name, job_name, job_outfile_name, job_errfile_name)
 #|         slurmlist.append((jobnum, errfile))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(slurmlist)
 #|     overall_cputime.add(cputime_slurm)
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def rebalance_descent_large_las(params, seed_ten, counter, ONLY_RETURN_TODOS=False):
 #|     # seed_ten is the 10-digit seed (string).
 #|     # The counter is 1 or greater. 1 indicates that we look at "start" files,
 #|     # and will write to "1" files. 2 indicates that we look at "1" files, and will
 #|     # write to "2" files. And so on.
-#| 
+#|
 #|     # Assume slurm jobs have been killed, and we have a bunch of
 #|     # partial *.out files, each with an associated todo file.
 #|     # It's possible some of the files are already done.
-#| 
+#|
 #|     numjobs = params.parameters['desc.large_las.numjobs']
 #|     working_dir = params.dirs['DESC'] + 'seed' + seed_ten + "/"
-#| 
+#|
 #|     counter = int(counter)
-#| 
+#|
 #|     if counter == 1:
 #|         prior_outfile_regex = working_dir + 'startlas.*.out'
 #|     else:
 #|         prior_outfile_regex = working_dir + f'rebalance.ctr{counter-1}.job*.out'
-#| 
+#|
 #|     prior_outfiles = glob.glob(prior_outfile_regex)
 #|     latest_output = [
 #|         ( xx[ : len(xx)-3 ] + 'todo', xx ) for xx in prior_outfiles
 #|     ]
-#| 
+#|
 #|     next_outfile_regex = working_dir + f'rebalance.ctr{counter}.job*.out'
 #|     assert len(glob.glob(next_outfile_regex)) == 0
-#| 
+#|
 #|     global_todolist = []
-#| 
+#|
 #|     for (jobtodo, jobout) in latest_output:
 #|         remaining_todolist = []
 #|         timeprint("Looking at output: " + str(jobout))
 #|         num_taken = 0
-#| 
+#|
 #|         with open(jobtodo, 'r') as f:
 #|             for line in f.readlines():
 #|                 line = line.strip()
@@ -3709,47 +3899,47 @@ if __name__ == "__main__":
 #|                     remaining_todolist.append((0, int(lineinfo[1])))
 #|                 elif lineinfo[0] == '1':
 #|                     remaining_todolist.append((1, int(lineinfo[1]), int(lineinfo[2])))
-#| 
+#|
 #|         with open(jobout, 'r') as f:
 #|             for line in f.readlines():
 #|                 line = line.strip()
-#| 
+#|
 #|                 if m := re.match(r".* pushing side-(\d+) q=(\d+); rho=(\d+) .* to todo list .*", line):
 #|                     side, sq, rho = (int(c) for c in m.groups())
 #|                     if side == 1:
 #|                         remaining_todolist.append((side, sq, rho))
 #|                     elif side == 0:
 #|                         remaining_todolist.append((side, sq))
-#| 
+#|
 #|                 if m := re.match(r"# Taking decision on .* side-(\d+) q=(\d+); rho=(\d+)", line):
 #|                     # To be stored if next line matches if condition below
 #|                     side, sq, rho = (int(c) for c in m.groups())
-#| 
+#|
 #|                 if (m := re.match("^Taken: (.*)", line)):
 #|                     if side == 1:
 #|                         remaining_todolist.remove((side, sq, rho))
 #|                     elif side == 0:
 #|                         remaining_todolist.remove((side, sq))
 #|                     num_taken += 1
-#| 
+#|
 #|         timeprint("Taken relations: " + str(num_taken))
 #|         timeprint("Remaining todolist: " + str(len(remaining_todolist)))
-#| 
+#|
 #|         global_todolist += remaining_todolist
-#| 
+#|
 #|     timeprint("In total, the size of our remaining todolist is: " + str(len(global_todolist)))
 #|     timeprint("We will redistribute it over " + str(numjobs) + " slurm jobs.")
-#| 
+#|
 #|     if ONLY_RETURN_TODOS:
 #|         return global_todolist
-#| 
+#|
 #|     #global_todolist2 = [ qq for qq in global_todolist if Integer(qq[1]).nbits() > 32 ]
 #|     #global_todolist = global_todolist2
 #|     #timeprint("Removed all 32-bit or smaller qs.")
 #|     #timeprint("Now, the size of our remaining todolist is: " + str(len(global_todolist)))
-#| 
+#|
 #|     job_allocation = dict()
-#| 
+#|
 #|     if len(global_todolist) <= numjobs:
 #|         for i in range(len(global_todolist)):
 #|             job_allocation[i] = [ global_todolist[i] ]
@@ -3758,86 +3948,86 @@ if __name__ == "__main__":
 #|         qs_per_job = ceil(1.0 * len(global_todolist) / numjobs)
 #|         for j in range(numjobs):
 #|             job_allocation[j] = global_todolist[j*qs_per_job : min(len(global_todolist), (j+1)*qs_per_job) ]
-#| 
+#|
 #|     slurmlist = []
-#| 
+#|
 #|     for jobi in job_allocation.keys():
 #|         job_todofile_name = working_dir + 'rebalance.ctr' + str(counter) + '.job' + str(jobi) + '.todo'
 #|         job_outfile_name = working_dir + 'rebalance.ctr' + str(counter) + '.job' + str(jobi) + '.out'
 #|         job_errfile_name = working_dir + 'rebalance.ctr' + str(counter) + '.job' + str(jobi) + '.err'
 #|         job_jobfile_name = working_dir + 'rebalance.ctr' + str(counter) + '.job' + str(jobi) + '.job'
 #|         job_name = 'rebal-' + str(counter) + '-' + str(jobi)
-#| 
+#|
 #|         with open(job_todofile_name, 'w') as tdf:
 #|             for todoitem in job_allocation[jobi]:
 #|                 line = " ".join([str(x) for x in todoitem])
 #|                 tdf.write(line)
 #|                 tdf.write("\n")
-#| 
+#|
 #|         command = get_las_descent_cmd_str(params, job_todofile_name)
 #|         jobnum, errfile = descent_slurmit(params, command, job_jobfile_name, job_name, job_outfile_name, job_errfile_name)
 #|         slurmlist.append((jobnum, errfile))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(slurmlist)
 #|     overall_cputime.add(cputime_slurm)
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def todofile_descent_large_las(params, given_todofile_glob):
 #|     # We look at todos in the given todofile.
 #|     # We'll write to todofile + 'rels.out'. It could be appended somewhere after this call.
 #|     # The purpose of this is really not to launch a ton of jobs;
 #|     # it's to launch a few with tweaked parameters, for example, or on the beefy machines only.
-#| 
+#|
 #|     slurmlist = []
-#| 
+#|
 #|     for given_todofile in glob.glob(given_todofile_glob):
-#| 
+#|
 #|         job_todofile_name = given_todofile
 #|         job_outfile_name = given_todofile + ".rels.out"
 #|         job_errfile_name = given_todofile + ".err"
 #|         job_jobfile_name = given_todofile + ".job"
 #|         job_name = 'desc-todo'
-#| 
+#|
 #|         command = get_las_descent_cmd_str(params, job_todofile_name)
 #|         jobnum, errfile = descent_slurmit(
 #|             params, command, job_jobfile_name, job_name, job_outfile_name, job_errfile_name
 #|         )
 #|         slurmlist.append((jobnum, errfile))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(slurmlist)
 #|     overall_cputime.add(cputime_slurm)
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def finish_descent_large_las(params, specified_descent_init_file):
 #|     # We write all the Taken lines to one file. We need to look at:
 #|     # 1. The large q relations
 #|     # 2. The "start" las_descent relations
 #|     # 3. The "rebalance" las_descent relations, from 1 to the last counter
-#| 
+#|
 #|     with open(specified_descent_init_file, "r") as fp:
 #|         init_dict = json.load(fp)
-#| 
+#|
 #|     seed_ten = str(init_dict['seed'])[:10]
 #|     working_dir = params.dirs['DESC'] + 'seed' + seed_ten + "/"
-#| 
+#|
 #|     largeq_rels_file = init_dict['largeq_rels_file']
 #|     total_file = init_dict['DRELS_FILE']
-#| 
+#|
 #|     writing_file = open(total_file, "w")
-#| 
+#|
 #|     num_largeq_taken = 0
-#| 
+#|
 #|     with open(largeq_rels_file, "r") as f:
 #|         for line in f.readlines():
 #|             writing_file.write(line)
 #|             num_largeq_taken += 0.5
-#| 
+#|
 #|     timeprint(f"Wrote {num_largeq_taken} relations from {largeq_rels_file} to {total_file}")
-#| 
+#|
 #|     start_files = glob.glob(working_dir + 'startlas.*.out')
-#| 
+#|
 #|     for ff in start_files:
 #|         num_ff = 0
 #|         with open(ff, "r") as f:
@@ -3846,9 +4036,9 @@ if __name__ == "__main__":
 #|                 if "Taken:" in line:
 #|                     num_ff += 1
 #|         timeprint(f"Wrote {num_ff} relations from {ff} to {total_file}")
-#| 
+#|
 #|     rebalance_files = glob.glob(working_dir + 'rebalance.ctr*.job*.out')
-#| 
+#|
 #|     for ff in rebalance_files:
 #|         num_ff = 0
 #|         with open(ff, "r") as f:
@@ -3857,10 +4047,10 @@ if __name__ == "__main__":
 #|                 if "Taken:" in line:
 #|                     num_ff += 1
 #|         timeprint(f"Wrote {num_ff} relations from {ff} to {total_file}")
-#| 
+#|
 #|     writing_file.close()
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def descent_rock_bottom(params, specified_descent_init_file, strategy, prev_desc_file=None):
 #|     # We assume all descent relations are in one file (e.g. desc.total.rels from calling ..._finish).
@@ -3873,33 +4063,33 @@ if __name__ == "__main__":
 #|     # can be looked at.
 #|     # It should be possible to update parameters and run this function again, to hopefully get those
 #|     # remaining q's.
-#| 
+#|
 #|     assert strategy in ['P','C','C1','C2']
-#| 
+#|
 #|     with open(specified_descent_init_file, "r") as fp:
 #|         init_dict = json.load(fp)
-#| 
+#|
 #|     seed_ten = str(init_dict['seed'])[:10]
 #|     working_dir = params.dirs['DESC'] + 'seed' + seed_ten + "/rbjobs/"
-#| 
+#|
 #|     # file where we will append the new relations
 #|     total_file = init_dict['DRELS_FILE']
-#| 
+#|
 #|     # file where we read the existing relations
 #|     if prev_desc_file is None:
 #|         prev_desc_file = total_file
-#| 
+#|
 #|     desired_LPB0 = params.parameters.get('current_desc_rb_lpb0', 'LPB0')
 #|     desired_LPB1 = params.parameters.get('current_desc_rb_lpb1', 'LPB1')
-#| 
+#|
 #|     global_todolist = extract_outstanding_qs(
 #|         params, desired_LPB0, desired_LPB1, prev_desc_file, ONLY_RETURN_TODOS=True
 #|     )
-#| 
+#|
 #|     # If we're calling this function, these better be defined
 #|     las_descent_lpb0 = params.parameters.get('LAS_DESCENT_UNTIL_LPB0', 'LPB0')
 #|     las_descent_lpb1 = params.parameters.get('LAS_DESCENT_UNTIL_LPB1', 'LPB1')
-#| 
+#|
 #|     # Also need to look for q's that were ignored in our original todo
 #|     # list, due to being in between LPB and LAS_DESCENT_UNTIL_LPB
 #|     original_todolist = init_dict['todofilename']
@@ -3921,27 +4111,27 @@ if __name__ == "__main__":
 #|                     timeprint(f"Adding a side-1 q from the original todolist ({qsize})")
 #|                 else:
 #|                     continue
-#| 
+#|
 #|     # Exactly one job per q, we are not combining qs into one job.
 #|     slurmlist = []
 #|     specialq_to_file = dict()
-#| 
+#|
 #|     shuffle_list = list(global_todolist)
 #|     random.shuffle(shuffle_list)        # sometimes stuff is killed early,
 #|                                         # depending on progress. it'd be nice
 #|                                         # to be representative
-#| 
+#|
 #|     for specialq in shuffle_list:
 #|         side = specialq[0]
 #|         q = specialq[1]
-#| 
+#|
 #|         # TEMPORARY
 #|         size_q = Integer(q).nbits()
 #|         #if side == 0 and size_q > 36:
 #|         #    continue
 #|         #if side == 1 and size_q > 38:
 #|         #    continue
-#| 
+#|
 #|         if side == 0:
 #|             rho = None
 #|             job_outfile = working_dir + f'bottomq.{side}.{q}.{strategy}.job.out'
@@ -3954,9 +4144,9 @@ if __name__ == "__main__":
 #|             job_errfile = working_dir + f'bottomq.{side}.{q}.{rho}.{strategy}.job.err'
 #|             job_jobfile = working_dir + f'bottomq.{side}.{q}.{rho}.{strategy}.job.slurm'
 #|             jobname = f'bot-{side}-{q}-{rho}'
-#| 
+#|
 #|         specialq_to_file[specialq] = job_outfile + '.rb'
-#| 
+#|
 #|         commandlist = [
 #|             params.files['SAGE'],
 #|             "descent_rb_helper.py",
@@ -3969,35 +4159,35 @@ if __name__ == "__main__":
 #|             "--overwrite-lpb0", str(desired_LPB0),
 #|             "--overwrite-lpb1", str(desired_LPB1)
 #|         ]
-#| 
+#|
 #|         if side == 1:
 #|             commandlist.append("--rho")
 #|             commandlist.append(str(rho))
-#| 
+#|
 #|         command_str = ' '.join(commandlist)
 #|         jobnum, errfile = descent_slurmit(params, command_str, job_jobfile, jobname, job_outfile, job_errfile)
 #|         slurmlist.append((jobnum, errfile))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(slurmlist)
 #|     overall_cputime.add(cputime_slurm)
-#| 
+#|
 #|     appending_file = open(total_file, "a")
 #|     num_written = 0
-#| 
+#|
 #|     for specialq in global_todolist:
 #|         side = specialq[0]
 #|         q = specialq[1]
-#| 
+#|
 #|         if side == 0:
 #|             rho = None
 #|         elif side == 1:
 #|             rho = specialq[2]
-#| 
+#|
 #|         if specialq not in specialq_to_file.keys():
 #|             continue
-#| 
+#|
 #|         expected_file = specialq_to_file[specialq]
-#| 
+#|
 #|         if not os.path.exists(expected_file):
 #|             print(f"Note: I don't see the expected file: {expected_file}")
 #|             print("That may be an outstanding q to try again.")
@@ -4007,55 +4197,55 @@ if __name__ == "__main__":
 #|             with open(expected_file, "r") as infile:
 #|                 for line in infile.readlines():
 #|                     appending_file.write(line)
-#| 
+#|
 #|             num_written += 1
-#| 
+#|
 #|     appending_file.close()
 #|     timeprint(f"Wrote {num_written} relations to file: {appending_file}")
 #|     timeprint(f"That was out of a total of {len(global_todolist)} qs.")
 #|     timeprint("If there are some left over you can run this command again with different parameters.")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def extract_outstanding_qs(params, desired_LPB0, desired_LPB1, prev_desc_file, ONLY_RETURN_TODOS=False):
 #|     # This is to be run when we have a file, e.g. desc.total.rels,
 #|     # that is smooth up to a bigger LPB than we ultimately want.
 #|     # We can't generate our todo list from the old descent files,
 #|     # but we can mimic construct_S and make a list of the remaining qs.
-#| 
+#|
 #|     # First look for outstanding qs that were put on the todo list.
 #|     # Probably there aren't any but we may as well check.
-#| 
+#|
 #|     og_poly = CadoPolyFile(params.files['POLYFILE']); og_poly.read()
 #|     g = og_poly.f[0]
 #|     f = og_poly.f[1]
 #|     missed_qs = []
-#| 
+#|
 #|     try:
 #|         sanity_check_descent_outfile(g, prev_desc_file)
 #|     except TakenLineMissing as ex:
 #|         for side,q,rho in ex.missed:
 #|             missed_qs.append((side,q,rho))
-#| 
+#|
 #|     timeprint(f"After a sanity check, the number of missing qs is: {len(missed_qs)}")
 #|     timeprint("This is coming only from the las_descent logs.")
-#| 
+#|
 #|     taken = list(extract_taken_relations(prev_desc_file))
-#| 
+#|
 #|     # At this point, the logged special qs are accounted for.
 #|     # We are now only concerned with large qs that show up in the (righthand)
 #|     # factorizations, that were previously considered done.
-#| 
+#|
 #|     side0_covered_special_qs = set()
 #|     side1_covered_special_qs = set()
 #|     side0_rough_qs = set()
 #|     side1_rough_qs = set()
-#| 
+#|
 #|     # TEMPORARY EDIT:
 #|     # We consider the extension unlinked ideals to be "rough".
 #|     # For 768 we don't have algebraic unlinked ideals to worry about, but we
 #|     # could do a similar thing if needed in the future.
-#| 
+#|
 #|     ext_unlinked_ideals = set()
 #|     ext_unlinked_files = [
 #|         # none for now
@@ -4068,7 +4258,7 @@ if __name__ == "__main__":
 #|                 p = Integer(lineinfo[1])
 #|                 r = Integer(lineinfo[2])
 #|                 ext_unlinked_ideals.add( (1,p,r) )
-#| 
+#|
 #|     #with open(params.files['EXT_UNLINKED_TODOS'], "r") as extfile:
 #|     #    for line in extfile.readlines():
 #|             # it's a todo file
@@ -4077,88 +4267,88 @@ if __name__ == "__main__":
 #|     #        q = Integer(lineinfo[1])
 #|     #        r = Integer(lineinfo[2])
 #|     #        ext_unlinked_ideals.add((1,q,r))
-#| 
+#|
 #|     for rel, (side, sq, rho) in taken:
 #|         a = rel.a
 #|         b = rel.b
-#| 
+#|
 #|         if side == 0:
 #|             side0_covered_special_qs.add((side,sq))
 #|         elif side == 1:
 #|             side1_covered_special_qs.add((side,sq,rho))
-#| 
+#|
 #|         if side == 0:
 #|             fac0 = [ p for p in rel.sides[0] if p != sq ]
 #|             fac1 = rel.sides[1]
 #|         elif side == 1:
 #|             fac0 = rel.sides[0]
 #|             fac1 = [ p for p in rel.sides[1] if p != sq ]
-#| 
+#|
 #|         for p in fac0:
 #|             p = Integer(p)
 #|             if p.nbits() > desired_LPB0:
 #|                 r = ZZ(g.roots(GF(p))[0][0])
 #|                 side0_rough_qs.add((0,p))
-#| 
+#|
 #|         for p in fac1:
 #|             p = Integer(p)
-#| 
+#|
 #|             if gcd(b,p) != 1:
 #|                 r = p
 #|             else:
 #|                 r = (a * inverse_mod(b,p)) % p
-#| 
+#|
 #|             if p.nbits() > desired_LPB1:
 #|                 side1_rough_qs.add((1,p,r))
-#| 
+#|
 #|             if (1,p,r) in ext_unlinked_ideals:
 #|                 side1_rough_qs.add((1,p,r))
-#| 
+#|
 #|     final_side0_rough = side0_rough_qs - side0_covered_special_qs
 #|     final_side1_rough = side1_rough_qs - side1_covered_special_qs
-#| 
+#|
 #|     side0_stats = dict()
 #|     side1_stats = dict()
-#| 
+#|
 #|     for (side,q) in final_side0_rough:
 #|         nb = Integer(q).nbits()
 #|         if nb not in side0_stats.keys():
 #|             side0_stats[nb] = 1
 #|         else:
 #|             side0_stats[nb] += 1
-#| 
+#|
 #|     for (side,q,rho) in final_side1_rough:
 #|         nb = Integer(q).nbits()
 #|         if nb not in side1_stats.keys():
 #|             side1_stats[nb] = 1
 #|         else:
 #|             side1_stats[nb] += 1
-#| 
+#|
 #|     timeprint("Stats for side 0:\n" + str(side0_stats))
 #|     timeprint("Stats for side 1:\n" + str(side1_stats))
-#| 
+#|
 #|     if ONLY_RETURN_TODOS:
 #|         return final_side0_rough | final_side1_rough
-#| 
+#|
 #|     new_todofile = prev_desc_file + f".lpbs.{desired_LPB0}.{desired_LPB1}.stilltodo"
 #|     num0 = 0
 #|     num1 = 0
-#| 
+#|
 #|     with open(new_todofile, "w") as outfile:
-#| 
+#|
 #|         for (side,q) in final_side0_rough:
 #|             outfile.write(f"0 {q}\n")
 #|             num0 += 1
-#| 
+#|
 #|         for (side,q,rho) in final_side1_rough:
 #|             outfile.write(f"1 {q} {rho}\n")
 #|             num1 += 1
-#| 
+#|
 #|     timeprint(f"Wrote {num0} rational and {num1} algebraic outstanding qs to {new_todofile}")
 
 #@ FILE code/descent_large_q_helper.py 644 4389 b7318f86cfd8e79d9d08c7b4ba12d66082b65ee0fb59af6d8136abdaacfadec8 text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| from cado.scripts import descent
 #| from helpers import timeprint
@@ -4180,37 +4370,37 @@ if __name__ == "__main__":
 #| import time
 #| import descent_ecm_utils
 #| import functools
-#| 
-#| 
+#|
+#|
 #| # XXX This is not unified with Params in run.py, which is unfortunate.
 #| # This type definition is quite like argparse.Namespace, by the way.
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='descent_large_q_helper.py')
 #|     topparser.add_argument('--params',dest='params')
 #|     topparser.add_argument('--existing-init-data',dest='existing_init_data',required=True)
 #|     topparser.add_argument('--lq',dest='lq',required=True)
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
-#| 
+#|
 #|     e = params.parameters['e']
 #|     N = params.parameters['N']
 #|     ZN = Integers(N)
 #|     target = generate_or_load_target(params)
-#| 
+#|
 #|     init_starttime = time.time()
 #|     timeprint("Starting large q: " + str(topargs.lq))
-#| 
+#|
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
 #|     og_poly = CadoPolyFile(params.files['POLYFILE']); og_poly.read()
-#| 
+#|
 #|     try:
 #|         with open(topargs.existing_init_data, "r") as fp:
 #|             init_dict = json.load(fp)
-#| 
+#|
 #|         todofile = init_dict['todofilename']
 #|         u = Integer(init_dict['u'])
 #|         v = Integer(init_dict['v'])
@@ -4225,25 +4415,25 @@ if __name__ == "__main__":
 #|         raise ex
 #|         sys.exit(1)
 #|         os._exit(1)
-#| 
+#|
 #|     pfx = params.dirs['DESC'] + 'largeq.' + str(seed)[:10] + "."
 #|     f = og_poly.f[1]
 #|     g = og_poly.f[0]
-#| 
+#|
 #|     lq = Integer(topargs.lq)
 #|     assert lq.nbits() > params.parameters.get('LARGEQ', 90)
 #|     assert lq in (u_fac + v_fac)
-#| 
+#|
 #|     # rho = ZZ(g.roots(GF(lq))[0][0])   # done in handle_very_large_special_q
 #|     timeprint(f"Handling the large q: {lq} of {lq.nbits()} bits")
 #|     a, b, fac0, fac1, winning_rel, newg, newf, rr, new_shared_root = handle_very_large_special_q(params, lq, 0, pfx, rho=None)
 #|     print("winning_rel: ", str(winning_rel))
 #|     a = Integer(a)
 #|     b = Integer(b)
-#| 
+#|
 #|     assert prod(fac0)*lq == ZZ(g(a/b)*b**g.degree()).abs()
 #|     assert prod(fac1) == ZZ(f(a/b)*b**f.degree()).abs()
-#| 
+#|
 #|     todo_qs = []
 #|     for fac in fac0:
 #|         if fac > params.BOUNDR:
@@ -4255,7 +4445,7 @@ if __name__ == "__main__":
 #|                 continue
 #|             r = ZZ(a/bb)
 #|             todo_qs.append((1, fac, r))
-#| 
+#|
 #|     with open(todofile, "a") as f:
 #|         for (side, q, r) in todo_qs:
 #|             if side == 0:
@@ -4263,7 +4453,7 @@ if __name__ == "__main__":
 #|             elif side == 1:
 #|                 f.write(f"{side} {q} {r}")
 #|             f.write("\n")
-#| 
+#|
 #|     with open(largeq_rels_file, "a") as f:
 #|         f.write("# Taking decision on ")
 #|         f.write(str(lq.nbits()))
@@ -4273,23 +4463,23 @@ if __name__ == "__main__":
 #|         rho = g.roots(GF(lq))[0][0]
 #|         f.write(str(rho))
 #|         f.write("\n")
-#| 
+#|
 #|         f.write("Taken: " + str(a) + "," + str(b))
 #|         f.write(":")
 #|         f.write(",".join([ hex(x)[2:] for x in fac0 ]))
 #|         f.write("," + hex(lq)[2:] + ":")
 #|         f.write(",".join([ hex(x)[2:] for x in fac1 ]))
 #|         f.write("\n")
-#| 
+#|
 #|     init_endtime = time.time()
 #|     descent_init_time = round(init_endtime-init_starttime)
-#| 
+#|
 #|     timeprint("Success! We found a relation for large q: " + str(lq))
 #|     timeprint("Data has been appended to: " + str(todofile) + " and " + str(largeq_rels_file))
 
 #@ FILE code/descent_rb_helper.py 644 5843 8855046bae80d4f5fc4471aaf1ec1faaa622e510960b5d88e806814b66d32a5b text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| from cado.scripts import descent
 #| from helpers import timeprint
@@ -4311,13 +4501,13 @@ if __name__ == "__main__":
 #| import time
 #| import descent_ecm_utils
 #| import functools
-#| 
-#| 
+#|
+#|
 #| # XXX This is not unified with Params in run.py, which is unfortunate.
 #| # This type definition is quite like argparse.Namespace, by the way.
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='descent_rb_helper.py')
 #|     topparser.add_argument('--params',dest='params',required=True)
@@ -4330,12 +4520,12 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--overwrite-lpb0',dest='overwrite_lpb0')
 #|     topparser.add_argument('--overwrite-lpb1',dest='overwrite_lpb1')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     assert topargs.strategy in ['P','C','C1','C2']
 #|     # either Polynomials or Composites
-#| 
+#|
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
-#| 
+#|
 #|     e = params.parameters['e']
 #|     N = params.parameters['N']
 #|     ZN = Integers(N)
@@ -4343,107 +4533,107 @@ if __name__ == "__main__":
 #|     LPB1 = params.parameters['LPB1']
 #|     BOUNDR = params.BOUNDR
 #|     BOUNDA = params.BOUNDA
-#| 
+#|
 #|     side = int(topargs.side)
 #|     assert side in [0,1]
-#| 
+#|
 #|     q = Integer(topargs.q)
 #|     #if side == 0:
 #|         #assert q > BOUNDR
 #|     #else:
 #|         #assert q > BOUNDA
-#| 
+#|
 #|     if topargs.rho is not None:
 #|         rho = Integer(topargs.rho)
 #|     else:
 #|         rho = None
-#| 
+#|
 #|     if topargs.seed is not None:
 #|         working_pfx = params.dirs['DESC'] + 'seed' + topargs.seed[:10] + "/rbjobs/"
 #|     else:
 #|         working_pfx = params.dirs['DESC']
-#| 
+#|
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
 #|     og_poly = CadoPolyFile(params.files['POLYFILE']); og_poly.read()
-#| 
+#|
 #|     f = og_poly.f[1]
 #|     g = og_poly.f[0]
-#| 
+#|
 #|     if topargs.overwrite_lpb0:
 #|         used_lpb0 = int(topargs.overwrite_lpb0)
 #|         BOUNDR = 2**used_lpb0
 #|     else:
 #|         used_lpb0 = None
-#| 
+#|
 #|     if topargs.overwrite_lpb1:
 #|         used_lpb1 = int(topargs.overwrite_lpb1)
 #|         BOUNDA = 2**used_lpb1
 #|     else:
 #|         used_lpb1 = None
-#| 
+#|
 #|     # Polynomials strategy
 #|     if topargs.strategy == 'P':
-#| 
+#|
 #|         a, b, fac0, fac1, winner, newg, newf, rr, new_shared_root = handle_bottom_special_q(
 #|             params, q, side, working_pfx, rho, None, used_lpb0, used_lpb1
 #|         )
-#| 
+#|
 #|         a = Integer(a)
 #|         b = Integer(b)
-#| 
+#|
 #|         if side == 0:
 #|             assert prod(fac0)*q == ZZ(g(a/b)*b**g.degree()).abs()
 #|             assert prod(fac1) == ZZ(f(a/b)*b**f.degree()).abs()
 #|             timeprint("Yay! The relation works under the original polynomials.")
 #|             fac0.append(q)
-#| 
+#|
 #|         else:
 #|             assert prod(fac0) == ZZ(g(a/b)*b**g.degree()).abs()
 #|             assert prod(fac1)*q == ZZ(f(a/b)*b**f.degree()).abs()
 #|             timeprint("Yay! The relation works under the original polynomials.")
 #|             fac1.append(q)
-#| 
+#|
 #|     # Composites strategy
 #|     elif topargs.strategy in ['C','C1','C2']:
-#| 
+#|
 #|         a, b, fac0, fac1 = handle_bottom_special_q_composites(
 #|             params, q, side, working_pfx, rho, topargs.strategy, used_lpb0, used_lpb1
 #|         )
-#| 
+#|
 #|         print("a", str(a))
 #|         print("b", str(b))
 #|         print("fac0", str(fac0))
 #|         print("fac1", str(fac1))
-#| 
+#|
 #|         # In fact casting to Integer is necessary to pass the assertions. Blegh!
 #|         a = Integer(a)
 #|         b = Integer(b)
-#| 
+#|
 #|         fac0_int = [ Integer(y,16) for y in fac0 ]
 #|         fac1_int = [ Integer(y,16) for y in fac1 ]
-#| 
+#|
 #|         assert prod(fac0_int) == ZZ(g(a/b)*b**g.degree()).abs()
 #|         assert prod(fac1_int) == ZZ(f(a/b)*b**f.degree()).abs()
 #|         timeprint("Yay! The relation works.")
-#| 
+#|
 #|         fac0 = fac0_int
 #|         fac1 = fac1_int
-#| 
+#|
 #|     assert len(fac0) > 0 and len(fac1) > 0
-#| 
+#|
 #|     for rat_fac in fac0:
 #|         assert (rat_fac == q and side == 0) or (rat_fac < BOUNDR)
-#| 
+#|
 #|     for alg_fac in fac1:
 #|         assert (alg_fac == q and side == 1) or (alg_fac < BOUNDA)
-#| 
+#|
 #|     # At this point, we have: a, b, fac0, fac1
 #|     # We write it in the way that the las_descent parser will recognize
 #|     with open(topargs.outfile, "w") as out:
-#| 
+#|
 #|         if side == 0:
 #|             rho = g.roots(GF(q))[0][0]
-#| 
+#|
 #|         out.write("# Taking decision on ")
 #|         out.write(str(q.nbits()))
 #|         out.write(f"@{side} side-{side} q=")
@@ -4451,16 +4641,16 @@ if __name__ == "__main__":
 #|         out.write("; rho=")
 #|         out.write(str(rho))
 #|         out.write("\n")
-#| 
+#|
 #|         out.write("Taken: " + str(a) + "," + str(b))
 #|         out.write(":")
 #|         out.write(",".join([ hex(x)[2:] for x in fac0 ]))
 #|         out.write(":")
 #|         out.write(",".join([ hex(x)[2:] for x in fac1 ]))
 #|         out.write("\n")
-#| 
-#| 
-#| 
+#|
+#|
+#|
 #| # -------------------------
 #| # We have a few strategies.
 #| # 1. For a given q, sieve over qq' for small primes q'.
@@ -4473,39 +4663,39 @@ if __name__ == "__main__":
 
 #@ FILE code/estimate2.py 644 13495 88e35ae0ea0645f8bd66b9cc3d93a686c5c8a450fad156441f98f8d69227c9b9 text
 #| from sage.all import *
-#| 
+#|
 #| import argparse
 #| import json
 #| import time
 #| import re
 #| import os
-#| 
+#|
 #| from cado_nfs_binaries import CadoNFS, CadoNFSBinaries
 #| from cado_sage import CadoPolyFile
 #| from run import parse_config
-#| 
+#|
 #| def estimate_algebraic_query_sieving_rels_per_q(params, polyfile, fbfile, nsamples=1024):
 #|     print("===== Algebraic query sieving unique-rels-per-q estimate =====")
 #|     print("----- Relevant parameters -----")
 #|     print("Number of random samples:", nsamples)
-#| 
+#|
 #|     poly = CadoPolyFile(polyfile); poly.read()
-#| 
+#|
 #|     LPB1_queries = params['LPB1_queries']
 #|     BOUNDA_queries = 2**LPB1_queries
-#| 
+#|
 #|     # The below four lines (setting special-q bounds q0 and q1) come from call_algebraic_query_sieving in helpers.py
 #|     c0 = QQ(params["algebraic_query_sieving.q0_ratio"])
 #|     c1 = 1 #4
 #|     q0 = floor(c0*BOUNDA_queries)
 #|     q1 = c1*BOUNDA_queries
-#| 
+#|
 #|     # The following comes from do_algebraic_query_sieving in helpers.py
 #|     #AQRELS_FILE = params.files['AQRELS_FILE']+"."+jobnum
 #|     #FBFILE = params.files['FBFILE']
 #|     #POLYFILE = params.files['POLYFILE']
 #|     #LPB0 = params.parameters['LPB0']
-#| 
+#|
 #|     print("algebraic_query_sieving.B:", params['algebraic_query_sieving.B'])
 #|     print("algebraic_query_sieving.A:", params['algebraic_query_sieving.A'])
 #|     #print("A_sieving (used as default if algebraic_query_sieving.A is unset):", params['A_sieving'])
@@ -4516,7 +4706,7 @@ if __name__ == "__main__":
 #|     print("algebraic_query_sieving.q0_ratio (magic constant c0)", params["algebraic_query_sieving.q0_ratio"])
 #|     print("q0 (determined from BOUNDA_queries and q0_ratio):", q0)
 #|     print("q1 (determined from BOUNDA_queries):", q1)
-#| 
+#|
 #|     print()
 #|     print("----- Running las ----")
 #|     print()
@@ -4552,11 +4742,11 @@ if __name__ == "__main__":
 #|             )
 #|     finish = time.time()
 #|     print("...finished running las")
-#| 
+#|
 #|     print()
 #|     print("----- Results -----")
 #|     print()
-#| 
+#|
 #|     # The last line of output is of the form
 #|     # "# Total xxx reports ..."
 #|     # where xxx is the total number of relations after dedup
@@ -4566,7 +4756,7 @@ if __name__ == "__main__":
 #|     relations_per_q = num_relations / nsamples
 #|     total_special_qs = float(log_integral(q1) - log_integral(q0))
 #|     estimated_total_relations = relations_per_q * total_special_qs
-#| 
+#|
 #|     print(f"Number of relations after dedup: {num_relations}")
 #|     print(f"Relations per special-q: {relations_per_q}")
 #|     print(f"Estimated total number of relations over full q-range: {estimated_total_relations}")
@@ -4580,25 +4770,25 @@ if __name__ == "__main__":
 #|     else:
 #|         print("----> This A_sieving seems reasonable, but try decreasing it a little more to see if that works")
 #|     print()
-#| 
+#|
 #|     return estimated_total_relations
-#| 
+#|
 #| def estimate_algebraic_query_sieving_time(params, polyfile, fbfile, tempdir, nsamples=1024):
 #|     print("===== Algebraic query sieving time estimate =====")
 #|     print("----- Relevant parameters -----")
 #|     print("Number of random samples:", nsamples)
-#| 
+#|
 #|     poly = CadoPolyFile(polyfile); poly.read()
-#| 
+#|
 #|     LPB1_queries = params['LPB1_queries']
 #|     BOUNDA_queries = 2**LPB1_queries
-#| 
+#|
 #|     # The below four lines (setting special-q bounds q0 and q1) come from call_algebraic_query_sieving in helpers.py
 #|     c0 = QQ(params["algebraic_query_sieving.q0_ratio"])
 #|     c1 = 1 #4
 #|     q0 = floor(c0*BOUNDA_queries)
 #|     q1 = c1*BOUNDA_queries
-#| 
+#|
 #|     # The following comes from do_algebraic_query_sieving in helpers.py
 #|     #BOUNDA_queries = params.BOUNDA_queries
 #|     #AQRELS_FILE = params.files['AQRELS_FILE']+"."+jobnum
@@ -4606,10 +4796,10 @@ if __name__ == "__main__":
 #|     #POLYFILE = params.files['POLYFILE']
 #|     #LPB0 = params.parameters['LPB0']
 #|     #LPB1_queries = params.parameters['LPB1_queries']
-#| 
+#|
 #|     # The las output isn't super useful to us, we just care about timing here
 #|     outfile = f"{tempdir}las-estimate-aqrels-{time.time()}.out"
-#| 
+#|
 #|     print("algebraic_query_sieving.B:", params['algebraic_query_sieving.B'])
 #|     print("algebraic_query_sieving.A:", params['algebraic_query_sieving.A'])
 #|     #print("A_sieving (used as default if algebraic_query_sieving.A is unset):", params['A_sieving'])
@@ -4620,7 +4810,7 @@ if __name__ == "__main__":
 #|     print("algebraic_query_sieving.q0_ratio (magic constant c0)", params["algebraic_query_sieving.q0_ratio"])
 #|     print("q0 (determined from BOUNDA_queries and q0_ratio):", q0)
 #|     print("q1 (determined from BOUNDA_queries):", q1)
-#| 
+#|
 #|     print()
 #|     print("----- Running las ----")
 #|     print()
@@ -4652,38 +4842,38 @@ if __name__ == "__main__":
 #|             )
 #|     finish = time.time()
 #|     print("...finished running las")
-#| 
+#|
 #|     print()
 #|     print("----- Results -----")
 #|     print()
-#| 
+#|
 #|     num_special_qs = float(log_integral(q1) - log_integral(q0))
 #|     core_seconds_per_q = float((finish - start)*88/nsamples) # 88 is the number of cores on our machines, TODO get this programattically
 #|     print(f"Sieved {nsamples} special-q's in wall-clock time {finish - start:.2f}sec")
 #|     print(f"Assuming 88 cores, this gives {core_seconds_per_q} core-seconds per special q")
 #|     print(f"Estimated time for sieving entire range: {num_special_qs * core_seconds_per_q / 3600:.2f} core-hours")
 #|     return
-#| 
+#|
 #| def estimate_fb_extension_sieving_rels(params, polyfile, fbfile, nsamples=1024):
 #|     print("===== fb extension sieving #relations estimate =====")
 #|     print("----- Relevant parameters -----")
 #|     print("Number of random samples:", nsamples)
-#| 
+#|
 #|     poly = CadoPolyFile(polyfile); poly.read()
-#| 
+#|
 #|     LPB1 = params['LPB1']
 #|     q1 = BOUNDA = 2**LPB1
 #|     LPB1_queries = params['LPB1_queries']
 #|     q0 = BOUNDA_queries = 2**LPB1_queries
-#| 
+#|
 #|     B = params.get('extension_sieving.B', 16)
 #|     A = params.get('extension_sieving.A', params['A_sieving'])
-#| 
+#|
 #|     mfb0 = params.get('extension_sieving.mfb',
 #|                     params['sieve.mfb1'])
 #|     lim0 = params.get('extension_sieving.lim',
 #|                                            BOUNDA_queries)
-#| 
+#|
 #|     print("B:", B)
 #|     print("A:", A)
 #|     print("lbp0:", LPB1_queries)
@@ -4692,7 +4882,7 @@ if __name__ == "__main__":
 #|     print("sieve.powlim", params['sieve.powlim'])
 #|     print("q0:", q0)
 #|     print("q1:", q1)
-#| 
+#|
 #|     print("\n----- Running las ----\n")
 #|     output = CadoNFS("sieve/las",
 #|         "-sqside", 0,
@@ -4723,21 +4913,21 @@ if __name__ == "__main__":
 #|         },
 #|         capture=True # makes it return stdout
 #|     )
-#| 
+#|
 #|     print("\n----- Results -----\n")
-#| 
+#|
 #|     output = output[output.rindex(b'#'):]
 #|     assert output.startswith(b"# Total "), f"las output wasn't in expected format; last line was: {output}"
 #|     num_relations = int(output.split(b" ")[2])
 #|     relations_per_q = num_relations / nsamples
 #|     total_special_qs = float(log_integral(q1) - log_integral(q0))
 #|     estimated_total_relations = relations_per_q * total_special_qs
-#| 
+#|
 #|     print(f"Number of relations after dedup: {num_relations}")
 #|     print(f"Relations per special-q: {relations_per_q}")
 #|     print(f"Estimated total number of relations over full q-range: {estimated_total_relations}")
 #|     return estimated_total_relations
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='estimate2.py')
 #|     topparser.add_argument('--config', dest='config', required=True)
@@ -4752,7 +4942,7 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--extrels', action='store_true', help="compute expected number of extrels instead of aqrels.")
 #|     topargs = topparser.parse_args()
 #|     nsamples = 100 if topargs.coarse else 1024
-#| 
+#|
 #|     with open(topargs.locations, "r") as locations:
 #|         for l in locations.readlines():
 #|             if re.search(r"^#", l):
@@ -4764,24 +4954,24 @@ if __name__ == "__main__":
 #|                 else:
 #|                     print(f"Using {var} from config file {topargs.locations}")
 #|                     os.environ[var] = value
-#| 
+#|
 #|     parameters = parse_config(topargs.config)
 #|     nbits = parameters["MODULUS_BITS"]
 #|     CADO_BUILD_DIR=os.environ['CADO_BUILD_DIR']
 #|     TEMP_OUTPUT_DIR=os.environ['TEMP_OUTPUT_DIR'] + f"n{nbits}/"
-#| 
+#|
 #|     if topargs.fbfile:
 #|         fbfile = topargs.fbfile
 #|     else:
 #|         fbfile = TEMP_OUTPUT_DIR + "fb.gz"
-#| 
+#|
 #|     if topargs.polyfile:
 #|         polyfile = topargs.polyfile
 #|     else:
 #|         polyfile = TEMP_OUTPUT_DIR + "f.poly"
-#| 
+#|
 #|     CadoNFSBinaries().set_build_dir(CADO_BUILD_DIR)
-#| 
+#|
 #|     if topargs.A_sieving:
 #|         print("Overriding algebraic_query_sieving.A to", topargs.A_sieving)
 #|         parameters['algebraic_query_sieving.A'] = topargs.A_sieving
@@ -4791,13 +4981,13 @@ if __name__ == "__main__":
 #|     if topargs.mfb1:
 #|         print("Overriding sieve.mfb1 to", topargs.mfb1)
 #|         parameters['sieve.mfb1'] = topargs.mfb1
-#| 
+#|
 #|     if 'algebraic_query_sieving.A' not in parameters.keys():
 #|         parameters['algebraic_query_sieving.A'] = parameters['A_sieving']
-#| 
+#|
 #|     if 'algebraic_query_sieving.B' not in parameters.keys():
 #|         parameters['algebraic_query_sieving.B'] = 16
-#| 
+#|
 #|     if topargs.extrels:
 #|         estimate_fb_extension_sieving_rels(parameters, polyfile, fbfile, nsamples)
 #|     else:
@@ -4806,7 +4996,7 @@ if __name__ == "__main__":
 
 #@ FILE code/fb_extension_sieving_helper.py 644 1066 bf8ddf5cd6cdf07d42a8208a590b57b808e23b3c63de9a525b654e601b03abf4 text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| import argparse
 #| import json
@@ -4814,10 +5004,10 @@ if __name__ == "__main__":
 #| from cado_sage import CadoPolyFile
 #| from relations import strip_rational_part_of_relations
 #| from helpers import do_fb_extension_sieving
-#| 
+#|
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='fb_extension_sieving_helper.py')
 #|     topparser.add_argument('--params',dest='params')
@@ -4825,14 +5015,14 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--q0',dest='q0')
 #|     topparser.add_argument('--q1',dest='q1')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     # Doing horrible things to fake the params object from a json exportable object
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
 #|     POLYFILE = params.files['POLYFILE']
-#|     poly = CadoPolyFile(POLYFILE); poly.read()  
+#$     poly = CadoPolyFile(POLYFILE); poly.read()  $
 #|     params.poly = poly
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#|     
+#$     $
 #|     do_fb_extension_sieving(params,jobnum=topargs.jobnum,q0=topargs.q0,q1=topargs.q1)
 
 #@ FILE code/helpers.py 644 250484 fa2a770d202f81631d5c4dee93741d060704f55b190a64961949d7b71654eb09 text
@@ -4843,10 +5033,10 @@ if __name__ == "__main__":
 #| from timing import *
 #| import tqdm
 #| import mmap
-#| 
+#|
 #| from sage.misc.persist import SagePickler, SageUnpickler
 #| from sage.libs.libecm import ecmfactor
-#| 
+#|
 #| import abc
 #| import argparse
 #| import copy
@@ -4866,18 +5056,18 @@ if __name__ == "__main__":
 #| import bisect
 #| import logging
 #| import math
-#| 
+#|
 #| from collections import defaultdict, namedtuple
 #| from pathlib import Path
 #| import time
 #| from contextlib import redirect_stdout,redirect_stderr
 #| from misc_tools import fast_persistent_save, fast_persistent_load
-#| 
+#|
 #| from cado.scripts import descent
 #| from cado_sage import CadoPolyFile
 #| from misc_tools import cat_or_zcat, fast_json_load, fast_json_dump, find_factors_close_to_square_root
 #| from wait_for_file import wait_for_file, wait_for_file_content
-#| 
+#|
 #| from cado_nfs_binaries import CadoNFS, CadoNFSBinaries
 #| from candy import print_command_line,warning_message,major_message
 #| from relations import las_relation, las_relations_from_file
@@ -4885,52 +5075,52 @@ if __name__ == "__main__":
 #| from relations import swap_parts_of_relations
 #| from relations import keep_only_one_relation_per_q, parse_fb_extension_relations
 #| from relations import convert_to_indexed_relation, big_convert_to_indexed_relation
-#| 
+#|
 #| import tocfile
 #| from descent_ecm_utils import transform_polys_by_q, filter_with_ecm
 #| from bwc_helpers import write_ascii_vector
 #| from partial_R import PartialRenumber1024
 #| from concurrent.futures import ProcessPoolExecutor
-#| 
+#|
 #| LinalgOutput = namedtuple('LinalgOutput', ['sol', 'ST_list', 'ST_alg_vector', 'T_list', 'row_to_aquery', 'S_rat_vector', 'indexed_relations_file'])
-#| 
+#|
 #| x = polygen(QQ, 'x')
-#| 
+#|
 #| def silent_remove(filename):
 #|     if os.path.exists(filename):
 #|         timeprint("Deleting",filename)
 #|         os.remove(filename)
-#| 
+#|
 #| def glob_remove(pattern):
 #|     for filename in glob.glob(pattern):
 #|         timeprint("Deleting",filename)
 #|         os.remove(filename)
-#| 
+#|
 #| def make_and_clean(dirname):
 #|     if os.path.exists(dirname):
 #|         shutil.rmtree(dirname)
 #|     Path(dirname).mkdir(exist_ok=True)
-#| 
+#|
 #| def get_uv_fac(u, v, target_info):
 #|     try:
 #|         u_fac = target_info['u_fac']
 #|         v_fac = target_info['v_fac']
-#| 
+#|
 #|         uv_fac_list = []
 #|         for fac in u_fac:
 #|             uv_fac_list.append( (ZZ(fac),1) )
 #|         for fac in v_fac:
 #|             uv_fac_list.append( (ZZ(fac),-1) )
-#| 
+#|
 #|         uv_fac = Factorization(uv_fac_list, unit=sign(u)*sign(v))
 #|     except KeyError:
 #|         uv_fac = Factorization([(p, sign(e)) for p, e in factor(ZZ(u) / ZZ(v)) for _ in range(abs(e))], unit=sign(u)*sign(v))
-#| 
+#|
 #|     print("u/v", str(u/v))
 #|     print("uv_fac", str(uv_fac.prod()))
 #|     assert uv_fac.prod() == u/v
 #|     return uv_fac
-#| 
+#|
 #| def masked_target(target, e):
 #|     """
 #|     given target as an element of Z/NZ, return the quadruple
@@ -4941,7 +5131,7 @@ if __name__ == "__main__":
 #|     h = target * mask**e
 #|     u, v = choose_uv(h)
 #|     return mask, h, u, v
-#| 
+#|
 #| def parse_polyfile(POLYFILE):
 #|     poly = CadoPolyFile(POLYFILE)
 #|     poly.read()
@@ -4949,13 +5139,13 @@ if __name__ == "__main__":
 #|     m = poly.m
 #|     f = poly.f[1]
 #|     return (N, m, f)
-#| 
+#|
 #| def check_N_d_and_e(params):
 #|     parameters = params.parameters
 #|     N = parameters['N']
 #|     d = Integer(parameters['d'])
 #|     e = Integer(parameters['e'])
-#| 
+#|
 #|     if d == 0:
 #|         if 'p' in parameters and 'q' in parameters:
 #|             p = Integer(parameters['p'])
@@ -4969,14 +5159,14 @@ if __name__ == "__main__":
 #|         d = ZZ(1/Integers(phi)(e))
 #|         params.parameters['d'] = d
 #|         timeprint(f"Computed d={d}")
-#| 
+#|
 #|     ZN = Integers(N)
 #|     # This is to make sure that we clean up all files if we want to
 #|     # experiment with other exponents.
 #|     assert ZN(2)**(d*e) == 2
-#| 
+#|
 #|     return N, d, e
-#| 
+#|
 #| def generate_or_load_target(params):
 #|     # Should be run ONCE for a computation.
 #|     # I'm not sure what exactly reads/writes to params.target
@@ -4984,31 +5174,31 @@ if __name__ == "__main__":
 #|         timeprint("Using existing target in: " + params.files['THE_TARGET'])
 #|         with open(params.files['THE_TARGET'], "r") as f:
 #|             return Integer(f.readline().strip())
-#| 
+#|
 #|     N = params.poly.N
 #|     ZN = Integers(N)
 #|     e = params.parameters['e']
 #|     nbits = Integer(N).nbits()
-#| 
+#|
 #|     tgt_d = 1
 #|     target = 1
-#| 
+#|
 #|     while True:
 #|         tgt_d = ZN.random_element()
 #|         target = ZN(tgt_d ** e)
-#| 
+#|
 #|         # We want to make sure we get a full-size target
 #|         if Integer(tgt_d).nbits() == nbits and Integer(target).nbits() == nbits:
 #|             break
-#| 
+#|
 #|     with open(params.files['THE_TARGET'], "w") as f:
 #|         f.write(str(target))
 #|         f.write("\n")
 #|         f.write("only for debugging:")
 #|         f.write("\n" + str(tgt_d) + "\n")
-#| 
+#|
 #|     return target
-#| 
+#|
 #| def write_hintfile(infilename,outfilename, BOUNDR, BOUNDA, I):
 #|     # https://sympa.inria.fr/sympa/arc/cado-nfs/2018-07/msg00044.html
 #|     # This file needs to exist and seems to be crucial for the efficiency of the descent
@@ -5018,7 +5208,7 @@ if __name__ == "__main__":
 #|             line = line.strip()
 #|             if not line or line.startswith('#'):
 #|                 continue
-#| 
+#|
 #|             foo = re.match(r"(^.*I=)(\d+)\s+(\d+)(,[\d.,]+)"
 #|                            r"\s+(\d+)(,[\d.,]+)$",
 #|                            line)
@@ -5027,7 +5217,7 @@ if __name__ == "__main__":
 #|                           "on line:\n" + line)
 #|                 continue
 #|             prolog,hint_I,lim0,params0,lim1,params1 = foo.groups()
-#| 
+#|
 #|             # If the I or lim values are bad, we should give a warning
 #|             if int(hint_I) > I:
 #|                 s = (
@@ -5059,31 +5249,31 @@ if __name__ == "__main__":
 #|                     str(BOUNDA)
 #|                 )
 #|                 raise RuntimeError(s)
-#| 
+#|
 #|             outfile.write(prolog + str(hint_I) + " " + str(lim0) + params0 + " " + str(lim1) + params1 + "\n")
 #|     return
-#| 
+#|
 #| def write_hintfile2(params, **kwargs):
 #|     """
 #|     very much WIP at this point. Does not do anything interesting yet. Do
 #|     not use.
 #|     """
-#| 
+#|
 #|     ratio = params.parameters.get('initial_descent_smoothness_ratio', 2.25)
 #|     ratio = float(ratio)
 #|     initial_smoothness_maxbits = params.parameters['MODULUS_BITS'] / 2 / ratio
 #|     initial_smoothness_maxbits = int(initial_smoothness_maxbits)
-#| 
+#|
 #|     I = kwargs.get('I', params.I_sieving)
-#| 
+#|
 #|     # We have prepared factor bases up to this size.
 #|     BOUNDR = params.BOUNDR
 #|     BOUNDA = params.BOUNDA
 #|     LPB0 = params.parameters['LPB0']
 #|     LPB1 = params.parameters['LPB1']
-#| 
+#|
 #|     s = params.poly.skewness
-#| 
+#|
 #|     # We have an affine relation that, for a given value of I and a
 #|     # special-q of bitsize b, gives the approximate bitsize of the two
 #|     # norms.
@@ -5093,7 +5283,7 @@ if __name__ == "__main__":
 #|         d = f.degree()
 #|         f_offset = max([log(abs(f[i])*s**(i-d/2),2) for i in range(d+1)])
 #|         multipliers.append((d, f_offset))
-#| 
+#|
 #|     for b in range(min(LPB0, LPB1), initial_smoothness_maxbits+1):
 #|         raw_norms = [(I+b/2)*m1 + m0 for m1, m0 in multipliers]
 #|         for side in range(2):
@@ -5101,8 +5291,8 @@ if __name__ == "__main__":
 #|             n[side] -= b
 #|             print(f"With I={I}, a {b}@{side} special-q"
 #|                   f" will have norms of {n[0]} and {n[1]} bits")
-#| 
-#| 
+#|
+#|
 #| def polysel_lattice(params,N,e,deg,force_monic=True):
 #|     x = polygen(ZZ)
 #|     ZP = x.parent()
@@ -5175,8 +5365,8 @@ if __name__ == "__main__":
 #|         coeffs.reverse()
 #|         f = ZP(coeffs)
 #|     return f,m
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def polysel_higheffort_select(params):
 #|     assert 'slurm.numjobs' in params.parameters
@@ -5184,9 +5374,9 @@ if __name__ == "__main__":
 #|     admin_min = float(params.parameters['poly.admin'])
 #|     admax_max = float(params.parameters['poly.admax'])
 #|     ad_diff = floor((admax_max - admin_min)/numjobs)
-#| 
+#|
 #|     params.save_to_file()
-#| 
+#|
 #|     processes = []
 #|     for jobnum in range(numjobs):
 #|         admin = admin_min + jobnum*ad_diff
@@ -5201,19 +5391,19 @@ if __name__ == "__main__":
 #|             "--outfile", outfile,
 #|         ]
 #|         processes.append(slurmit(params, " ".join(command_list), params.prefix[:-1]+"-polyselect", jobnum))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(processes)
 #|     overall_cputime.add(cputime_slurm)
 #|     print(f"Finished running {numjobs} polyselects!")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def polysel_higheffort_ropt(params):
 #|     assert 'slurm.numjobs' in params.parameters
 #|     numjobs = int(params.parameters['slurm.numjobs'])
-#| 
+#|
 #|     params.save_to_file()
-#| 
+#|
 #|     processes = []
 #|     for jobnum in range(numjobs):
 #|         infile = params.files['POLYSEL_SELECT_PFX'] + "." + str(jobnum)
@@ -5226,32 +5416,32 @@ if __name__ == "__main__":
 #|             "--outfile", outfile,
 #|         ]
 #|         processes.append(slurmit(params, " ".join(command_list), params.prefix[:-1]+"-polyropt", jobnum))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(processes)
 #|     overall_cputime.add(cputime_slurm)
 #|     print(f"Finished running {numjobs} poly_ropts!")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def polysel_higheffort_candidates(params, ncandidates=10):
 #|     assert 'slurm.numjobs' in params.parameters
 #|     numjobs = int(params.parameters['slurm.numjobs'])
 #|     output = ""
-#| 
+#|
 #|     deg = int(params.parameters['POLY_DEG'])
 #|     N = Integer(params.parameters['N'])
-#| 
+#|
 #|     best = [(None,None,None,None) for i in range(ncandidates)]
 #|     current = None
 #|     x = polygen(ZZ, 'x')
 #|     ZN = Integers(N)
-#| 
+#|
 #|     for jobnum in range(numjobs):
 #|         outfilename = params.files['POLYSEL_SELECT_PFX'] + "." + str(jobnum) + ".ropt"
 #|         with open(outfilename, "r") as outfile:
 #|             output += outfile.read()
 #|             output += "\n"
-#| 
+#|
 #|     for line in output.split("\n"):
 #|         if m := re.match(r"^#* root-optimized polynomial (\d+) #*", line):
 #|             current = {}
@@ -5272,18 +5462,18 @@ if __name__ == "__main__":
 #|                 continue
 #|             else:
 #|                 best[best_to_replace] = (score, g, f, m)
-#| 
+#|
 #|     for i in range(len(best)):
 #|         score = best[i][0]
 #|         g = best[i][1]
 #|         f = best[i][2]
 #|         m = best[i][3]
-#| 
+#|
 #|         if score is None:
 #|             continue
-#| 
+#|
 #|         filename = params.files['POLYSEL_SELECT_PFX'] + ".poly.option." + str(i)
-#| 
+#|
 #|         with open(filename, "w") as file:
 #|             print(f"n: {N}", file=file)
 #|             print(f"m: {m}", file=file)
@@ -5293,7 +5483,7 @@ if __name__ == "__main__":
 #|             print(f"n: {N}", file=file)
 #|             print(f"m: {m}", file=file)
 #|             print("poly0: ", ", ".join([str(x) for x in f.list()]), file=file)
-#| 
+#|
 #|         try:
 #|             skew = float(CadoNFS("polyselect/skewness", "poly",
 #|                          inputs={"poly": filename},
@@ -5301,16 +5491,16 @@ if __name__ == "__main__":
 #|         except CadoNFSBinaries.BinaryNotFound:
 #|             skew = 0.7
 #|             warning_message(f"binary polyselect/skewness not found, using phony skewness value {skew} instead")
-#| 
+#|
 #|         with open(filename, "a+") as file:
 #|             print(f"skew: {skew}", file=file)
-#| 
+#|
 #|         with open(filename + ".Me", "w") as efile:
 #|             print(f"\nscore: {score}\n", file=efile)
-#| 
+#|
 #|     print("Finished selecting best " + str(ncandidates) + " candidate polynomials!")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def polysel_cado(params,N,e,deg):
 #|     output = CadoNFS("polyselect/polyselect",
@@ -5325,7 +5515,7 @@ if __name__ == "__main__":
 #|     surviving_polynomials = []
 #|     coeffs = {}
 #|     polylines = []
-#| 
+#|
 #|     lines = iter(output.decode('utf-8').split("\n"))
 #|     candidate_polys = []
 #|     for line in lines:
@@ -5339,9 +5529,9 @@ if __name__ == "__main__":
 #|             matches = re.search(r"lognorm ([\d\.]+),", line)
 #|             lognorm = matches.groups(0)[0]
 #|             heapq.heappush(candidate_polys, (float(lognorm),polylines))
-#| 
+#|
 #|     params.save_to_file()
-#| 
+#|
 #|     if not params.slurm:
 #|         timeprint("Running polyselect_ropt without slurm, setting numjobs = 1")
 #|         numjobs = 1
@@ -5367,7 +5557,7 @@ if __name__ == "__main__":
 #|                     outfile.write(line)
 #|                     outfile.write("\n")
 #|                 outfile.write("\n")
-#| 
+#|
 #|         command_list = [
 #|             params.files['SAGE'],
 #|             "poly_ropt_helper.py",
@@ -5375,7 +5565,7 @@ if __name__ == "__main__":
 #|             "--infile", outfilename,
 #|             "--outfile", outfilename+".out"
 #|         ]
-#| 
+#|
 #|         if params.slurm:
 #|             processes.append(slurmit(params,
 #|                 " ".join(command_list),
@@ -5383,7 +5573,7 @@ if __name__ == "__main__":
 #|                 jobnum))
 #|         else:
 #|             processes.append(subprocess.Popen(["time", "-p"] + command_list, stderr=subprocess.PIPE, text=True))
-#| 
+#|
 #|     expected_filenames = [f"{filename}.out" for filename in filenames]
 #|     if params.slurm:
 #|         finished_processes, cputime_slurm = slurm_wait(processes)
@@ -5396,7 +5586,7 @@ if __name__ == "__main__":
 #|             process.wait()
 #|             stderr = process.communicate()[1]
 #|             overall_cputime.add(extract_time(stderr))
-#| 
+#|
 #|     # output = CadoNFS("polyselect/polyselect_ropt",
 #|     #                  "-t",params.polyselect_nthreads_or_auto,
 #|     #                  "-inputpolys",params.files['POLYSELECT'],
@@ -5405,7 +5595,7 @@ if __name__ == "__main__":
 #|     #                  "-Bg",params.parameters['poly.Bg'],
 #|     #                  "-ropteffort",params.parameters.get('poly.ropteffort',5),
 #|     #                  capture=True)
-#| 
+#|
 #|     best = (None,)
 #|     current = None
 #|     x = polygen(ZZ, 'x')
@@ -5415,7 +5605,7 @@ if __name__ == "__main__":
 #|         with open(outfilename,"r") as outfile:
 #|             output += outfile.read()
 #|         output += "\n"
-#| 
+#|
 #|     for line in output.split("\n"):
 #|         if m := re.match(r"^#* root-optimized polynomial (\d+) #*", line):
 #|             current = {}
@@ -5434,7 +5624,7 @@ if __name__ == "__main__":
 #|             best = (score, g, f, m)
 #|     timeprint("Best poly has score:",score)
 #|     return best[1:]
-#| 
+#|
 #| @timing
 #| def write_polyfile(params,algorithm,N, e, deg, filename, force_monic=True, hardcoded_m=None, hardcoded_polys=None):
 #|     x = polygen(ZZ, 'x')
@@ -5453,9 +5643,9 @@ if __name__ == "__main__":
 #|         m = hardcoded_m
 #|         g = hardcoded_polys[0]
 #|         f = hardcoded_polys[1]
-#| 
+#|
 #|     with open(filename, "w") as file:
-#| 
+#|
 #|         print(f"n: {N}", file=file)
 #|         print(f"m: {m}", file=file)
 #|         # It's a bit of a pity: we could at least theoretically write the
@@ -5464,34 +5654,34 @@ if __name__ == "__main__":
 #|         #print(f"poly0: -{m}, 1", file=file)
 #|         print("poly0: ", ", ".join([str(x) for x in g.list()]), file=file)
 #|         print("poly1: ", ", ".join([str(x) for x in f.list()]), file=file)
-#| 
+#|
 #|     with open(filename + ".only-side1", "w") as file:
 #|         #x = polygen(ZZ, 'x')
 #|         print(f"n: {N}", file=file)
 #|         print(f"m: {m}", file=file)
 #|         print("poly0: ", ", ".join([str(x) for x in f.list()]), file=file)
-#| 
+#|
 #|     # We have an external tool that can compute the skewness
 #|     try:
 #|         skew = float(CadoNFS("polyselect/skewness", "poly",
 #|                              inputs={"poly": filename},
 #|                              capture=True))
-#| 
+#|
 #|         if skew < 0.0000000001:
 #|             skew = 1.0  # fake, but 2e-155 won't be parsed correctly
-#| 
+#|
 #|     except CadoNFSBinaries.BinaryNotFound:
 #|         skew = 0.7
 #|         warning_message(f"binary polyselect/skewness not found, using phony skewness value {skew} instead")
-#| 
+#|
 #|     with open(filename, "a+") as file:
 #|         print(f"skew: {skew}", file=file)
-#| 
+#|
 #| @timing
 #| def run_oracle(params, todofilename, jsonfilename):
 #|     if params.oracle == "sage":
 #|         N, d, e = check_N_d_and_e(params)
-#| 
+#|
 #|         command_line = [params.files['SAGE'],
 #|             f"oracles/sage_oracle.py",
 #|             "-d", str(d),
@@ -5499,7 +5689,7 @@ if __name__ == "__main__":
 #|             "--in", todofilename,
 #|             "--out", jsonfilename
 #|         ]
-#| 
+#|
 #|         if params.mpi:
 #|             command_line = [
 #|                 params.mpi_mpirun_bin,
@@ -5538,24 +5728,24 @@ if __name__ == "__main__":
 #|         ]
 #|     else:
 #|         raise Exception(f"Unsupported oracle {params.oracle}")
-#| 
+#|
 #|     print_command_line(*command_line)
 #|     p = subprocess.run(["time", "-p"] + command_line, check=True, stderr=subprocess.PIPE, text=True)
 #|     overall_cputime.add(extract_time(p.stderr))
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def do_rational_queries(params):
 #|     boundr = params.BOUNDR
 #|     todofilename = params.files['RQUERIES_TODO']
 #|     jsonfilename = params.files['RQUERIES_FILE']
-#| 
+#|
 #|     nqueries = 0
 #|     do_generate = True
 #|     if os.path.isfile(todofilename):
 #|         with open(todofilename, "r") as todofile:
 #|             do_generate = len(todofile.readlines()) < prime_pi(boundr)
-#| 
+#|
 #|     if do_generate:
 #|         with open(todofilename, "w") as todofile:
 #|             primesieve_bin = "/usr/bin/primesieve"
@@ -5578,13 +5768,13 @@ if __name__ == "__main__":
 #|                 for p in prime_range(boundr):
 #|                     print(p, file=todofile)
 #|                     nqueries += 1
-#| 
+#|
 #|     with open(todofilename, "r+") as todofile:
 #|         with open(todofilename, "r") as todofile:
 #|             queries = todofile.readlines()
 #|             nqueries = len(queries)
 #|         last_primes = frozenset([int(p.strip()) for p in queries])
-#| 
+#|
 #|         # I'm not sure it's useful on the algebraic side. Quite possibly
 #|         # not. It doesn't hurt, though.
 #|         for side in range(2):
@@ -5596,19 +5786,19 @@ if __name__ == "__main__":
 #|                           f" f{side} = {F} among the rational queries")
 #|                 print(p, file=todofile)
 #|                 nqueries += 1
-#| 
+#|
 #|     if not do_generate and os.path.isfile(jsonfilename):
 #|         timeprint(f"Skipping calls to oracle for rational queries and instead reusing the ones already in {jsonfilename}.")
 #|     else:
 #|         run_oracle(params, todofilename, jsonfilename)
-#| 
+#|
 #|     return nqueries
-#| 
+#|
 #| def slurmit(params, command, jobname, jobnum, exclusive=True, setup_commands=[], partition=None, nested_mpi=False):
 #|     jobfile = f"{params.dirs['SLURMJOBS']}{jobname}.{jobnum}.job"
 #|     outfile = f"{params.dirs['SLURMJOBS']}{jobname}.{jobnum}.%j.out"
 #|     errfile = f"{params.dirs['SLURMJOBS']}{jobname}.{jobnum}.%j.err"
-#| 
+#|
 #|     if nested_mpi:
 #|         m = re.search(r'--mpi[\s=]+(\d+)x(\d+)', command)
 #|         if m:
@@ -5616,7 +5806,7 @@ if __name__ == "__main__":
 #|             nnodes = int(groups[0]) * int(groups[1])
 #|         else:
 #|             nnodes = 1
-#| 
+#|
 #|     with open(jobfile,"w") as f:
 #|         f.writelines("#!/bin/bash\n")
 #|         if nested_mpi:
@@ -5638,7 +5828,7 @@ if __name__ == "__main__":
 #|         f.writelines("export DOT_SAGE=/tmp/$USER.sage/\n")
 #|         f.writelines("set -e\n")
 #|         f.writelines(setup_commands)
-#| 
+#|
 #|         if nested_mpi:
 #|             # Remark: Possible ways to call MPI are:
 #|             #   - "sbatch/script/mpirun" (this file),
@@ -5653,9 +5843,9 @@ if __name__ == "__main__":
 #|         else:
 #|             f.writelines("\n# srun is necessary so that SIGINT signals are forwarded to the executed job, time is here to measure cputime.\n")
 #|             f.writelines(f"srun time -p " + command)
-#| 
+#|
 #|         f.writelines("\n")
-#| 
+#|
 #|     result = subprocess.run(["sbatch", jobfile],stdout=subprocess.PIPE)
 #|     timeprint("Submitted slurm job:")
 #|     major_message(command)
@@ -5665,7 +5855,7 @@ if __name__ == "__main__":
 #|         jobnum = int(match.group(1))
 #|         timeprint("job number is",jobnum)
 #|     return jobnum, errfile.replace("%j", str(jobnum))
-#| 
+#|
 #| def slurm_wait(process_list, throw_error_on_failed_job=False, params=None):
 #|     finished_processes = []
 #|     launched_processes = []
@@ -5673,10 +5863,10 @@ if __name__ == "__main__":
 #|     while process_list:
 #|         for jobnum, errfile in process_list:
 #|             result = subprocess.run(["sacct","-j",str(jobnum),"--format=state","--noheader"],stdout=subprocess.PIPE)
-#| 
+#|
 #|             # Remark: the order of the below matters. Some batch jobs have multiple
 #|             # subjobs that are listed in the sacct output.
-#| 
+#|
 #|             # If any (sub)jobs failed we want to fail the whole job.
 #|             if re.search(b'FAILED',result.stdout):
 #|                 result2 = subprocess.run(["sacct","-j",str(jobnum),"--format=nodelist,JobName%50","--noheader","-X"],stdout=subprocess.PIPE)
@@ -5685,13 +5875,13 @@ if __name__ == "__main__":
 #|                 process_list.remove((jobnum, errfile))
 #|                 cputime_slurm += extract_time_from_file(errfile)
 #|                 timeprint(exception_msg)
-#| 
+#|
 #|                 if throw_error_on_failed_job:
 #|                     if os.path.isfile(errfile):
 #|                         with open(errfile, "r") as fp:
 #|                             exception_msg += f"\nHere is the job's error output from file {errfile}:\n" + fp.read()
 #|                     raise Exception(exception_msg)
-#| 
+#|
 #|             # If any (sub)jobs is still running, we want to wait.
 #|             elif re.search(b'RUNNING',result.stdout):
 #|                 if jobnum in launched_processes:
@@ -5700,7 +5890,7 @@ if __name__ == "__main__":
 #|                 nodename = result2.stdout.split()[0].decode('ascii')
 #|                 launched_processes.append(jobnum)
 #|                 timeprint(f"job {jobnum} launched on node {nodename}")
-#| 
+#|
 #|             # If all (sub)jobs are either complete or cancelled, we want to mark the whole job as cancelled.
 #|             elif re.search(b'CANCELLED',result.stdout):
 #|                 result2 = subprocess.run(["sacct","-j",str(jobnum),"--format=elapsed","--noheader"],stdout=subprocess.PIPE)
@@ -5710,7 +5900,7 @@ if __name__ == "__main__":
 #|                 job_cputime_slurm = extract_time_from_file(errfile)
 #|                 cputime_slurm += job_cputime_slurm
 #|                 timeprint(f"job {jobnum} cancelled :/ elapsed: {elapsed} (cputime: {job_cputime_slurm:2.4f}s)")
-#| 
+#|
 #|             # If all (sub)jobs completed, we finally are done!
 #|             elif re.search(b'COMPLETED',result.stdout):
 #|                 result2 = subprocess.run(["sacct","-j",str(jobnum),"--format=elapsed","--noheader"],stdout=subprocess.PIPE)
@@ -5721,7 +5911,7 @@ if __name__ == "__main__":
 #|                 cputime_slurm += job_cputime_slurm
 #|                 timeprint(f"job {jobnum} succeeded :) elapsed: {elapsed}s (cputime: {job_cputime_slurm:2.4f}s)")
 #|     return finished_processes, cputime_slurm
-#| 
+#|
 #| def get_slurm_job_status(slurm_job):
 #|     result = subprocess.run(["sacct","-j",str(slurm_job),"--format=state","--noheader"],stdout=subprocess.PIPE)
 #|     if re.search(b'RUNNING',result.stdout):
@@ -5733,13 +5923,13 @@ if __name__ == "__main__":
 #|     if re.search(b'PENDING',result.stdout):
 #|         return 'PENDING'
 #|     return None
-#| 
+#|
 #| @timing
 #| def call_todo_sieving(params, is_alg_or_ext=True):
 #|     # True for alg, False for extension
-#| 
+#|
 #|     R = params.R
-#| 
+#|
 #|     if is_alg_or_ext:
 #|         shortname = "alg"
 #|         basefile = params.files['AQRELS_FILE']
@@ -5764,22 +5954,22 @@ if __name__ == "__main__":
 #|                  ])
 #|         A_start = int(params.parameters.get('extension_todo_sieving.A_min', params.parameters['A_sieving']))
 #|         A_max = int(params.parameters.get('extension_todo_sieving.A_max', A_start+1))
-#| 
+#|
 #|     num_total_ideals = len(outstanding_renumber_indices)
-#| 
+#|
 #|     for r in convert_to_indexed_relation(las_relations_from_file(basefile), params):
 #|         for ii in r.indices:
 #|             outstanding_renumber_indices -= {ii}
-#| 
+#|
 #|     extra_flags = []
 #|     round_info = dict(num=0,
 #|                       A = A_start,
 #|                       mfb1 = int(params.parameters['sieve.mfb1']))
-#| 
+#|
 #|     #if not params.slurm:
 #|     #    raise RuntimeError("Haven't implemented non-slurm todo sieving.")
 #|     #    exit(0)
-#| 
+#|
 #|     if 'extension_sieving.numjobs' in params.parameters:
 #|         numjobs = int(params.parameters['extension_sieving.numjobs'])
 #|     elif 'sieve.numjobs' in params.parameters:
@@ -5789,10 +5979,10 @@ if __name__ == "__main__":
 #|     else:
 #|         timeprint("slurm.numjobs not set; defaulting to numjobs = 24")
 #|         numjobs = 24
-#| 
+#|
 #|     if not params.slurm:
 #|         numjobs = 1
-#| 
+#|
 #|     while len(outstanding_renumber_indices) and round_info['A'] <= A_max:
 #|         outstanding_qs = [R.side_and_index_to_ideal(1,
 #|                                                     R.renumber_to_column(i))
@@ -5800,21 +5990,21 @@ if __name__ == "__main__":
 #|         timeprint(f"Missing relations for {len(outstanding_qs)} ideals")
 #|         if len(outstanding_qs) < 20:
 #|             timeprint("Complete list:", outstanding_qs)
-#| 
+#|
 #|         pct_missing = round(100.0 * len(outstanding_qs) / num_total_ideals, 10)
 #|         timeprint(f"That means the percentage of missing {shortname} ideals is: {pct_missing}")
-#| 
+#|
 #|         sieve_processes = []
 #|         nonlinear_todo_qs = []
 #|         qs_per_job = ceil(len(outstanding_qs)/numjobs)
 #|         last_cmd = []
-#| 
+#|
 #|         for job in range(numjobs):
 #|             outfile_suffix = f".round{round_info['num']}.job{job}"
 #|             todofilename = base_outfile + outfile_suffix + ".todo"
 #|             start = job*qs_per_job
 #|             stop = min((job+1)*qs_per_job, len(outstanding_qs))
-#| 
+#|
 #|             with open(todofilename, "w") as f:
 #|                 for side, q, rho in outstanding_qs[start:stop]:
 #|                     assert side == 1
@@ -5824,7 +6014,7 @@ if __name__ == "__main__":
 #|                         nonlinear_todo_qs.append(q)
 #|                     else:
 #|                         print(f"0 {q} {rho}", file=f)
-#| 
+#|
 #|             command_list = [params.files['SAGE'],
 #|                             "todo_sieving_helper.py",
 #|                             "--params",params.files['PARAMS'],
@@ -5834,7 +6024,7 @@ if __name__ == "__main__":
 #|                             "--todofile", todofilename,
 #|                             "--q0",str(-1),
 #|                             "--q1",str(-1)]
-#| 
+#|
 #|             jobname = f"{params.prefix[:-1]}-todosieve-{round_info['num']}-{job}"
 #|             if params.slurm:
 #|                 sieve_processes.append(
@@ -5843,7 +6033,7 @@ if __name__ == "__main__":
 #|                         " ".join(command_list),
 #|                         jobname, job))
 #|             last_cmd = command_list
-#| 
+#|
 #|         todo_start = time.time()
 #|         if params.slurm:
 #|             finished_processes, cputime_slurm = slurm_wait(sieve_processes)
@@ -5853,18 +6043,18 @@ if __name__ == "__main__":
 #|             sp = subprocess.run(last_cmd, stdout=subprocess.PIPE)
 #|             todo_fin = time.time()
 #|             overall_cputime.add(int(round(todo_fin-todo_start)))
-#| 
+#|
 #|         timeprint(f"This round of todo jobs all finished!")
-#| 
+#|
 #|         # TODO: Actually use extra_flags. Add to timing dictionary.
-#| 
+#|
 #|         outfile_suffix = f".round{round_info['num']}"
 #|         with open(base_outfile + outfile_suffix, "w") as round_out:
 #|             for job in range(numjobs):
 #|                 jobfile = f"{base_outfile}.round{round_info['num']}.job{job}"
 #|                 if not wait_for_file([jobfile]):
 #|                     continue
-#| 
+#|
 #|                 try:
 #|                     infile = open(jobfile, "r")
 #|                     for line in infile.readlines():
@@ -5872,29 +6062,29 @@ if __name__ == "__main__":
 #|                     infile.close()
 #|                 except FileNotFoundError:
 #|                     timeprint(f"{jobfile} does not exist, skipping")
-#| 
+#|
 #|         if not is_alg_or_ext:
 #|             keep_only_one_relation_per_q(base_outfile + outfile_suffix,
 #|                                         (1, params.BOUNDA_queries, params.BOUNDA),
 #|                                         keep_file=True)
-#| 
+#|
 #|         round_info['num'] += 1
 #|         for r in convert_to_indexed_relation(las_relations_from_file(base_outfile + outfile_suffix), params):
 #|             for ii in r.indices:
 #|                 outstanding_renumber_indices -= {ii}
-#| 
+#|
 #|         if len(outstanding_renumber_indices):
 #|             timeprint("Increasing A, mfb1 and trying todo sieving again!")
 #|             round_info['A'] += 1
 #|             round_info['mfb1'] += 2
 #|             extra_flags = [ "--adjust-strategy", 2 ]
-#| 
+#|
 #|     if len(outstanding_renumber_indices) == 0:
 #|         timeprint("No outstanding ideals! All done with todo sieving.")
 #|     else:
 #|         timeprint("Reached the maximum A value of " + str(round_info['A']))
 #|         timeprint("Giving up on todo sieving. The number of missing ideals is " + str(len(outstanding_renumber_indices)))
-#| 
+#|
 #|     with open(basefile, "a") as outfile:
 #|         for r in range(round_info['num']):
 #|             timeprint(f"Adding relations from round {r} todo sieving")
@@ -5902,21 +6092,21 @@ if __name__ == "__main__":
 #|                 for line in infile.readlines():
 #|                     if not line.startswith("#"):
 #|                         _ = outfile.write(line)
-#| 
+#|
 #|     if is_alg_or_ext:
 #|         ulfile = params.files['UNLINKED_IDEALS']
 #|     else:
 #|         ulfile = params.files['EXT_UNLINKED_IDEALS']
-#| 
+#|
 #|     # This would be the first encounter with unlinked ideals
 #|     with open(ulfile, "w") as f:
 #|         for ii in outstanding_renumber_indices:
 #|             f.write(str(ii) + "\n")
-#| 
+#|
 #|     num_remaining = len(outstanding_renumber_indices)
 #|     pct_missing = round(100.0 * num_remaining / num_total_ideals, 10)
 #|     timeprint(f"After todo sieving, the percentage of missing {shortname} ideals is: {pct_missing}")
-#| 
+#|
 #| @timing
 #| def call_extra_sieving_granular(params, prefix, given_A, given_mfb1, is_alg_or_ext=True, is_filter=False,
 #|                                 mult_by_nprimes=0):
@@ -5924,10 +6114,10 @@ if __name__ == "__main__":
 #|     # mult_by_nprimes: For a given q, add todos for q*q' for q' the first n primes.
 #|     # mult_by_nprimes can be helpful when A becomes too large. It will require --allow_compsq.
 #|     # If used for extension sieving, the de-duplication by q certainly should be done.
-#| 
+#|
 #|     #R = params.R
 #|     extra_flags = []
-#| 
+#|
 #|     if is_alg_or_ext:
 #|         basefile = params.files['AQRELS_FILE']
 #|         base_outfile = params.dirs['TEMP_OUTPUT_DIR'] + "algrels/alg"
@@ -5942,11 +6132,11 @@ if __name__ == "__main__":
 #|         base_outfile = basefile
 #|         unlinkedfile = params.files['EXT_UNLINKED_IDEALS']
 #|         unlinked_todofile = params.files['EXT_UNLINKED_TODOS']
-#| 
+#|
 #|     if not params.slurm:
 #|         raise RuntimeError("Haven't implemented non-slurm todo sieving.")
 #|         exit(0)
-#| 
+#|
 #|     if 'extension_sieving.numjobs' in params.parameters and (not is_alg_or_ext):
 #|         numjobs = int(params.parameters['extension_sieving.numjobs'])
 #|     elif 'sieve.numjobs' in params.parameters:
@@ -5956,26 +6146,26 @@ if __name__ == "__main__":
 #|     else:
 #|         timeprint("slurm.numjobs not set; defaulting to numjobs = 72")
 #|         numjobs = 72
-#| 
+#|
 #|     #if is_filter:
 #|         # more reasonable
 #|         # should be quite a small list
 #|     #    numjobs = 4
-#| 
+#|
 #|     #outstanding_qs = []
 #|     #with open(unlinkedfile, "r") as f:
 #|     #    for line in f.readlines():
 #|     #        renumber_index = int(line.strip())
 #|     #        ideal = R.side_and_index_to_ideal(1, R.renumber_to_column(renumber_index))
 #|     #        outstanding_qs.append(ideal)
-#| 
+#|
 #|     outstanding_todo_lines = []
 #|     with open(unlinked_todofile, 'r') as f:
 #|         for line in f:
 #|             outstanding_todo_lines.append(line)
-#| 
+#|
 #|     timeprint(f"Missing relations for {len(outstanding_todo_lines)} ideals")
-#| 
+#|
 #|     sieve_processes = []
 #|     nonlinear_todo_qs = []
 #|     qs_per_job = ceil(len(outstanding_todo_lines)/numjobs)
@@ -5983,27 +6173,27 @@ if __name__ == "__main__":
 #|     #    primeset = primes_first_n(mult_by_nprimes)  #[4:]  # skip first few primes
 #|     #else:
 #|     #    primeset = []
-#| 
+#|
 #|     primeset = primes_first_n(100)[60:]
-#| 
+#|
 #|     og_poly = CadoPolyFile(params.files['POLYFILE']); og_poly.read()
 #|     alg_poly = og_poly.f[1]
-#| 
+#|
 #|     for job in range(numjobs):
 #|         outfile = f"{base_outfile}.{prefix}.job{job}"
 #|         todofilename = outfile + ".todo"
 #|         start = job*qs_per_job
 #|         stop = min((job+1)*qs_per_job, len(outstanding_todo_lines))
-#| 
+#|
 #|         with open(todofilename, "w") as f:
 #|             for line in outstanding_todo_lines[start:stop]:
 #|                 #f.write(line)
-#| 
+#|
 #|                 lineinfo = line.strip().split()
 #|                 assert lineinfo[0] == '0'
 #|                 q = int(lineinfo[1])
 #|                 rho = int(lineinfo[2])
-#| 
+#|
 #|                 for q_prime in primeset:
 #|                     roots = alg_poly.roots(GF(q_prime))
 #|                     if len(roots) > 0:
@@ -6015,7 +6205,7 @@ if __name__ == "__main__":
 #|                             f.write(f"0 {q*q_prime} {rho_q_qprime}\n")
 #|                         except ValueError:
 #|                             continue
-#| 
+#|
 #|             #for side, q, rho in outstanding_qs[start:stop]:
 #|             #    assert side == 1
 #|             #    if "alpha" in str(rho) and (q not in nonlinear_todo_qs):
@@ -6025,7 +6215,7 @@ if __name__ == "__main__":
 #|             #    else:
 #|                     # side 0 since it's 1-sided sieving
 #|             #        print(f"0 {q} {rho}", file=f)
-#| 
+#|
 #|             #        if mult_by_nprimes > 0:
 #|             #            for q_prime in primeset:
 #|             #                roots = alg_poly.roots(GF(q_prime))
@@ -6035,13 +6225,13 @@ if __name__ == "__main__":
 #|             #                    assert rho_q_qprime % q == rho
 #|             #                    assert rho_q_qprime % q_prime == rho_prime
 #|             #                    print(f"0 {q*q_prime} {rho_q_qprime}", file=f)
-#| 
+#|
 #|         #if len(nonlinear_todo_qs) > 0:
 #|         #    major_message("Warning: some nonlinear todo qs.")
 #|         #    if len(nonlinear_todo_qs) < 25:
 #|         #        print("Here they are:")
 #|         #        print(str(nonlinear_todo_qs))
-#| 
+#|
 #|         command_list = [params.files['SAGE'],
 #|                         "todo_sieving_helper.py",
 #|                         "--params",params.files['PARAMS'],
@@ -6051,23 +6241,23 @@ if __name__ == "__main__":
 #|                         "--todofile", todofilename,
 #|                         "--q0",str(-1),
 #|                         "--q1",str(-1)]
-#| 
+#|
 #|         jobname = f"{params.prefix[:-1]}-extrasieve-{prefix}-{job}"
 #|         sieve_processes.append(
 #|             slurmit(
 #|                 params,
 #|                 " ".join(command_list),
 #|                 jobname, job))
-#| 
+#|
 #|     todo_start = time.time()
 #|     finished_processes, cputime_slurm = slurm_wait(sieve_processes)
 #|     overall_cputime.add(cputime_slurm)
 #|     todo_fin = time.time()
 #|     timeprint("Done doing extra sieving!")
-#| 
+#|
 #|     # TODO: Actually use extra_flags. Add to timing dictionary.
 #|     # Also handle the nonlinear ideals, using q0 and q1.
-#| 
+#|
 #|     #with open(basefile, "a") as ff:
 #|     #    for job in range(numjobs):
 #|     #        jobfile = f"{base_outfile}.{prefix}.job{job}"
@@ -6075,28 +6265,28 @@ if __name__ == "__main__":
 #|     #            for line in infile.readlines():
 #|     #                if not line.startswith("#"):
 #|     #                    _ = ff.write(line)
-#| 
+#|
 #|     #timeprint("Done adding extra relations to " + basefile + "!")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def call_algebraic_query_sieving(params, is_extra=False):
 #|     params.save_to_file()
-#| 
+#|
 #|     c0 = QQ(params.parameters.get("algebraic_query_sieving.q0_ratio", 1/4))
 #|     c1 = 1 #4
 #|     q0 = floor(c0*params.BOUNDA_queries)
 #|     q1 = c1*params.BOUNDA_queries
-#| 
+#|
 #|     if is_extra and 'extra_alg.q0' in params.parameters and 'extra_alg.q1' in params.parameters:
 #|         q0 = int( params.parameters['extra_alg.q0'] )
 #|         q1 = int( params.parameters['extra_alg.q1'] )
 #|         assert q1 > q0
-#| 
+#|
 #|     #R = params.R
-#| 
+#|
 #|     sieve_processes = []
-#| 
+#|
 #|     if not params.slurm:
 #|         timeprint("Running sieving without slurm, setting numjobs = 1")
 #|         numjobs = 1
@@ -6114,7 +6304,7 @@ if __name__ == "__main__":
 #|         process = subprocess.run(command_list, stderr=subprocess.PIPE, text=True)
 #|         overall_cputime.add(extract_time(process.stderr))
 #|         jobrange = range(numjobs)
-#| 
+#|
 #|     else:
 #|         if 'sieve.numjobs' in params.parameters:
 #|             numjobs = int(params.parameters['sieve.numjobs'])
@@ -6126,7 +6316,7 @@ if __name__ == "__main__":
 #|         step = floor((q1-q0)/numjobs)
 #|         intervals = [q0+i*step for i in range(numjobs)]+[q1]
 #|         timeprint(intervals)
-#| 
+#|
 #|         if 'alg_sieving.jobnum.min' in params.parameters and 'alg_sieving.jobnum.max' in params.parameters:
 #|             jobrange = range(
 #|                 int(params.parameters['alg_sieving.jobnum.min']),
@@ -6134,17 +6324,17 @@ if __name__ == "__main__":
 #|             )
 #|         else:
 #|             jobrange = range(numjobs)
-#| 
+#|
 #|         for jobnum in jobrange:
-#| 
+#|
 #|             if is_extra:
 #|                 jobstr = params.extra_prefix + str(jobnum)
 #|             else:
 #|                 jobstr = str(jobnum)
-#| 
+#|
 #|             if os.path.exists(f'alg.{jobstr}.tmp'):
 #|                 continue
-#| 
+#|
 #|             command_list = [params.files['SAGE'],
 #|                             "algebraic_query_sieving_helper.py",
 #|                             "--params",params.files['PARAMS'],
@@ -6160,7 +6350,7 @@ if __name__ == "__main__":
 #|                         params,
 #|                         " ".join(command_list),
 #|                         jobname, jobnum))
-#| 
+#|
 #|         aqrels_start = time.time()
 #|         finished_processes, cputime_slurm = slurm_wait(sieve_processes)
 #|         overall_cputime.add(cputime_slurm)
@@ -6170,9 +6360,9 @@ if __name__ == "__main__":
 #|         else:
 #|             params.timing["aqrels_slurm_sieving"] = aqrels_fin-aqrels_start
 #|         timeprint("Aqrels slurm jobs all finished!")
-#| 
+#|
 #|     AQRELS_FILE = params.files['AQRELS_FILE']
-#| 
+#|
 #|     if is_extra:
 #|         mode = "a"
 #|     else:
@@ -6183,23 +6373,23 @@ if __name__ == "__main__":
 #|                 jobstr = params.extra_prefix + str(jobnum)
 #|             else:
 #|                 jobstr = str(jobnum)
-#| 
+#|
 #|             #jobfile = f"{AQRELS_FILE}.{jobstr}"
 #|             jobfile = params.dirs['TEMP_OUTPUT_DIR'] + f"algrels/alg.{jobstr}"
-#| 
+#|
 #|             if not wait_for_file([jobfile]):
 #|                 timeprint(f"{jobfile} does not exist, skipping")
 #|                 continue
-#| 
+#|
 #|             with open(jobfile, "r") as infile:
 #|                 for line in infile.readlines():
 #|                     _ = outfile.write(line)
-#| 
+#|
 #|     timeprint("Finished writing to AQRELS_FILE!")
 #|     if not is_extra:
 #|         call_todo_sieving(params, is_alg_or_ext=True)
-#| 
-#| 
+#|
+#|
 #| # No timing decorator, fails with fake outsourced params
 #| def do_algebraic_query_sieving(params,jobnum=0,q0=None,q1=None):
 #|     BOUNDA_queries = params.BOUNDA_queries
@@ -6208,27 +6398,27 @@ if __name__ == "__main__":
 #|     POLYFILE = params.files['POLYFILE']
 #|     LPB0 = params.parameters['LPB0']
 #|     LPB1_queries = params.parameters['LPB1_queries']
-#| 
+#|
 #|     # AQRELS_FILE_tmp = f"{AQRELS_FILE}.{jobnum}.tmp"
 #|     AQRELS_FILE_tmp = params.dirs['TEMP_OUTPUT_DIR'] + f"algrels/alg.{jobnum}.tmp"
-#| 
+#|
 #|     c0 = 1/4 # 1/2 # Magic constants
 #|     c1 = 1 #4
-#| 
+#|
 #|     if not q0:
 #|         q0 = floor(c0*params.BOUNDA_queries)
 #|     if not q1:
 #|         q1 = c1*params.BOUNDA_queries
-#| 
+#|
 #|     A_used = params.parameters.get('algebraic_query_sieving.A', params.parameters['A_sieving'])
 #|     if int(A_used) > 32 and 'las.bigA.hwloc_job_binding_policy' in params.parameters:
 #|         t_used = params.parameters['las.bigA.hwloc_job_binding_policy']
 #|     else:
 #|         t_used = params.las_job_binding_policy
-#| 
+#|
 #|     lim0_t = params.parameters.get('algebraic_query_sieving.lim', params.BOUNDA_queries)
 #|     lim0 = min(lim0_t, params.BOUNDA_queries, 2**31)
-#| 
+#|
 #|     # We're doing sieving on one side only, so we only use lim0, lpb0, et
 #|     # caetera. The special-q side becomes 0 as well.
 #|     # NOTE: If you update this las call, please also correspondingly update the two las calls in estimate.py so that the estimator remains accurate
@@ -6257,12 +6447,12 @@ if __name__ == "__main__":
 #|                 'POLY': POLYFILE + ".only-side1",
 #|             }
 #|             )
-#| 
+#|
 #|     # Will need to do later -- on machines with enough memory
 #|     swap_parts_of_relations(AQRELS_FILE_tmp, remove_tmp_suffix=True, do_ext_dedup=None,
 #|                            extra_relation_check=(True, params.files['DEBUG_RENUMBER_FILE']))
 #|     return
-#| 
+#|
 #| def do_todo_query_sieving(params, round_A, round_mfb1, outfile, qmin, qmax, todofilename, extra_flags=[]):
 #|     # Do sieving for this particular A and mfb1.
 #|     # If qmin and qmax are given, go through all special q's in the range.
@@ -6270,27 +6460,27 @@ if __name__ == "__main__":
 #|     # This function works for either algebraic or extension sieving.
 #|     FBFILE = params.files['CAPPED_FBGZ']
 #|     POLYFILE = params.files['POLYFILE']
-#| 
+#|
 #|     outfile_tmp = f"{outfile}.tmp"
-#| 
+#|
 #|     if "extrels" in outfile:
 #|         do_ext_dedup = (True, params.BOUNDA_queries, params.BOUNDA)
 #|     else:
 #|         do_ext_dedup = None
-#| 
+#|
 #|     if int(qmin) < 0:
 #|         qrange = ["-todo", todofilename]
 #|     else:
 #|         qrange = ["-q0", qmin, "-q1", qmax]
-#| 
+#|
 #|     if int(round_A) > 32 and 'las.bigA.hwloc_job_binding_policy' in params.parameters:
 #|         t_used = params.parameters['las.bigA.hwloc_job_binding_policy']
 #|     else:
 #|         t_used = params.las_job_binding_policy
-#| 
+#|
 #|     lim0_t = params.parameters.get('algebraic_query_sieving.lim', params.BOUNDA_queries)
 #|     lim0 = min(lim0_t, params.BOUNDA_queries, 2**31)
-#| 
+#|
 #|     CadoNFS("sieve/las",
 #|         "--memory-margin", params.parameters.get('las.memory_margin', 20),
 #|         "-sqside", 0,
@@ -6324,7 +6514,7 @@ if __name__ == "__main__":
 #|     #swap_parts_of_relations(outfile_tmp, remove_tmp_suffix=True, do_ext_dedup=do_ext_dedup,
 #|     #                        extra_relation_check=(True, params.files['DEBUG_RENUMBER_FILE']))
 #|     return
-#| 
+#|
 #| #alg_or_ext = "algebraic" or "extension"
 #| @timing
 #| def do_algebraic_queries(params, alg_or_ext):
@@ -6338,15 +6528,15 @@ if __name__ == "__main__":
 #|         todofilename = params.files['EXT_QUERIES_TODO']
 #|     else:
 #|         raise ValueError(f"do_algebraic_queries got invalid keyword {alg_or_ext}")
-#| 
+#|
 #|     # N = params.poly.N
 #|     # ZN = Integers(N)
-#| 
+#|
 #|     nqueries = 0
-#| 
+#|
 #|     with open(todofilename, "w") as todofile:
 #|         for rel in indexed_relations_from_file(input_rels):
-#| 
+#|
 #|             # Note -- we don't have check() defined for indexed relations.
 #|             #if not params.cadopoly:
 #|                 # TODO: fix this call if it's useful?
@@ -6358,41 +6548,41 @@ if __name__ == "__main__":
 #|             #     if fac.norm() > BOUNDA_queries:
 #|             #         is_smooth = False
 #|             #         break
-#| 
+#|
 #|             # if (not is_smooth):
 #|             #     pass
-#| 
+#|
 #|             # print(ZN(rel.norm(params.poly, 0)), file=todofile)
 #|             print(rel.a-rel.b*params.poly.m, file=todofile)
-#| 
+#|
 #|             nqueries += 1
-#| 
+#|
 #|     run_oracle(params, todofilename, jsonfilename)
-#| 
+#|
 #|     return nqueries
-#| 
+#|
 #| def do_fb_extension_sieving(params,jobnum=0,q0=None,q1=None):
 #|     EXTRELS_FILE = params.files['EXTRELS_FILE']
 #|     FBFILE = params.files['CAPPED_FBGZ']
 #|     POLYFILE = params.files['POLYFILE']
 #|     LPB0 = params.parameters['LPB0']
 #|     LPB1_queries = params.parameters['LPB1_queries']
-#| 
+#|
 #|     EXTRELS_FILE_tmp = f"{EXTRELS_FILE}.{jobnum}.tmp"
-#| 
+#|
 #|     if not q0: q0 = str(params.BOUNDA_queries)
 #|     if not q1: q1 = str(params.BOUNDA)
-#| 
+#|
 #|     switch_never_discard = ""
 #|     if params.parameters.get('extension_sieving.never_discard', 0) == 1:
 #|         switch_never_discard = "--never-discard"
-#| 
+#|
 #|     A_used = params.parameters.get('extension_sieving.A', params.parameters['A_sieving'])
 #|     if int(A_used) > 32 and 'las.bigA.hwloc_job_binding_policy' in params.parameters:
 #|         t_used = params.parameters['las.bigA.hwloc_job_binding_policy']
 #|     else:
 #|         t_used = params.las_job_binding_policy
-#| 
+#|
 #|     CadoNFS("sieve/las",
 #|             "-sqside", 0,
 #|             "--memory-margin", params.parameters.get('las.memory_margin', 20),
@@ -6431,7 +6621,7 @@ if __name__ == "__main__":
 #|                             do_ext_dedup = (True, params.BOUNDA_queries, params.BOUNDA),
 #|                             extra_relation_check=(True, params.files['DEBUG_RENUMBER_FILE']))
 #|     return
-#| 
+#|
 #| @timing
 #| def call_fb_extension_sieving(params):
 #|     # By the end of this function, all of the extension relations should be in EXTRELS_FILE.
@@ -6439,13 +6629,13 @@ if __name__ == "__main__":
 #|     # doesn't find a relation for some of the q's, this may mean rerunning the one-round
 #|     # function a few times. (Each round produces its own output file, but everything should
 #|     # be coalesced into EXTRELS_FILE, which is used elsewhere.)
-#| 
+#|
 #|     EXTRELS_FILE = params.files['EXTRELS_FILE']
-#| 
+#|
 #|     q0 = params.BOUNDA_queries
 #|     q1 = params.BOUNDA
 #|     #R = params.R
-#| 
+#|
 #|     params.save_to_file()
 #|     if not params.slurm:
 #|         timeprint("Running extension sieving without slurm, setting numjobs = 1")
@@ -6468,12 +6658,12 @@ if __name__ == "__main__":
 #|         if numjobs is None:
 #|             timeprint("slurm.numjobs not set; defaulting to numjobs = 24")
 #|             numjobs = 24
-#| 
+#|
 #|         sieve_processes = []
 #|         step = floor((q1-q0)/numjobs)
 #|         intervals = [q0+i*step for i in range(numjobs)]+[q1]
 #|         timeprint(intervals)
-#| 
+#|
 #|         for jobnum in range(numjobs):
 #|             command_list = [params.files['SAGE'],
 #|                             "fb_extension_sieving_helper.py",
@@ -6485,30 +6675,30 @@ if __name__ == "__main__":
 #|             sieve_processes.append(
 #|                     slurmit(params," ".join(command_list),
 #|                             jobname, jobnum))
-#| 
+#|
 #|         extslurm_start = time.time()
 #|         _, cputime_slurm = slurm_wait(sieve_processes)
 #|         overall_cputime.add(cputime_slurm)
 #|         extslurm_fin = time.time()
 #|         params.timing["extension_slurm_sieving"] = extslurm_fin-extslurm_start
 #|         timeprint(f"extension_slurm_sieving finished in {params.timing['extension_slurm_sieving']}s!")
-#| 
+#|
 #|     with open(EXTRELS_FILE, "w") as outfile:
 #|         for jobnum in range(numjobs):
 #|             jobfile = f"{EXTRELS_FILE}.{jobnum}"
-#| 
+#|
 #|             if not wait_for_file([jobfile]):
 #|                 timeprint(f"{jobfile} does not exist, skipping")
 #|                 continue
-#| 
+#|
 #|             with open(jobfile, "r") as infile:
 #|                 for line in infile.readlines():
 #|                     _ = outfile.write(line)
-#| 
+#|
 #|     keep_only_one_relation_per_q(EXTRELS_FILE, (1, params.BOUNDA_queries, params.BOUNDA), keep_file=True)
 #|     call_todo_sieving(params, is_alg_or_ext=False)
-#| 
-#| 
+#|
+#|
 #| def choose_uv(h):
 #|     # Find small u,v such that u/v = h mod N
 #|     # For this we use lattice basis (0, N) (1, -h)
@@ -6521,14 +6711,14 @@ if __name__ == "__main__":
 #|     M[1,0] = 1
 #|     M[1,1] = (-1)*ZZ(h)
 #|     Mr = M.LLL()
-#| 
+#|
 #|     u = Mr[0][1]
 #|     v = Mr[0][0]*(-1)
 #|     assert h.parent()(u/v) == h
 #|     return (u, v)
-#| 
+#|
 #| def do_descent_sieving(params, DESCENT_PREFIX):
-#| 
+#|
 #|     parser = argparse.ArgumentParser(description="Descent sieving")
 #|     parser.add_argument("--target",
 #|                         help="Element whose DL is wanted",
@@ -6536,14 +6726,14 @@ if __name__ == "__main__":
 #|                         required=True)
 #|     descent.GeneralClass.declare_args(parser)
 #|     descent.DescentMiddleClass.declare_args(parser)
-#| 
+#|
 #|     output_name = params.dirs['DESC'] + DESCENT_PREFIX + ".descent.tgt.middle.rels"
-#| 
+#|
 #|     timeprint("output_name:", output_name)
-#| 
+#|
 #|     silent_remove(output_name)
 #|     silent_remove(output_name+".cond")
-#| 
+#|
 #|     inputs = [
 #|         "--poly", params.files['POLYFILE'],
 #|         "--fb1", params.files['CAPPED_FBGZ'],
@@ -6579,8 +6769,8 @@ if __name__ == "__main__":
 #|     # DEAD code
 #|     timeprint("relsfile:",relsfile)
 #|     return relsfile
-#| 
-#| 
+#|
+#|
 #| class descent_processes_pool():
 #|     def __init__(self, params, seedval=None):
 #|         self.params = params
@@ -6595,7 +6785,7 @@ if __name__ == "__main__":
 #|             # later.
 #|             self.seedval = int(time.time()) * 10**6
 #|         self.max_runs = params.parameters['MAX_DESCENT_TRIES']
-#| 
+#|
 #|     def schedule_one_process(self):
 #|         cmd = ["time", "-p",
 #|                self.params.files['SAGE'],
@@ -6610,12 +6800,12 @@ if __name__ == "__main__":
 #|                                  stderr=subprocess.PIPE, text=True)
 #|                 )
 #|         self.descent_count += 1
-#| 
+#|
 #|     def __enter__(self):
 #|         while len(self.descent_processes) < self.n_max_descent_processes:
 #|             self.schedule_one_process()
 #|         return self
-#| 
+#|
 #|     def __exit__(self, *args):
 #|         for P in self.descent_processes:
 #|             if P.poll() is None:
@@ -6627,10 +6817,10 @@ if __name__ == "__main__":
 #|                 P.wait()
 #|                 stderr = P.communicate()[1]
 #|                 overall_cputime.add(extract_time(stderr))
-#| 
+#|
 #|     def __len__(self):
 #|         return len(self.descent_processes)
-#| 
+#|
 #|     def poll(self):
 #|         assert len(self)
 #|         finished = []
@@ -6642,15 +6832,15 @@ if __name__ == "__main__":
 #|                 finished.append(P)
 #|                 stderr = P.communicate()[1]
 #|                 overall_cputime.add(extract_time(stderr))
-#| 
+#|
 #|         self.descent_processes = pending
 #|         while self.descent_count < self.max_runs and len(self) < self.n_max_descent_processes:
 #|                self.schedule_one_process()
 #|         if not finished:
 #|             time.sleep(1)
 #|         return finished
-#| 
-#| 
+#|
+#|
 #| class descent_slurm_pool():
 #|     def __init__(self, params, existing_init_data=None, seedval=None):
 #|         self.params = params
@@ -6667,7 +6857,7 @@ if __name__ == "__main__":
 #|             self.seedval = int(time.time()) * 10**6
 #|         self.max_runs = params.parameters['MAX_DESCENT_TRIES']
 #|         self.cputime_slurm_pool = 0
-#| 
+#|
 #|     def schedule_one_process(self):
 #|         cmd = [self.params.files['SAGE'],
 #|                "descent_helper.py",
@@ -6688,12 +6878,12 @@ if __name__ == "__main__":
 #|             )
 #|         )
 #|         self.descent_count += 1
-#| 
+#|
 #|     def __enter__(self):
 #|         while len(self.descent_processes) < self.numslurm:
 #|             self.schedule_one_process()
 #|         return self
-#| 
+#|
 #|     def __exit__(self, *args):
 #|         cancelled_jobs_errfiles = []
 #|         for slurmjob, errfile in self.descent_processes:
@@ -6714,19 +6904,19 @@ if __name__ == "__main__":
 #|                     "scancel",
 #|                     str(slurmjob)
 #|                 ])
-#| 
+#|
 #|         for p, slurmjob, errfile in cancelled_jobs_errfiles:
 #|             p.wait()
 #|             wait_for_file_content(errfile, ["real ", "user ", "sys "])
 #|             cputime_slurm = extract_time_from_file(errfile)
 #|             timeprint(f"Cancelled slurm job {slurmjob} spent {cputime_slurm}s cputime")
 #|             self.cputime_slurm_pool += cputime_slurm
-#| 
+#|
 #|         overall_cputime.add(self.cputime_slurm_pool)
-#| 
+#|
 #|     def __len__(self):
 #|         return len(self.descent_processes)
-#| 
+#|
 #|     def poll(self):
 #|         assert len(self.descent_processes)
 #|         finished = []
@@ -6746,16 +6936,16 @@ if __name__ == "__main__":
 #|         if not finished:
 #|             time.sleep(1)
 #|         return finished
-#| 
+#|
 #| @timing
 #| def call_descents(target, params):
 #|     params.save_to_file()
-#| 
+#|
 #|     # just _any_ run that succeeds is good. We'll pick the result from
 #|     # files named like this. So we start by removing potential traces of
 #|     # the older ones.
 #|     wildcard = params.dirs['TEMP_OUTPUT_DIR']+"tgt.json*"
-#| 
+#|
 #|     glob_remove(wildcard)
 #|     with descent_processes_pool(params) as D:
 #|         while len(D):
@@ -6769,7 +6959,7 @@ if __name__ == "__main__":
 #|                     shutil.copyfile(filename, params.files['TGT_INFO'])
 #|                     with open(filename, "r") as fp:
 #|                         D = json.load(fp)
-#| 
+#|
 #|                     def cast(D, field, parent):
 #|                         D[field] = parent(D[field])
 #|                     ZN = Integers(params.poly.N)
@@ -6785,13 +6975,13 @@ if __name__ == "__main__":
 #|                     params.timing['descent_middle'] = D['middle_time']
 #|                     return params.target_info
 #|     return None
-#| 
+#|
 #| @timing
 #| def call_descents_slurm(target, params, existing_init_data=None):
 #|     params.save_to_file()
 #|     wildcard = params.dirs['TEMP_OUTPUT_DIR']+"tgt.json*"
 #|     glob_remove(wildcard)
-#| 
+#|
 #|     with descent_slurm_pool(params, existing_init_data=existing_init_data) as Pool:
 #|         while len(Pool):
 #|             for completed_jobs in Pool.poll():
@@ -6799,7 +6989,7 @@ if __name__ == "__main__":
 #|                     shutil.copyfile(filename, params.files['TGT_INFO'])
 #|                     with open(filename, "r") as fp:
 #|                         tgtfile = json.load(fp)
-#| 
+#|
 #|                     def cast(tgtfile, field, parent):
 #|                         tgtfile[field] = parent(tgtfile[field])
 #|                     ZN = Integers(params.poly.N)
@@ -6815,7 +7005,7 @@ if __name__ == "__main__":
 #|                     params.timing['descent_middle'] = tgtfile['middle_time']
 #|                     return params.target_info
 #|     return None
-#| 
+#|
 #| def call_descent_helper(target,params,seedval):
 #|     seedval = int(seedval)
 #|     cmdline = [
@@ -6828,10 +7018,10 @@ if __name__ == "__main__":
 #|     print(f"Run descent helper for target {target} with command:\n{' '.join(cmdline)}")
 #|     completed_descent = subprocess.run(cmdline, stderr=subprocess.PIPE, text=True)
 #|     overall_cputime.add(extract_time(completed_descent.stderr))
-#| 
+#|
 #|     print(f"yay finished with seedval {seedval}")
 #|     print("returncode",completed_descent.returncode)
-#| 
+#|
 #|     if completed_descent.returncode == 0:
 #|         timeprint("Descent success")
 #|         for filename in glob.glob(params.dirs['TEMP_OUTPUT_DIR']+"tgt.json*"):
@@ -6840,7 +7030,7 @@ if __name__ == "__main__":
 #|     else:
 #|         timeprint("Descent failed")
 #|     return None
-#| 
+#|
 #| class TakenLineMissing(Exception):
 #|     def __init__(self, missed, *args, **kwargs):
 #|         super().__init__(*args, **kwargs)
@@ -6848,17 +7038,17 @@ if __name__ == "__main__":
 #|     def __str__(self):
 #|         m = "; ".join([f"{side},{q},{rho}" for side,q,rho in self.missed])
 #|         return f"\"Taken\" line missing for special-qs: [{m}]"
-#| 
+#|
 #| def sanity_check_descent_outfile(g, descent_file, todofile=None):
 #|     # We want to make sure the descent output file has a Taken line for each special-q.
 #|     # Technically, we only care about this for special-q's that go into constructing S,
 #|     # but that would essentially recreate the logic of construct_S. For now, just check
 #|     # that each special-q job has a Taken line.
 #|     timeprint("Starting sanity_check_descent_outfile")
-#| 
+#|
 #|     all_qs = set()
 #|     taken_qs = set()
-#| 
+#|
 #|     if todofile is not None:
 #|         with open(todofile, "r") as f:
 #|             for line in f.readlines():
@@ -6868,38 +7058,38 @@ if __name__ == "__main__":
 #|                 ssi = tuple([Integer(i) for i in ss])
 #|                 assert len(ssi) in [2,3]
 #|                 assert ssi[0] in [0,1]
-#| 
+#|
 #|                 if ssi[0] == 1:
 #|                     all_qs.add(ssi)
 #|                 else:
 #|                     qq = ssi[1]
 #|                     rho = g.roots(GF(qq))[0][0]
 #|                     all_qs.add((0, qq, rho))
-#| 
+#|
 #|     for line in open(descent_file).readlines():
 #|         line = line.strip()
-#| 
+#|
 #|         if m := re.match(r"^# Now sieving side-(\d+) q=(\d+); rho=(\d+)", line):
 #|             side, sq, rho = (int(c) for c in m.groups())
 #|             all_qs.add((side,sq,rho))
 #|             continue
-#| 
+#|
 #|         if m := re.match(r"^# [descent] pushing side-(\d+) q=(\d+); rho=(\d+) .* to todo list .*", line):
 #|             side, sq, rho = (int(c) for c in m.groups())
 #|             all_qs.add((side,sq,rho))
 #|             continue
-#| 
+#|
 #|         if m := re.match(r"# Taking decision on .* side-(\d+) q=(\d+); rho=(\d+)", line):
 #|             # To be stored in taken_qs if next line matches if condition below
 #|             side, sq, rho = (int(c) for c in m.groups())
-#| 
+#|
 #|         if (m := re.match("^Taken: (.*)", line)):
 #|             taken_qs.add((side, sq, rho))
-#| 
+#|
 #|     if len(all_qs) > len(taken_qs):
 #|         raise TakenLineMissing(all_qs - taken_qs)
 #|     return
-#| 
+#|
 #| def fast_ab_parsing(rel_lines):
 #|     l = []
 #|     for rel_line in rel_lines:
@@ -6907,17 +7097,17 @@ if __name__ == "__main__":
 #|             a, b = rel_line.split(b':')[0].split(b',')
 #|             l.append((int(a, 16), int(b, 16)))
 #|     return l
-#| 
+#|
 #| class LinearAlgebraMatrix(abc.ABC):
 #|     def __init__(self, params, indexed_relations_file):
-#| 
+#|
 #|         timeprint("Inside init of LinearAlgebraMatrix")
-#| 
+#|
 #|         # Only store relative path persistently to allow copying
 #|         self.indexed_relations_file_relative = self.convert_absolute_to_relative_path(params, indexed_relations_file)
-#| 
+#|
 #|         timeprint("Inside init of LinearAlgebraMatrix; starting to load row_to_aquery")
-#| 
+#|
 #|         # pre-read this.
 #|         self.row_to_aquery = []
 #|         # works for linux and macos
@@ -6939,7 +7129,7 @@ if __name__ == "__main__":
 #|                             break
 #|                         indexed_rels_lines.append(line)
 #|                     timeprint(f"Finished splitting {indexed_relations_file} into lines.")
-#| 
+#|
 #|                 with ProcessPoolExecutor(max_workers=params.nthreads) as executor:
 #|                     batch_size = math.ceil(l / params.nthreads)
 #|                     batch_args = [indexed_rels_lines[i * batch_size : (i+1) * batch_size] for i in range(params.nthreads)]
@@ -6949,33 +7139,33 @@ if __name__ == "__main__":
 #|         else:
 #|             for irel in tqdm.tqdm(indexed_relations_from_file(indexed_relations_file)):
 #|                 self.row_to_aquery.append((irel.a, irel.b))
-#| 
+#|
 #|         timeprint("Finished loading row_to_aquery")
-#| 
+#|
 #|         self.Ze = IntegerModRing(params.parameters['e'])
-#| 
+#|
 #|     def convert_absolute_to_relative_path(self, params, abs_path):
 #|         return abs_path.replace(params.dirs['TEMP_OUTPUT_DIR'], "")
-#| 
+#|
 #|     def convert_relative_to_absolute_path(self, params, rel_path):
 #|         return os.path.join(params.dirs['TEMP_OUTPUT_DIR'], rel_path)
-#| 
+#|
 #|     def base_ring(self):
 #|         return self.Ze
-#| 
+#|
 #|     @abc.abstractmethod
 #|     def ab_per_row(self, params):
 #|         pass
-#| 
+#|
 #|     def indexed_relations_filename(self, params):
 #|         # XXX: for backwards compatibility with matrices persistently stored on disk
 #|         # before making them path independent.
 #|         if not hasattr(self, 'indexed_relations_file_relative'):
 #|             prefix_idx = self.indexed_relations_file.index(params.prefix)
 #|             self.indexed_relations_file_relative = self.indexed_relations_file[prefix_idx + len(params.prefix):]
-#| 
+#|
 #|         return self.convert_relative_to_absolute_path(params, self.indexed_relations_file_relative)
-#| 
+#|
 #|     def all_ab(self):
 #|         """
 #|         this iterator returns all the (a,b) pairs that were used to
@@ -6983,17 +7173,17 @@ if __name__ == "__main__":
 #|         """
 #|         for ab in self.row_to_aquery:
 #|             yield ab
-#| 
-#| 
+#|
+#|
 #| def construct_sage_matrix(params, indexed_relations_file):
 #|     e = params.parameters['e']
 #|     R = params.R
 #|     Ze = Integers(e)
-#| 
+#|
 #|     num_cols = R.number_of_fb_valuations(params.BOUNDA_queries)
-#| 
+#|
 #|     M_entries = defaultdict(Ze)
-#| 
+#|
 #|     row_to_aquery = []
 #|     for r, rel in enumerate(indexed_relations_from_file(indexed_relations_file)):
 #|         for idx in rel.indices:
@@ -7005,17 +7195,17 @@ if __name__ == "__main__":
 #|             elif col >= 0:
 #|                 M_entries[r, col] += 1
 #|         row_to_aquery.append((rel.a,rel.b))
-#| 
+#|
 #|     M0 = matrix(Ze, len(row_to_aquery), num_cols, dict(M_entries), sparse=True)
 #|     Z = matrix(Ze, len(row_to_aquery), 1)
-#| 
+#|
 #|     # XXX oddly enough, the existing code is padding M with two zero
 #|     # columns...
 #|     # M = block_matrix(1,3,[Z,M0,Z])
 #|     M = M0
-#| 
+#|
 #|     return M, row_to_aquery
-#| 
+#|
 #| class LinearAlgebraMatrix_IndexedFileOnly(LinearAlgebraMatrix):
 #|     def __init__(self, params, indexed_relations_file):
 #|         super().__init__(params, indexed_relations_file)
@@ -7023,26 +7213,26 @@ if __name__ == "__main__":
 #|                                                            indexed_relations_file)
 #|         self.nrows = self.M.nrows()
 #|         self.ncols = self.M.ncols()
-#| 
+#|
 #|     def matrix(self):
 #|         return self.M
-#| 
+#|
 #|     def ab_per_row(self, params):
 #|         """
 #|         For each row of the matrix, return the combination of all (a,b)
 #|         pairs that led to it, with exponents.
-#| 
+#|
 #|         Of course in the case of the current class, it's a fairly trivial
 #|         thing.
 #|         """
 #|         return [{x:1} for x in self.row_to_aquery]
-#| 
+#|
 #|     def __str__(self):
 #|         return "matrix built from the full set of " \
 #|                f"{len(self.row_to_aquery)} indexed relations"
-#| 
-#| 
-#| 
+#|
+#|
+#|
 #| class LinearAlgebraMatrix_Filtered(LinearAlgebraMatrix):
 #|     def __init__(self,
 #|                  params,
@@ -7050,42 +7240,42 @@ if __name__ == "__main__":
 #|                  purged_file,
 #|                  ideals_file, index_file,
 #|                  matrix_file):
-#| 
+#|
 #|         timeprint("Inside init of LinearAlgebraMatrix_Filtered")
-#| 
+#|
 #|         super().__init__(params, indexed_relations_file)
-#| 
+#|
 #|         self.params = params
 #|         self.matrix_file = self.convert_absolute_to_relative_path(params, matrix_file)
 #|         self.ideals_file = self.convert_absolute_to_relative_path(params, ideals_file)
 #|         self.index_file = self.convert_absolute_to_relative_path(params, index_file)
 #|         self.purged_file = self.convert_absolute_to_relative_path(params, purged_file)
-#| 
+#|
 #|         rwfile = re.sub(r'\.bin$', '.rw.bin', matrix_file)
 #|         cwfile = re.sub(r'\.bin$', '.cw.bin', matrix_file)
 #|         self.nrows = os.stat(rwfile).st_size // 4
 #|         self.ncols = os.stat(cwfile).st_size // 4
 #|         self.ncoeffs = ((os.stat(matrix_file).st_size // 4) - self.nrows) // 2
-#| 
+#|
 #|         from cado.tests.sagemath.cado_sage import bwc
-#| 
+#|
 #|         timeprint("Inside init of LinearAlgebraMatrix_Filtered; starting bwc setup")
-#| 
+#|
 #|         self.bwcparams = bwc.BwcParameters(m=6, n=6,
 #|                                            p=ZZ(self.params.parameters['e']))
-#| 
+#|
 #|         sage_or_scipy = True        # sage
 #|         if params.scipy_matrix:
 #|             sage_or_scipy = False   # scipy
-#| 
+#|
 #|         self.sage_or_scipy = sage_or_scipy
 #|         self.M = bwc.BwcMatrix(self.bwcparams, matrix_file, nthreads=self.params.nthreads, sage_or_scipy=sage_or_scipy)
-#| 
+#|
 #|         timeprint("Inside init of LinearAlgebraMatrix_Filtered; starting M.read()")
-#| 
+#|
 #|         self.M.read()
 #|         timeprint(self.M)
-#| 
+#|
 #|         self._expand_map=[]
 #|         with open(ideals_file) as f:
 #|             line = next(f)
@@ -7097,26 +7287,26 @@ if __name__ == "__main__":
 #|                 assert int(ii) == i
 #|                 self._expand_map.append(int(j, 16))
 #|         self._shrink_map={xj: j for j,xj in enumerate(self._expand_map)}
-#| 
+#|
 #|     def get_matrix_file(self, params):
 #|         return self.convert_relative_to_absolute_path(params, self.matrix_file)
-#| 
+#|
 #|     def get_ideals_file(self, params):
 #|         return self.convert_relative_to_absolute_path(params, self.ideals_file)
-#| 
+#|
 #|     def get_index_file(self, params):
 #|         return self.convert_relative_to_absolute_path(params, self.index_file)
-#| 
+#|
 #|     def get_purged_file(self, params):
 #|         return self.convert_relative_to_absolute_path(params, self.purged_file)
-#| 
+#|
 #|     def matrix(self):
 #|         return self.M.M
-#| 
+#|
 #|     def __str__(self):
 #|         return   f"cado-nfs matrix of size {self.nrows} x {self.ncols}" \
 #|                + f" with {self.ncoeffs} non-zero coefficients"
-#| 
+#|
 #|     def ab_per_row(self, params):
 #|         """
 #|         For each row of the matrix, return the combination of all (a,b)
@@ -7124,9 +7314,9 @@ if __name__ == "__main__":
 #|         """
 #|         # Note that row_to_aquery is mapping indices/rows in the *full* list of relations.
 #|         # The index file is mapping indices/rows in the *purged* file.
-#| 
+#|
 #|         timeprint("Starting ab_per_row")
-#| 
+#|
 #|         purge_row_to_ab = []
 #|         with open(self.get_purged_file(params)) as pf:
 #|             nlines = int(next(pf).split()[1])
@@ -7135,11 +7325,11 @@ if __name__ == "__main__":
 #|                 a = int(line.split(":")[0].split(",")[0], 16)
 #|                 b = int(line.split(":")[0].split(",")[1], 16)
 #|                 purge_row_to_ab.append((a,b))
-#| 
+#|
 #|         assert(nlines == len(purge_row_to_ab))
-#| 
+#|
 #|         timeprint("Finished reading purged file. Starting to read index file")
-#| 
+#|
 #|         with open(self.get_index_file(params)) as f:
 #|             nrows = int(next(f))
 #|             assert nrows == self.nrows
@@ -7148,21 +7338,21 @@ if __name__ == "__main__":
 #|                 assert int(length) == len(coeffs)
 #|                 yield {purge_row_to_ab[int(j, 16)]: int(c)
 #|                        for j, c in [x.split(':') for x in coeffs]}
-#| 
-#| 
+#|
+#|
 #|     def column_shrink_map(self):
 #|         """
 #|         this maps the column range of the indexed relations to the column
 #|         range of the matrix in matrix_file
 #|         """
 #|         return self._shrink_map
-#| 
+#|
 #|     def column_expand_map(self):
 #|         return self._expand_map
-#| 
-#| 
-#| 
-#| 
+#|
+#|
+#|
+#|
 #| @timing
 #| def construct_S(params, DRELS_FILE, DRELS_INDEXED,
 #|                 u, v, already_indexed=False, partial_R=False, uv_fac=None):
@@ -7173,7 +7363,7 @@ if __name__ == "__main__":
 #|     BOUNDA = params.BOUNDA
 #|     #u = params.target_info['u']
 #|     #v = params.target_info['v']
-#| 
+#|
 #|     if partial_R:
 #|         R = PartialRenumber1024(params.poly)
 #|         partial_renum_filename = params.dirs['TEMP_OUTPUT_DIR'] + 'partial.renumber.map'
@@ -7181,37 +7371,37 @@ if __name__ == "__main__":
 #|         R.do_sanity_checks()
 #|     else:
 #|         R = params.R
-#| 
+#|
 #|     S_rat_vector = vector(ZZ, R.number_of_rational_queries(), sparse=True)
 #|     timeprint(f"rat vector in dimension {len(S_rat_vector)}")
 #|     S_alg_vector = vector(ZZ, R.number_of_fb_valuations(params.BOUNDA), sparse=True)
 #|     timeprint(f"alg vector in dimension {len(S_alg_vector)} (bound={params.BOUNDA})")
-#| 
+#|
 #|     # (side, q) --> (a,b)
 #|     special_qs = dict()
-#| 
+#|
 #|     # (a,b) --> [rough factors]
 #|     rough_alg_factors = dict()
 #|     rough_rat_factors = dict()
-#| 
+#|
 #|     taken = list(extract_taken_relations(DRELS_FILE))
-#| 
+#|
 #|     ext_unlinked_qs = set()
-#| 
+#|
 #|     if os.path.exists(params.files['EXT_UNLINKED_TODOS']):
-#| 
+#|
 #|         with open(params.files['EXT_UNLINKED_TODOS'], "r") as extfile:
 #|             for line in extfile.readlines():
 #|                 if line.strip() == "":
 #|                     continue
-#| 
+#|
 #|                 # it's a todo file
 #|                 lineinfo = line.strip().split(" ")
 #|                 assert lineinfo[0] == '0'
 #|                 q = Integer(lineinfo[1])
 #|                 r = Integer(lineinfo[2])
 #|                 ext_unlinked_qs.add((1,q,r))
-#| 
+#|
 #|     # Here we use pull_large_factors to __modify__ the taken relations,
 #|     # and remove the factors above BOUNDR and BOUNDA. This means in
 #|     # particular that the indexed relations that we produce are no longer
@@ -7222,9 +7412,9 @@ if __name__ == "__main__":
 #|         rough_rat_factors[int(side), int(sq), rel.a, rel.b] = Rf
 #|         rough_alg_factors[int(side), int(sq), rel.a, rel.b] = Af
 #|         special_qs[side, sq] = (rel.a, rel.b)
-#| 
+#|
 #|     rels = [rel for rel, q in taken]
-#| 
+#|
 #|     if already_indexed:
 #|         # DRELS_INDEXED is a file of indexed relations,
 #|         # by some other means.
@@ -7234,62 +7424,62 @@ if __name__ == "__main__":
 #|         indexed_relations_file = big_convert_to_indexed_relation(rels,
 #|                                                params,
 #|                                                DRELS_INDEXED)
-#| 
+#|
 #|     indexed = { (irel.a,irel.b): irel for irel in indexed_relations_file }
-#| 
+#|
 #|     from collections import deque
-#| 
+#|
 #|     # rough, and outstanding (same items, for the moment): the set of
 #|     # special-q's that need to be descended.
 #|     rough = deque()
 #|     outstanding = defaultdict(int)
-#| 
+#|
 #|     # indices: what we find in the relations. Some of them are rational
 #|     # primes, but they only get converted in the end.
 #|     # As regards the rest, because we work with relations from which we
 #|     # pulled all factors above the linear algebra bounds, these really
 #|     # all go in the matrix.
 #|     indices = defaultdict(int)
-#| 
+#|
 #|     # rat_primes: the rational primes in the factorization. Initially, we
 #|     # only have those from the factorization of u/v
 #|     rat_primes = defaultdict(int)
-#| 
+#|
 #|     # rel_combination: how we arrange relations together.
 #|     rel_combination = defaultdict(int)
-#| 
+#|
 #|     if uv_fac is not None:
 #|         fac_target = uv_fac
 #|     else:
 #|         # silly to do, since we have this information saved in a file,
 #|         # but it is fast since u and v are very smooth.
 #|         fac_target = factor(ZZ(u)/ZZ(v))
-#| 
+#|
 #|     timeprint("Factorization of target is", fac_target)
-#| 
+#|
 #|     for p, k in fac_target:
 #|         if p >= BOUNDR:
 #|             outstanding[0, p] += k
 #|             rough.append((0, p))
 #|         else:
 #|             S_rat_vector[R.rational_prime_to_prime_index(p)] += k
-#| 
+#|
 #|     while rough:
 #|         side, q = rough.popleft()
 #|         exponent = outstanding[side, q]
-#| 
+#|
 #|         S_exponent = -exponent
-#| 
+#|
 #|         a, b = special_qs[side, q]
-#| 
+#|
 #|         print(f"killer relation for {(side,q)} is", indexed[a, b])
 #|         if rough_rat_factors:
 #|             print("attached rough factors (rat)", rough_rat_factors[int(side), int(q), a,b])
 #|         if rough_alg_factors:
 #|             print("attached rough factors (alg)", rough_alg_factors[int(side), int(q), a,b])
-#| 
+#|
 #|         rel_combination[a,b] += S_exponent
-#| 
+#|
 #|         for fac in indexed[a,b].indices:
 #|             # FIXME J_valuation_inconsistency
 #|             # to be activated someday
@@ -7297,38 +7487,38 @@ if __name__ == "__main__":
 #|                 indices[fac] -= S_exponent
 #|             else:
 #|                 indices[fac] += S_exponent
-#| 
+#|
 #|         for aa in rough_alg_factors[(int(side), int(q), a,b)]:
 #|             outstanding[1, aa] += S_exponent
 #|             rough.append((1, aa))
-#| 
+#|
 #|         for rr in rough_rat_factors[(int(side), int(q), a,b)]:
 #|             outstanding[0, rr] += S_exponent
 #|             rough.append((0, rr))
-#| 
+#|
 #|         outstanding[side, q] += S_exponent
 #|         assert outstanding[side, q] == 0
-#| 
+#|
 #|     for fac, v in indices.items():
 #|         col = R.renumber_to_column(fac)
 #|         if col >= 0:
 #|             S_alg_vector[col] += v
 #|         else:
 #|             S_rat_vector[R.renumber_to_rational_prime_index(fac)] += v
-#| 
+#|
 #|     # The S vector is over ideals in the extended factor base.
 #|     # We look for the BOUNDA_queries unlinked ideals in 'FILT_UNLINKED_IDEALS'
 #|     # which is the total set after filtering.
 #|     # We look for the BOUNDA unlinked ideals in 'EXT_UNLINKED_IDEALS'.
 #|     ul_ideal_cols = set()
-#| 
+#|
 #|     if os.path.exists(params.files['FILT_UNLINKED_IDEALS']):
 #|         with open(params.files['FILT_UNLINKED_IDEALS'], "r") as ul_file:
 #|             for renum_index in ul_file.readlines():
 #|                 ul_col = R.renumber_to_column(int(renum_index))
 #|                 if ul_col >= 0:
 #|                     ul_ideal_cols.add(ul_col)
-#| 
+#|
 #|     if os.path.exists(params.files['EXT_UNLINKED_IDEALS']):
 #|         with open(params.files['EXT_UNLINKED_IDEALS'], "r") as ul_file:
 #|             for line in ul_file.readlines():
@@ -7336,7 +7526,7 @@ if __name__ == "__main__":
 #|                 ul_col = R.renumber_to_column(renumber_index)
 #|                 if ul_col >= 0:
 #|                     ul_ideal_cols.add(ul_col)
-#| 
+#|
 #|     for ul in ul_ideal_cols:
 #|         if S_alg_vector[ul] != 0:
 #|             ul_renum = R.column_to_renumber(ul)
@@ -7350,10 +7540,10 @@ if __name__ == "__main__":
 #|                                 " however it is not linked to the others."
 #|                                 " Too bad, really.")
 #|             exit(0)
-#| 
+#|
 #|     return rel_combination, S_alg_vector, S_rat_vector
-#| 
-#| 
+#|
+#|
 #| def extract_taken_relations(DRELS_FILE):
 #|     """
 #|     This is a bit like condense_descent_relations, except that we don't
@@ -7362,14 +7552,14 @@ if __name__ == "__main__":
 #|     """
 #|     for line in open(DRELS_FILE).readlines():
 #|         line = line.strip()
-#| 
+#|
 #|         if m := re.match(r"# Taking decision on .* side-(\d+) q=(\d+); rho=(\d+)", line):
 #|             # To be stored in taken_qs if next line matches if condition below
 #|             side, sq, rho = (int(c) for c in m.groups())
-#| 
+#|
 #|         if (m := re.match("^Taken: (.*)", line)):
 #|             yield (las_relation(m.group(1)), (side, sq, rho))
-#| 
+#|
 #| @timing
 #| def filter_relation_file(params):
 #|     #filename = params.files['AQRELS_FILE']
@@ -7377,11 +7567,11 @@ if __name__ == "__main__":
 #|     POLYFILE = params.files['POLYFILE']
 #|     RENUMBERFILE = params.files['RENUMBERFILE']
 #|     # Return the filename of the filtered relations
-#| 
+#|
 #|     # For 1024: we can use the 31-version of the renumber file,
 #|     # which should be faster to load.
 #|     # ^ removed for now
-#| 
+#|
 #|     basename = os.path.basename(params.files['AQRELS_FILE'])
 #|     indexed_relations_file = params.files['AQRELS_FILE'] + ".indexed"
 #|     purged_file            =  indexed_relations_file + ".purged"
@@ -7390,25 +7580,25 @@ if __name__ == "__main__":
 #|     index_file             =  indexed_relations_file + ".index"
 #|     ideals_file            =  indexed_relations_file + ".ideals"
 #|     matrix_file            =  indexed_relations_file + ".matrix.bin"
-#| 
+#|
 #|     make_and_clean(params.dirs['DUP'])
-#| 
+#|
 #|     # we don't need to bother with dup1 doing anything fun. So really,
 #|     # it's just about making a copy (and stripping out comments)
-#| 
+#|
 #|     CadoNFS("filter/dup1",
 #|             "-out", 'TMPDIR',
 #|             "-prefix", basename + ".dup",
 #|             "-n", 0, 'DATA',
 #|             inputs={'TMPDIR': params.dirs['TEMP_OUTPUT_DIR'][:-1],
 #|                     'DATA': params.files['AQRELS_FILE']})
-#| 
+#|
 #|     # count the number of relations in all files from L
 #|     wc_l = lambda L: sum([len(open(f).readlines()) for f in L])
-#| 
+#|
 #|     files_to_dup2 = glob.glob(params.dirs['DUP']+'*.dup.*')
 #|     nrels = wc_l(files_to_dup2)
-#| 
+#|
 #|     CadoNFS("filter/dup2",
 #|             "-dl",
 #|             "-nrels", nrels,
@@ -7416,17 +7606,17 @@ if __name__ == "__main__":
 #|             "-renumber", 'RENUMBER',
 #|             *files_to_dup2,
 #|             inputs={'POLY': POLYFILE, 'RENUMBER': RENUMBERFILE})
-#| 
-#| 
+#|
+#|
 #|     # We no longer call this function to renumber the relations from
 #|     # extrels or from the descent.
 #|     assert "desc" not in params.files['AQRELS_FILE']
 #|     assert "extrels" not in params.files['AQRELS_FILE']
-#| 
+#|
 #|     # so really, it's only about algebraic query relations.
 #|     assert "aqrels" in params.files['AQRELS_FILE']
-#| 
-#| 
+#|
+#|
 #|     # record the collection of renumbered relations in a single file, for
 #|     # potential future use.
 #|     with open(indexed_relations_file, "w") as out:
@@ -7434,19 +7624,19 @@ if __name__ == "__main__":
 #|             with open(f) as slice:
 #|                 for line in slice.readlines():
 #|                     out.write(line)
-#| 
-#| 
+#|
+#|
 #|     if not params.cado_nfs_filter:
 #|         # do *not* using the cado-nfs filtering tools.
 #|         warning_message("***** skipping purge, copying rels to",
 #|                         indexed_relations_file)
-#| 
+#|
 #|         return LinearAlgebraMatrix_IndexedFileOnly(params,
 #|                                                 indexed_relations_file)
-#| 
+#|
 #|     nrels = wc_l(files_to_dup2)
 #|     major_message(f"Number of algebraic relations after dup2: {nrels}")
-#| 
+#|
 #|     CadoNFS("filter/purge",
 #|             "-col-max-index", params.BOUNDA_queries,
 #|             "-col-min-index", 0,
@@ -7459,8 +7649,8 @@ if __name__ == "__main__":
 #|             params.parameters.get('purge.keep', 10),
 #|             *files_to_dup2,
 #|             outputs={'PURGED': purged_file, 'RELSDEL': relsdel_file})
-#| 
-#| 
+#|
+#|
 #|     CadoNFS("filter/merge-dl",
 #|             "-mat", 'PURGED',
 #|             "-out", 'HIST',
@@ -7470,8 +7660,8 @@ if __name__ == "__main__":
 #|             "-t", str(params.parameters.get('nthreads', 8)),
 #|             inputs={'PURGED': purged_file},
 #|             outputs={'HIST': history_file})
-#| 
-#| 
+#|
+#|
 #|     CadoNFS("filter/replay-dl",
 #|             "-purged", 'PURGED',
 #|             "-his", 'HIST',
@@ -7483,22 +7673,22 @@ if __name__ == "__main__":
 #|             outputs={'INDEX': index_file,
 #|                     'IDEALS': ideals_file,
 #|                     'MATRIX': matrix_file})
-#| 
+#|
 #|     M = LinearAlgebraMatrix_Filtered(params,
 #|                                      indexed_relations_file,
 #|                                      purged_file,
 #|                                      ideals_file, index_file,
 #|                                      matrix_file)
-#| 
+#|
 #|     return M
-#| 
-#| 
+#|
+#|
 #| class CadoExplainRenumberFile:
 #|     """
 #|     This class takes inspiration (and copies much code!) from
 #|     CadoIdealsDebugFile, except that we don't want to waste time
 #|     computing the ideals.
-#| 
+#|
 #|     (now that we cheat on the max order computation, there's probably not
 #|     much point in duplicating code)
 #|     """
@@ -7515,16 +7705,16 @@ if __name__ == "__main__":
 #|         self.__clear_fields_for_read()
 #|         self.has_merged_J = False
 #|         self.index_of_J = []
-#| 
+#|
 #|     def __clear_fields_for_read(self):
 #|         self._ideals = None
 #|         self._indices_per_side = None
-#| 
+#|
 #|     def __repr__(self):
 #|         return ("CadoExplainRenumberFile("
 #|                 + f"CadoPolyFile(\"{self.poly.filename}\")"
 #|                 + f", \"{self.filename}\")")
-#| 
+#|
 #|     def __str__(self):
 #|         rep = "cado-nfs proxy to the renumber table"
 #|         if self.filename:
@@ -7537,40 +7727,40 @@ if __name__ == "__main__":
 #|         else:
 #|             rep += f", {len(self.ideals)} ideals"
 #|             return rep
-#| 
+#|
 #|     def __len__(self):
 #|         return len(self._ideals)
-#| 
+#|
 #|     # def __iter__(self):
 #|     #     return iter(self._ideals)
 #|     #
 #|     # def __getitem__(self, i):
 #|     #     return self._ideals[i]
-#| 
+#|
 #|     def index(self, i):
 #|         return self._ideals.index(i)
-#| 
+#|
 #|     def read(self):
 #|         self.__clear_fields_for_read()
-#| 
+#|
 #|         if get_verbose():
 #|             timeprint(f"Reading {self.filename}")
-#| 
+#|
 #|         K = self.poly.K
-#| 
+#|
 #|         self._ideals = []
 #|         #self._ideals_to_index = dict()
 #|         self._indices_per_side = [[] for f in K]
-#| 
+#|
 #|         with cat_or_zcat(self.filename) as fp:
 #|             for t in fp:
 #|                 if t.startswith('#'):
 #|                     continue
-#| 
+#|
 #|                 parser, *data = t.split()
-#| 
+#|
 #|                 i = len(self._ideals)
-#| 
+#|
 #|                 if parser == 'J':
 #|                     # the "data" field is actually a bit of a lie, b
 #|                     self.has_merged_J = len(data) > 1
@@ -7615,15 +7805,15 @@ if __name__ == "__main__":
 #|                         raise e
 #|                     I = (p, theta)
 #|                     #self._ideals_to_index[side,p,theta] = i
-#| 
+#|
 #|                 # _indices_per_side[side] is always a list of indices in the
 #|                 # renumber table (that is, in self._ideals) of all ideals
 #|                 # that have something to do with the given {side}.
-#| 
+#|
 #|                 # reciprocally, self._ideals[i] has info on the index of this
 #|                 # among ideals on the same side. Watch out for the special
 #|                 # treatment of the J ideals, though!
-#| 
+#|
 #|                 if type(side) is tuple:
 #|                     # This is a special case for J, which is sometimes
 #|                     # attached to two sides.
@@ -7633,9 +7823,9 @@ if __name__ == "__main__":
 #|                 else:
 #|                     side_restricted_index = len(self._indices_per_side[side])
 #|                     self._indices_per_side[side].append(i)
-#| 
+#|
 #|                 self._ideals.append((parser, side, I, side_restricted_index))
-#| 
+#|
 #|                 END_READING_EARLY = True
 #|                 if END_READING_EARLY and parser != 'J' and int(I[0]) > 2**31:
 #|                     break
@@ -7643,27 +7833,27 @@ if __name__ == "__main__":
 #|                     # we don't need to read beyond 2**31,
 #|                     # and it would be expensive to do so.
 #|                     # Comment this out when we do extension things.
-#| 
+#|
 #|             assert not self.has_merged_J or len(self.index_of_J) == 1
-#| 
+#|
 #|     def ideal_to_index(self, q):
 #|         """
 #|         q is a tuple (side, *things)
 #|         """
 #|         raise NotImplementedError("AFAIK ideal_to_index is never called.")
 #|         #return self._ideals_to_index[q]
-#| 
+#|
 #|     def index_to_ideal(self, i):
 #|         parser, side, I, col_index = self._ideals[i]
 #|         # This is really only something we can understand if we're away
 #|         # from the special cases such as J, bad ideals, and so on.
 #|         return side, *I
-#| 
+#|
 #|     def side_and_index_to_ideal(self, side, i):
 #|         rside, *I = self.index_to_ideal(self._indices_per_side[side][i])
 #|         assert rside == side
 #|         return side, *I
-#| 
+#|
 #|     def ideal_to_side_and_index(self, q):
 #|         """
 #|         q is a tuple (side, *things)
@@ -7673,36 +7863,36 @@ if __name__ == "__main__":
 #|         #parser, side, I, col_index = self._ideals[i]
 #|         #assert side == q[0]
 #|         #return side, col_index
-#| 
-#| 
+#|
+#|
 #|     def renumber_to_column(self, idx):
 #|         """
 #|         given an index to the renumber table, return the column index in
 #|         the valuation matrix.
 #|         This returns -1 if the index corresponds to a rational prime.
 #|         """
-#| 
+#|
 #|         parser, side, I, col_index = self._ideals[idx]
-#| 
+#|
 #|         if type(side) is tuple:
 #|             assert len(side) == 2
 #|             # it had better be 0 on both sides, otherwise we don't really
 #|             # know what to return...
 #|             assert col_index[0] == col_index[1]
 #|             return col_index[0]
-#| 
+#|
 #|         return -1 if side == 0 else col_index
-#| 
+#|
 #|     def column_to_renumber(self, col_index):
 #|         return self._indices_per_side[1][col_index]
-#| 
+#|
 #|     def column_to_sage_ideal(self, col_index, side_hint=None):
 #|         # XXX: Note that there's a parallelizable version of this function in
 #|         # montgomery_ethroot.py that has close to identical code. Any updates
 #|         # to this function should likely also be applied there.
-#| 
+#|
 #|         parser, side, Idata, _col_index = self._ideals[self.column_to_renumber(col_index)]
-#| 
+#|
 #|         if parser == 'J' and self.has_merged_J:
 #|             # This case is special, really.
 #|             assert side_hint is not None    # what can we do?
@@ -7710,17 +7900,17 @@ if __name__ == "__main__":
 #|             assert _col_index == (_col_index[0],)*len(side)
 #|             side = side[side_hint]
 #|             _col_index = _col_index[side_hint]
-#| 
+#|
 #|         assert _col_index == col_index
-#| 
+#|
 #|         # XXX this assert is a bit excessive in full generality.
 #|         # Perhaps we'd like to assert side == side_hint, at most.
 #|         assert side == 1
-#| 
+#|
 #|         K = self.poly.K
 #|         J = self.poly.nt.J()
 #|         OK = self.poly.nt.maximal_orders()
-#| 
+#|
 #|         if parser == 'J':
 #|             return J[side]
 #|         elif parser == 'rat':
@@ -7738,7 +7928,7 @@ if __name__ == "__main__":
 #|         else:
 #|             raise AssertionError("Unknown parser:", parser)
 #|         return I
-#| 
+#|
 #|     def renumber_to_rational_prime(self, idx):
 #|         parser, side, I, col_index = self._ideals[idx]
 #|         if parser == 'J':
@@ -7749,7 +7939,7 @@ if __name__ == "__main__":
 #|             raise KeyError
 #|         assert parser == 'rat'
 #|         return I[0]
-#| 
+#|
 #|     def renumber_to_rational_prime_index(self, idx):
 #|         parser, side, I, col_index = self._ideals[idx]
 #|         if parser == 'J':
@@ -7758,7 +7948,7 @@ if __name__ == "__main__":
 #|             raise KeyError
 #|         assert parser == 'rat'
 #|         return col_index - int(self.has_merged_J)
-#| 
+#|
 #|     def _rational_prime_to_prime_index_raw(self, p):
 #|         """
 #|         This returns the prime index, possibly offset by 1 if we have a
@@ -7769,7 +7959,7 @@ if __name__ == "__main__":
 #|                                key=lambda x: self._ideals[x][2][0])
 #|         if b == len(self._indices_per_side[0]):
 #|             raise KeyError(f"rational prime p={p} is not in the renumber table")
-#| 
+#|
 #|         j = self._indices_per_side[0][b]
 #|         if self._ideals[j] == ('rat', 0, (p,), b):
 #|             pass
@@ -7782,16 +7972,16 @@ if __name__ == "__main__":
 #|                                " First entry above:"
 #|                                f"{self._ideals[j]}")
 #|         return b, j
-#| 
-#| 
+#|
+#|
 #|     def rational_prime_to_prime_index(self, p):
 #|         b, r = self._rational_prime_to_prime_index_raw(p)
 #|         return b - int(self.has_merged_J)
-#| 
+#|
 #|     def rational_prime_to_renumber(self, p):
 #|         b, r = self._rational_prime_to_prime_index_raw(p)
 #|         return r
-#| 
+#|
 #|     def rational_prime_index_to_prime(self, i):
 #|         lo = int(self.has_merged_J)
 #|         b = i + lo
@@ -7799,7 +7989,7 @@ if __name__ == "__main__":
 #|         p = self._ideals[j][2][0]
 #|         assert self._ideals[j] == ('rat', 0, (p,), b)
 #|         return p
-#| 
+#|
 #|     def rational_ideal_index_to_prime(self, b):
 #|         """
 #|         This is _almost_ the same as rational_prime_index_to_prime, with
@@ -7814,8 +8004,8 @@ if __name__ == "__main__":
 #|         else:
 #|             p = self.rational_prime_index_to_prime(b - int(self.has_merged_J))
 #|             return p
-#| 
-#| 
+#|
+#|
 #|     def _number_of_valuations(self, bound=None):
 #|         # This takes the
 #|         # corresponding bound as a parameter.
@@ -7837,17 +8027,17 @@ if __name__ == "__main__":
 #|             return index + 1
 #|         except AssertionError as e:
 #|             raise RuntimeError(f"_number_of_valuations({bound}) did not find _any_ ideal below {bound}, which is nuts, really")
-#| 
+#|
 #|     def number_of_fb_valuations(self, BOUNDA_queries):
 #|         """
 #|         returns the number of prime ideals that end up in the
 #|         linear algebra matrix (before filtering).
 #|         """
 #|         return self._number_of_valuations(BOUNDA_queries)
-#| 
+#|
 #|     def number_of_algebraic_columns(self):
 #|         return self._number_of_valuations()
-#| 
+#|
 #|     def number_of_rational_queries(self):
 #|         """
 #|         return the number of rational queries that we need to make in
@@ -7857,8 +8047,8 @@ if __name__ == "__main__":
 #|         coordinate for it with the linear algebra solution
 #|         """
 #|         return len(self._indices_per_side[0]) - self.has_merged_J
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def run_S_sanity_checks(params, S_list, S_alg_vector, S_rat_vector, u, v, partial_R=False):
 #|     N = params.poly.N
@@ -7868,13 +8058,13 @@ if __name__ == "__main__":
 #|     assert m == params.poly.K[0].gen()
 #|     ZN = Integers(N)
 #|     assert ZN(m) == ZN(params.poly.m)
-#| 
+#|
 #|     # note that (a-b*x).resultant(f0) is a-b*m if f0 is monic. Otherwise
 #|     # it's lc(f0)*(a-b*m)
-#| 
+#|
 #|     # The following checks are only valid if we kept track of the
 #|     # rational side, which in fact we'd like to avoid!
-#| 
+#|
 #|     if partial_R:
 #|         R = PartialRenumber1024(params.poly)
 #|         partial_renum_filename = params.dirs['TEMP_OUTPUT_DIR'] + 'partial.renumber.map'
@@ -7882,31 +8072,31 @@ if __name__ == "__main__":
 #|         R.do_sanity_checks()
 #|     else:
 #|         R = params.R
-#| 
+#|
 #|     pi2p = R.rational_prime_index_to_prime
-#| 
+#|
 #|     rat_factored = Factorization([(ZN(pi2p(i)),k)
 #|                                   for i,k in S_rat_vector.dict().items()])
-#| 
+#|
 #|     # Check u/v * S(m)
 #|     rational_smooth_product = rat_factored.prod()
-#| 
+#|
 #|     S_m = ZN(u) / ZN(v)
-#| 
+#|
 #|     # see remark above. S_m isn't exactly S(m)
 #|     # S_m *= prod([ZN((a-b*x).resultant(f0))**k for (a, b), k in S_list.items()])
 #|     S_m *= prod([ZN((a-b*m))**k for (a, b), k in S_list.items()])
 #|     lc_fix = sum(S_list.values())
 #|     S_m *= ZN(f0.leading_coefficient())**lc_fix
-#| 
+#|
 #|     print("S_m", str(S_m))
 #|     print("rational_smooth_product", str(rational_smooth_product))
 #|     print("lc_fix", str(lc_fix))
-#| 
+#|
 #|     assert(rational_smooth_product == S_m or
 #|            rational_smooth_product == -S_m)
-#| 
-#| 
+#|
+#|
 #|     # another way to put it. Maybe this one is a bit expensive because it
 #|     # computes over the integers and not in ZN (but on the other hand
 #|     # everything remains in sparse form so it isn't that bad)
@@ -7916,44 +8106,44 @@ if __name__ == "__main__":
 #|                                 for i,k in S_rat_vector.dict().items()])
 #|     ff = fac_elems / fac_primes
 #|     assert ff.prod() == ff.unit()
-#| 
-#| 
+#|
+#|
 #|     # also check what we can check on the algebraic side.
-#| 
+#|
 #|     f1 = params.poly.f[1]
 #|     K = params.poly.K[1]
 #|     alpha = K.gen()
 #|     OK = K.maximal_order()
-#| 
+#|
 #|     # note that we can only check the ideal factorizations!
 #|     S_alpha = OK.fractional_ideal(prod([(a-b*alpha)**k
 #|                                         for (a, b), k in S_list.items()]))
-#| 
+#|
 #|     # FIXME J_valuation_inconsistency. This is the same as the situation
 #|     # we encounted in the Montgomery e-th root computation (see "FIXME
 #|     # J_valuation_inconsistency" there)
 #|     if True and not f1.is_monic():
 #|         J1 = R.column_to_sage_ideal(0, side_hint=1)
 #|         S_alpha *= J1**(lc_fix*2)
-#| 
+#|
 #|         print("J1 norm", str(J1.norm()))
 #|         print("lc_fix", str(lc_fix))
-#| 
+#|
 #|     c2a = lambda c: R.column_to_sage_ideal(c, side_hint=1)
 #|     alg_factored = Factorization([(c2a(i),k)
 #|                                   for i,k in S_alg_vector.dict().items()])
-#| 
+#|
 #|     diff = S_alpha.norm() -  alg_factored.prod().norm()
 #|     ratio = S_alpha.norm() / alg_factored.prod().norm()
 #|     ratio2 = alg_factored.prod().norm() / S_alpha.norm()
-#| 
+#|
 #|     print("diff", diff)
 #|     print("ratio", ratio)
 #|     print("ratio2", ratio2)
-#| 
+#|
 #|     assert S_alpha.norm() == alg_factored.prod().norm()
 #|     assert S_alpha == alg_factored.prod()
-#| 
+#|
 #| @timing
 #| def run_ST_sanity_checks(params, S_list, T_list, ST_alg_vector, S_rat_vector, u, v, partial_R=False):
 #|     N = params.poly.N
@@ -7963,7 +8153,7 @@ if __name__ == "__main__":
 #|     assert m == params.poly.K[0].gen()
 #|     ZN = Integers(N)
 #|     assert ZN(m) == ZN(params.poly.m)
-#| 
+#|
 #|     if partial_R:
 #|         desc_R = PartialRenumber1024(params.poly)
 #|         partial_renum_filename = params.dirs['TEMP_OUTPUT_DIR'] + 'partial.renumber.map'
@@ -7973,43 +8163,43 @@ if __name__ == "__main__":
 #|     else:
 #|         desc_R = params.R
 #|         params_R = params.R
-#| 
+#|
 #|     # note that (a-b*x).resultant(f0) is a-b*m if f0 is monic. Otherwise
 #|     # it's lc(f0)*(a-b*m)
-#| 
+#|
 #|     # The following checks are only valid if we kept track of the
 #|     # rational side, which in fact we'd like to avoid!
 #|     pi2p = desc_R.rational_prime_index_to_prime
 #|     rat_factored = Factorization([(ZN(pi2p(i)),k)
 #|                                   for i,k in S_rat_vector.dict().items()])
 #|     rational_smooth_product = rat_factored.prod()
-#| 
+#|
 #|     # Check u/v * S(m)
 #|     S_m = ZN(u) / ZN(v)
-#| 
+#|
 #|     # see remark above. S_m isn't exactly S(m)
 #|     # S_m *= prod([ZN((a-b*x).resultant(f0))**k for (a, b), k in S_list.items()])
 #|     S_m *= prod([ZN((a-b*m))**k for (a, b), k in S_list.items()])
 #|     lc_fix = sum(S_list.values())
 #|     S_m *= ZN(f0.leading_coefficient())**lc_fix
-#| 
+#|
 #|     assert(rational_smooth_product == S_m or
 #|            rational_smooth_product == -S_m)
-#| 
+#|
 #|     # NOTE: We have ignored T_list for now: these elements are not
 #|     # smooth, and we only expect to find their roots via additional
 #|     # queries:
 #|     # [(a-b*x).resultant(f0).factor()**k for (a, b), k in T_list.items()]
-#| 
-#| 
+#|
+#|
 #|     # also check what we can check on the algebraic side. Here, we use
 #|     # T_list as well!
-#| 
+#|
 #|     f1 = params.poly.f[1]
 #|     K = params.poly.K[1]
 #|     alpha = K.gen()
 #|     OK = K.maximal_order()
-#| 
+#|
 #|     # note that we can only check the ideal factorizations!
 #|     S_alpha = OK.fractional_ideal(prod([(a-b*alpha)**k
 #|                                         for (a, b), k in S_list.items()]))
@@ -8022,24 +8212,24 @@ if __name__ == "__main__":
 #|         J1 = params_R.column_to_sage_ideal(0, side_hint=1)
 #|         S_alpha *= J1**(2*sum(S_list.values()))
 #|         T_alpha *= J1**(2*sum(T_list.values()))
-#| 
+#|
 #|     c2a = lambda c: params_R.column_to_sage_ideal(c, side_hint=1)
 #|     alg_factored = Factorization([(c2a(i),k)
 #|                                   for i,k in ST_alg_vector.dict().items()])
-#| 
+#|
 #|     S_times_T = S_alpha*T_alpha
-#| 
+#|
 #|     diff = S_times_T.norm() -  alg_factored.prod().norm()
 #|     ratio = S_times_T.norm() / alg_factored.prod().norm()
 #|     ratio2 = alg_factored.prod().norm() / S_times_T.norm()
-#| 
+#|
 #|     timeprint("diff", str(diff))
 #|     timeprint("ratio", str(ratio))
 #|     timeprint("ratio2", str(ratio2))
-#| 
+#|
 #|     assert S_times_T == alg_factored.prod()
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def run_sol_sanity_checks(params, sol, ST_alg_vector, indexed_relations_file):
 #|     """
@@ -8063,41 +8253,41 @@ if __name__ == "__main__":
 #|             elif col >= 0:
 #|                 sol_prime_ideal_vals[col] += sol_r
 #|         current_row += 1
-#| 
+#|
 #|     # print(str(sol_prime_ideal_vals))
 #|     # print(str(ST_alg_vector))
-#| 
+#|
 #|     for i in range(len(ST_alg_vector)):
 #|         assert(-1*sol_prime_ideal_vals[i] % e == ST_alg_vector[i] % e)
-#| 
+#|
 #| @timing
 #| def algebraic_consistency_check(params, S_list, S_alg_vector):
 #|     alpha1 = params.poly.K[1].gen()
 #|     alg_thing = ZZ(1)
 #|     for (a,b),e in S_list.items():
 #|         alg_thing *= (a-b*alpha1).norm()**e
-#| 
+#|
 #|     # print(alg_thing)
 #|     # print(alg_thing.factor())
-#| 
+#|
 #|     biggie = ZZ(1)
 #|     for i,v in enumerate(S_alg_vector):
 #|         if not v:
 #|             continue
 #|         side,q,rho = params.R.side_and_index_to_ideal(1, i)
 #|         biggie *= q**v
-#| 
+#|
 #|     # print(biggie)
 #|     # print(biggie.factor())
-#| 
+#|
 #|     return biggie / alg_thing in [1, -1]
-#| 
+#|
 #| @timing
 #| def truncate_S(params, S_list, S_alg_vector, partial_R=False):
-#| 
+#|
 #|     EXTRELS_FILE = params.files['EXTRELS_FILE']
 #|     EXTRELS_INDEXED = params.files['EXTRELS_INDEXED']
-#| 
+#|
 #|     if partial_R:
 #|         desc_R = PartialRenumber1024(params.poly)
 #|         partial_renum_filename = params.dirs['TEMP_OUTPUT_DIR'] + 'partial.renumber.map'
@@ -8107,15 +8297,15 @@ if __name__ == "__main__":
 #|     else:
 #|         desc_R = params.R
 #|         params_R = params.R
-#| 
+#|
 #|     # num_cols = R.number_of_fb_valuations(params.BOUNDA)
 #|     # for irel in indexed_relations_from_file(EXTRELS_INDEXED):
 #|     #     for idx in irel.indices:
-#| 
+#|
 #|     #print("S_alg_vector", ', '.join([ f"{i}:{S_alg_vector[i]}" for i in S_alg_vector.nonzero_positions()]))
 #|     if params.debug:
 #|         assert algebraic_consistency_check(params, S_list, S_alg_vector)
-#| 
+#|
 #|     starttime = time.time()
 #|     # this is messy, really. We should be able to avoid some of these
 #|     # detours.
@@ -8130,46 +8320,46 @@ if __name__ == "__main__":
 #|     endtime = time.time()
 #|     params.timing['big_convert_to_indexed_relation'] = endtime-starttime
 #|     timeprint('big_convert_to_indexed_relation', endtime-starttime)
-#| 
+#|
 #|     indexed = { (irel.a,irel.b): irel for irel in indexed_relations_file }
-#| 
+#|
 #|     T_list = defaultdict(int)
 #|     ST_list = copy.copy(S_list)
 #|     ST_alg_vector = copy.copy(S_alg_vector)
-#| 
+#|
 #|     num_cols = params_R.number_of_fb_valuations(params.BOUNDA_queries)
 #|     timeprint("num_cols", str(num_cols))
 #|     timeprint("num_cols_2", str(desc_R.number_of_fb_valuations(params.BOUNDA_queries)))
 #|     #assert num_cols == params_R.number_of_fb_valuations(params.BOUNDA_queries)
-#| 
+#|
 #|     num_missing_ideals = 0
-#| 
+#|
 #|     for i in S_alg_vector.nonzero_positions():
 #|         if i < num_cols:
 #|             continue
-#| 
+#|
 #|         exponent = S_alg_vector[i]
-#| 
+#|
 #|         side, *I = desc_R.side_and_index_to_ideal(1, i)
 #|         if side != 1 or len(I) != 2:
 #|             raise RuntimeError(f"ideal {i} in the renumber table points to {(side, *I)}")
 #|         q, rho = I
-#| 
+#|
 #|         if not partial_R:
 #|             # _indices_per_side should be defined as usual
 #|             # Not sure why we use that instead of column_to_renumber.
 #|             timeprint(f"now killing index {i}->0x{params.R._indices_per_side[1][i]:x} == {(side, q, rho)}")
 #|         else:
 #|             timeprint(f"now killing index {i}->0x{desc_R.column_to_renumber(i)} == {(side, q, rho)}")
-#| 
+#|
 #|         if (side, q, rho) not in per_q:
-#| 
+#|
 #|             num_missing_ideals += 1
 #|             print(f"Missing prime ideal {side} {q} {rho}")
 #|             print(f"So far missing: {num_missing_ideals}")
-#| 
+#|
 #|             continue
-#| 
+#|
 #|             #raise RuntimeError(f"Uh oh! The prime ideal of index 0x{i:x}"
 #|             #                   " in the extension factor base,"
 #|             #                   f" a.k.a.  {(side,q,rho)}"
@@ -8177,14 +8367,14 @@ if __name__ == "__main__":
 #|             #                   " the query factor base."
 #|             #                   " This bug is supposedly gone."
 #|             #                   f" See {EXTRELS_INDEXED}")
-#| 
+#|
 #|         las_rel = per_q[side, q, rho]
 #|         irel = indexed[las_rel.a, las_rel.b]
-#| 
+#|
 #|         # We divide both sides by (a-b*alpha) = q * smooth_prod
 #|         ST_list[las_rel.a, las_rel.b] -= exponent
 #|         T_list[las_rel.a, las_rel.b] -= exponent
-#| 
+#|
 #|         found_me = False
 #|         for f in irel.indices:
 #|             col_desc = desc_R.renumber_to_column(f)
@@ -8192,7 +8382,7 @@ if __name__ == "__main__":
 #|                 col_params = params_R.renumber_to_column(f)
 #|             except IndexError:
 #|                 col_params = -1
-#| 
+#|
 #|             if col_desc < 0 and col_params < 0:
 #|                 # rational
 #|                 continue
@@ -8207,18 +8397,18 @@ if __name__ == "__main__":
 #|                 # prime below LPB1_queries
 #|                 ST_alg_vector[col_params] -= exponent
 #|         assert found_me
-#| 
+#|
 #|     timeprint(f"At least made it through main loop of truncate_S")
 #|     timeprint(f"Beyond this we will need all the extension relations.")
-#| 
+#|
 #|     assert num_missing_ideals == 0
 #|     assert ST_alg_vector[num_cols:].nonzero_positions() == []
-#| 
+#|
 #|     ST_alg_vector = vector(ST_alg_vector[:num_cols])
-#| 
+#|
 #|     if params.debug:
 #|         assert algebraic_consistency_check(params, ST_list, ST_alg_vector)
-#| 
+#|
 #|     # After truncation, we should only be within BOUNDA_queries, so only
 #|     # need to look for unlinked ideals among the FILT_UNLINKED_IDEALS.
 #|     ul_ideal_cols = set()
@@ -8228,7 +8418,7 @@ if __name__ == "__main__":
 #|                 ul_col = params_R.renumber_to_column(int(renum_index))
 #|                 if ul_col >= 0:
 #|                     ul_ideal_cols.add(ul_col)
-#| 
+#|
 #|     for ul in ul_ideal_cols:
 #|         if ST_alg_vector[ul] != 0:
 #|             ul_renum = params_R.column_to_renumber(ul)
@@ -8242,9 +8432,9 @@ if __name__ == "__main__":
 #|                                 " however it is not linked to the others."
 #|                                 " Too bad, really.")
 #|             exit(0)
-#| 
+#|
 #|     return T_list, ST_list, ST_alg_vector
-#| 
+#|
 #| @timing
 #| def get_RSU_m(S_list, sol, row_to_aquery, f, e, N, m):
 #|     # R**e = S*U
@@ -8253,9 +8443,9 @@ if __name__ == "__main__":
 #|     extra_abks = []
 #|     S_m = ZN(1)
 #|     U_m = ZN(1)
-#| 
+#|
 #|     # Note that the crt_ethroot script uses the (a+b*m) convention, not (a-b*m).
-#| 
+#|
 #|     for (a, b), exponent in S_list.items():
 #|         S_m = ZN(S_m * power_mod(a-b*m, exponent, N))
 #|         if exponent > 0:
@@ -8267,7 +8457,7 @@ if __name__ == "__main__":
 #|                 k += 1
 #|             extra_abks.append((a, b, k))
 #|             abm_list.append((a, -1*b, k*e + exponent))
-#| 
+#|
 #|     for i in range(len(sol)):
 #|         a,b = row_to_aquery[i]
 #|         exponent = Integer(sol[i])
@@ -8280,10 +8470,10 @@ if __name__ == "__main__":
 #|                 k += 1
 #|             extra_abks.append((a, b, k))
 #|             abm_list.append((a, -1*b, k*e + exponent))
-#| 
+#|
 #|     for a,b,m in abm_list:
 #|         assert(m >= 0)
-#| 
+#|
 #|     ethroot_gen = ethroot(abm_list, f, e, N)
 #|     ### For debugging, uncomment the following lines to write the eth-root step's input to a file
 #|     #with open('/tmp/ethroot_data','w') as file:
@@ -8292,57 +8482,57 @@ if __name__ == "__main__":
 #|     #    file.write(f"N: {N}\n")
 #|     #    file.write(f"len(abm_list): {len(abm_list)}\n")
 #|     #    file.write(f"abm_list: {abm_list}\n")
-#| 
-#| 
+#|
+#|
 #|     if False:
 #|         assert U_m == prod([ZN(a-b*m)^k
 #|                             for (a,b),k in [
 #|                                 (linalg_output.row_to_aquery[i],s)
 #|                                 for i,s in enumerate(linalg_output.sol)]])
-#| 
+#|
 #|         assert S_m == prod([ZN(a-b*m)^k
 #|                             for (a,b),k in linalg_output.ST_list.items()])
-#| 
+#|
 #|         TT = [(linalg_output.row_to_aquery[i],s) for i,s in enumerate(linalg_output.sol)]
 #|         TT += list(linalg_output.ST_list.items())
 #|         assert S_m*U_m == prod([ZN(a-b*m)^k for (a,b),k in TT])
 #|         assert S_m*U_m == prod([ZN(a+minus_b*m)^k for a,minus_b,k in abm_list])/prod([ZN(a-b*m)^k for a,b,k in extra_abks])^e
-#| 
-#| 
-#| 
+#|
+#|
+#|
 #|     return S_m, U_m, ethroot_gen, extra_abks, abm_list
-#| 
-#| 
+#|
+#|
 #| def extract_decimal_ab_from_file(outfilename, infilename):
 #|     with open(outfilename, "w") as fw:
 #|         timeprint("Reading", infilename)
 #|         for rel in indexed_relations_from_file(infilename):
 #|             print(f"{rel.a},{rel.b}", file=fw)
-#| 
-#| 
+#|
+#|
 #| def fast_union(s1, s2):
 #|     s1.update(s2)
 #|     return s1
-#| 
+#|
 #| def get_dict_keyset(d):
 #|     return set(d.keys())
-#| 
+#|
 #| class SchirokauerMapsAppender(abc.ABC):
 #|     def __init__(self, params):
 #|         self.params = params
 #|         self.N = params.poly.N
 #|         self.e = int(params.parameters['e'])
 #|         self.Ze = IntegerModRing(self.e)
-#| 
+#|
 #|     @abc.abstractmethod
 #|     def maps_from_more_ab(self, ab_pairs):
 #|         pass
-#| 
+#|
 #|     @abc.abstractmethod
 #|     def compute_sm_block_for_matrix(self, mat):
 #|         pass
-#| 
-#| 
+#|
+#|
 #| def cado_sage_maps_from_ab_parallel(inputs):
 #|     (a, b, e, alpha_pkl, sm_maps_pkl) = inputs
 #|     alpha = SageUnpickler.loads(alpha_pkl)
@@ -8350,14 +8540,14 @@ if __name__ == "__main__":
 #|     return vector(Integers(e),
 #|                   sum([s(a-b*alpha).list() for s in sm_maps], [])
 #|                   )
-#| 
-#| 
+#|
+#|
 #| class SchirokauerMapsAppender_cado_sage(SchirokauerMapsAppender):
 #|     def _maps_from_ab(self, a, b):
 #|         return vector(self.Ze,
 #|                       sum([s(a-b*self.alpha).list() for s in self.sm_maps], [])
 #|                       )
-#| 
+#|
 #|     def __init__(self, params):
 #|         super().__init__(params)
 #|         self.K = params.poly.K[1]
@@ -8366,76 +8556,76 @@ if __name__ == "__main__":
 #|         self.sm_maps = self.Kw.schirokauer_maps(self.e)
 #|         self.nthr = params.parameters.get('sm_append.thr', multiprocessing.cpu_count())
 #|         self.e = params.parameters['e']
-#| 
+#|
 #|     @timing
 #|     def compute_sm_block_for_matrix(self, mat):
 #|         """
 #|         Form the block of Schirokauer map values that we're going to paste
 #|         into the matrix.
 #|         """
-#| 
+#|
 #|         # This uses the mat.ab_per_row() interface, which can actually
 #|         # return stuff that is more complicated than the 1-1 mapping that
 #|         # we have in a LinearAlgebraMatrix_IndexedFileOnly object.
-#| 
+#|
 #|         # precompute sm maps for all a,b, in case some a,b appear several
 #|         # times.
-#| 
+#|
 #|         timeprint("Starting compute_sm_block_for_matrix")
-#| 
+#|
 #|         try:
 #|             import mr4mp
 #|             all_ab = mr4mp.pool().mapreduce(get_dict_keyset, fast_union, list(mat.ab_per_row(self.params)))
 #|         except ModuleNotFoundError:
 #|             timeprint("WARNING: Install Python package 'mr4mp' for faster mapreduce operation")
 #|             all_ab = functools.reduce(set.union, [R.keys() for R in mat.ab_per_row(self.params)], set())
-#| 
+#|
 #|         #all_ab = functools.reduce(set.union, [R.keys() for R in mat.ab_per_row(self.params)], set())
-#| 
+#|
 #|         timeprint("Finished making all_ab set")
-#| 
+#|
 #|         pool = multiprocessing.Pool(processes=self.nthr)
 #|         all_inputs = []
-#| 
+#|
 #|         DO_PARALLEL_CADO_SAGE = False
 #|         DO_SLURM_CADO_SAGE = True
-#| 
+#|
 #|         if DO_PARALLEL_CADO_SAGE:
 #|             for (a,b) in all_ab:
 #|                 all_inputs.append(
 #|                     (a, b, self.e, SagePickler.dumps(self.alpha), SagePickler.dumps(self.sm_maps))
 #|                 )
 #|             res = pool.map(cado_sage_maps_from_ab_parallel, all_inputs)
-#| 
+#|
 #|             D = { (all_inputs[i][0], all_inputs[i][1]) : res[i] for i in range(len(all_inputs)) }
-#| 
+#|
 #|         elif DO_SLURM_CADO_SAGE:
 #|             timeprint("starting slurm allocations")
-#| 
+#|
 #|             all_ab_list = list(all_ab)
 #|             job_line_to_ab = dict()
-#| 
+#|
 #|             numjobs = int(self.params.parameters['slurm.numjobs'])
 #|             ab_per_job = ceil( len(all_ab) / numjobs)
-#| 
+#|
 #|             timeprint("ab_per_job", str(ab_per_job))
-#| 
+#|
 #|             processes = []
-#| 
+#|
 #|             for j in range(numjobs):
 #|                 infile = f"{self.params.dirs['TEMP_OUTPUT_DIR']}sm/abs.job{j}.in"
 #|                 outfile = f"{self.params.dirs['TEMP_OUTPUT_DIR']}sm/abs.job{j}.out"
 #|                 jobname = f"sm-768-{j}"
-#| 
+#|
 #|                 linenum = 0
-#| 
+#|
 #|                 with open(infile, "w") as abfile:
 #|                     for i in range( j*ab_per_job, min( (j+1)*ab_per_job, len(all_ab) ) ):
 #|                         (a,b) = all_ab_list[i]
 #|                         job_line_to_ab[(j,linenum)] = (a,b)
 #|                         abfile.write(f"{a},{b}\n")
 #|                         linenum += 1
-#| 
+#|
 #|                 command_list = [
 #|                     self.params.files['SAGE'],
 #|                     "sm_cado_sage_helper.py",
@@ -8445,15 +8635,15 @@ if __name__ == "__main__":
 #|                     "--poly", self.params.files['POLYFILE']
 #|                 ]
 #|                 processes.append(slurmit(self.params, " ".join(command_list), jobname, j))
-#| 
+#|
 #|             finished_processes, cputime_slurm = slurm_wait(processes)
 #|             overall_cputime.add(cputime_slurm)
-#| 
+#|
 #|             D = dict()
-#| 
+#|
 #|             for j in range(numjobs):
 #|                 outfile = f"{self.params.dirs['TEMP_OUTPUT_DIR']}sm/abs.job{j}.out"
-#| 
+#|
 #|                 with open(outfile, "r") as smfile:
 #|                     i = 0
 #|                     for line in smfile.readlines():
@@ -8461,16 +8651,16 @@ if __name__ == "__main__":
 #|                         a,b = job_line_to_ab[(j,i)]
 #|                         D[(a,b)] = vector(self.Ze, line.split(","))
 #|                         i += 1
-#| 
+#|
 #|         else:
 #|             D = { (a,b):self._maps_from_ab(a, b) for (a,b) in all_ab }
-#| 
+#|
 #|         timeprint("Finished constructing cado_sage dictionary D. Now making the matrix to return.")
-#| 
+#|
 #|         return matrix(self.Ze, [
 #|             sum([D[a, b] * k for (a,b),k in R.items()])
 #|             for R in mat.ab_per_row(self.params)])
-#| 
+#|
 #|     @timing
 #|     def maps_from_more_ab(self, ab_pairs):
 #|         """
@@ -8479,17 +8669,17 @@ if __name__ == "__main__":
 #|         file AQRELS_INDEXED
 #|         """
 #|         return { x: self._maps_from_ab(*x) for x in ab_pairs }
-#| 
-#| 
+#|
+#|
 #| class SchirokauerMapsAppender_sm_simple(SchirokauerMapsAppender):
 #|     def __init__(self, params):
 #|         super().__init__(params)
-#| 
-#| 
+#|
+#|
 #|     def _call_sm_simple(self, inputname):
-#| 
+#|
 #|         outputname = inputname + ".sm"
-#| 
+#|
 #|         CadoNFS("filter/sm_simple",
 #|                 "-ell", self.e,
 #|                 "-inp", 'IN',
@@ -8503,17 +8693,17 @@ if __name__ == "__main__":
 #|                 )
 #|         return [vector(self.Ze, line.strip().split()) for line in
 #|                 open(outputname).readlines()]
-#| 
+#|
 #|     @timing
 #|     def compute_sm_block_for_matrix(self, mat):
 #|         """
 #|         Form the block of Schirokauer map values that we're going to paste
 #|         into the matrix.
 #|         """
-#| 
+#|
 #|         # Each row of the matrix is for a linear combination of (a,b) pairs (because filtering)
 #|         # but filter/sm_simple wants as input one (a,b) pair per line.
-#| 
+#|
 #|         # Make a list of all (a,b) used in the filtered matrix, removing duplicates.
 #|         # Note that mat.ab_per_row() returns an iterator of {(a,b): coeff} dicts, one per row of mat.
 #|         all_ab = functools.reduce(set.union, [R.keys() for R in mat.ab_per_row(self.params)], set())
@@ -8527,23 +8717,23 @@ if __name__ == "__main__":
 #|                 print(f"{a},{b}", file=fw)
 #|         block_unfiltered = matrix(self.Ze, self._call_sm_simple(aqrels_decimal_filename))
 #|         # Now the characters for (a,b) are row (ab_to_line[(a,b)]) of block_unfiltered
-#| 
+#|
 #|         return matrix(self.Ze, [
 #|             sum([block_unfiltered[ab_to_line[(a, b)]] * k for (a,b),k in R.items()])
 #|             for R in mat.ab_per_row(self.params)
 #|         ])
-#| 
+#|
 #|     @timing
 #|     def maps_from_more_ab(self, ab_pairs):
 #|         tmp = self.params.dirs['TEMP_OUTPUT_DIR']
 #|         with tempfile.NamedTemporaryFile(dir=tmp, mode="w") as f:
 #|             for a,b in ab_pairs:
 #|                 print(f"{a},{b}", file=f.file)
-#| 
+#|
 #|             f.flush()
 #|             sms = self._call_sm_simple(f.name)
 #|             return { (a,b):s for (a,b),s in zip(ab_pairs, sms) }
-#| 
+#|
 #| def parse_sm_append_lines_to_vector(args):
 #|     Ze, lines = args
 #|     vectors = []
@@ -8552,19 +8742,19 @@ if __name__ == "__main__":
 #|         if not line.startswith('#'):
 #|             vectors.append(vector(Ze, line.strip().split(':')[1].split(',')))
 #|     return vectors
-#| 
+#|
 #| class SchirokauerMapsAppender_sm_append(SchirokauerMapsAppender):
 #|     def __init__(self, params):
 #|         super().__init__(params)
-#| 
-#| 
+#|
+#|
 #|     def _call_sm_append(self, inputname):
 #|         outputname = inputname + ".withsm"
-#| 
+#|
 #|         nsm = []
 #|         if nc := self.params.parameters.get('num_character_columns'):
 #|             nsm = ["-nsm", f"0,{nc}"]
-#| 
+#|
 #|         sm_append_mpi_exec = []
 #|         sm_append_add_args = []
 #|         if self.params.mpi:
@@ -8577,7 +8767,7 @@ if __name__ == "__main__":
 #|             sm_append_add_args = [
 #|                 "-t", sm_append_thr
 #|             ]
-#| 
+#|
 #|         CadoNFS("filter/sm_append",
 #|                 "-ell", self.e,
 #|                 "-in", 'IN',
@@ -8592,7 +8782,7 @@ if __name__ == "__main__":
 #|                     'IN': inputname,
 #|                     'POLY': self.params.files['POLYFILE'],
 #|                     })
-#| 
+#|
 #|         if self.params.nthreads > 1:
 #|             timeprint(f"loading {outputname} into memory")
 #|             with open(outputname, mode="r", encoding="ascii") as output_fp:
@@ -8607,7 +8797,7 @@ if __name__ == "__main__":
 #|                             break
 #|                         output_lines.append(line)
 #|                     timeprint(f"Finished splitting {outputname} into lines.")
-#| 
+#|
 #|                 vectors = []
 #|                 with ProcessPoolExecutor(max_workers=self.params.nthreads) as executor:
 #|                     batch_size = math.ceil(l / self.params.nthreads)
@@ -8620,19 +8810,19 @@ if __name__ == "__main__":
 #|             return [vector(self.Ze, line.strip().split(':')[1].split(','))
 #|                     for line in open(outputname).readlines()
 #|                     if not line.startswith('#')]
-#| 
+#|
 #|     @timing
 #|     def compute_sm_block_for_matrix(self, mat):
 #|         """
 #|         Form the block of Schirokauer map values that we're going to paste
 #|         into the matrix.
 #|         """
-#| 
+#|
 #|         # Each row of the matrix is for a linear combination of (a,b) pairs (because filtering)
 #|         # but filter/sm_append wants as input one (a,b) pair per line.
-#| 
+#|
 #|         timeprint("Making list of all (a,b)'s used")
-#| 
+#|
 #|         # Make a list of all (a,b) used in the filtered matrix, removing duplicates.
 #|         # Note that mat.ab_per_row() returns an iterator of {(a,b): coeff} dicts, one per row of mat.
 #|         try:
@@ -8641,7 +8831,7 @@ if __name__ == "__main__":
 #|         except ModuleNotFoundError:
 #|             timeprint("WARNING: Install Python package 'mr4mp' for faster mapreduce operation")
 #|             all_ab = functools.reduce(set.union, [R.keys() for R in mat.ab_per_row(self.params)], set())
-#| 
+#|
 #|         # Write to a file, and remember which (a,b) are on which line
 #|         base = mat.indexed_relations_filename(self.params)
 #|         abpairs_for_sm_filename = base + ".forsm"
@@ -8651,22 +8841,22 @@ if __name__ == "__main__":
 #|         with open(abpairs_for_sm_filename, "w") as fw:
 #|             for (lineno, (a,b)) in enumerate(all_ab):
 #|                 ab_to_line[(a,b)] = lineno
-#| 
+#|
 #|                 #if Integer(a).nbits() >= 64 or Integer(b).nbits() >= 64:
 #|                 #    raise RuntimeError(f"Large a,b passed to matrix sm_append: {a}, {b}")
-#| 
+#|
 #|                 print(f"{a:x},{b:x}", file=fw)
-#| 
+#|
 #|         timeprint("Calling sm_append")
 #|         block_unfiltered = matrix(self.Ze, self._call_sm_append(abpairs_for_sm_filename))
 #|         # Now the characters for (a,b) are row (ab_to_line[(a,b)]) of block_unfiltered
-#| 
+#|
 #|         timeprint("Recovering sm block with a matrix multiplication")
 #|         return matrix(self.Ze, [
 #|             sum([block_unfiltered[ab_to_line[(a, b)]] * k for (a,b),k in R.items()])
 #|             for R in mat.ab_per_row(self.params)
 #|         ])
-#| 
+#|
 #|     @timing
 #|     def maps_from_more_ab(self, ab_pairs):
 #|         """
@@ -8678,27 +8868,27 @@ if __name__ == "__main__":
 #|             for a,b in ab_pairs:
 #|                 #if Integer(a).nbits() >= 64 or Integer(b).nbits() >= 64:
 #|                 #    raise RuntimeError(f"Large a,b passed to sm_append: {a}, {b}")
-#| 
+#|
 #|                 print(f"{a:x},{b:x}", file=f)
-#| 
+#|
 #|             f.file.flush()
 #|             sms = self._call_sm_append(f.name)
 #|             return { (a,b):s for (a,b),s in zip(ab_pairs, sms) }
-#| 
+#|
 #| @timing
 #| def make_linalg_system(params, matrix, ST_list, ST_alg_vector):
 #|     # We have several options for the computation of the Schirokauer maps
 #|     # block that goes in the matrix. Here, the cado_sage method has
 #|     # higher priority because it works more generally.
-#| 
+#|
 #|     timeprint("Starting make_linalg_system")
-#| 
+#|
 #|     compute_sm_method = {
 #|         'sm_simple': SchirokauerMapsAppender_sm_simple,
 #|         'sm_append': SchirokauerMapsAppender_sm_append,
 #|         'cado_sage': SchirokauerMapsAppender_cado_sage,
 #|     }
-#| 
+#|
 #|     # starttime = time.time()
 #|     # sm_simple_init = SchirokauerMapsAppender_sm_simple(params)
 #|     # endtime = time.time()
@@ -8714,20 +8904,20 @@ if __name__ == "__main__":
 #|     # endtime = time.time()
 #|     # print("cado_sage_init took",endtime-starttime)
 #|     # params.timing["cado_sage_init"] = endtime-starttime
-#| 
+#|
 #|     # compute_sm_flags = {
 #|     #     'sm_simple': sm_simple_init,
 #|     #     'sm_append': sm_append_init,
 #|     #     'cado_sage': cado_sage_init
 #|     # }
-#| 
+#|
 #|     timeprint("Starting sm_init")
 #|     starttime = time.time()
 #|     compute_sm_flags = {params.sm_alg: compute_sm_method[params.sm_alg](params)}
 #|     endtime = time.time()
 #|     timeprint("Finished sm_init")
 #|     params.timing["sm_init"] = endtime-starttime
-#| 
+#|
 #|     MC_saved_file = params.dirs['TEMP_OUTPUT_DIR']+"MC.sobj"
 #|     S_block_saved_file = params.dirs['TEMP_OUTPUT_DIR']+"S_block.sobj"
 #|     if os.path.exists(MC_saved_file) and os.path.exists(S_block_saved_file) and (not params.overwrite_MC):
@@ -8737,16 +8927,16 @@ if __name__ == "__main__":
 #|         write_matrix = False
 #|     else:
 #|         write_matrix = True
-#| 
+#|
 #|     variants = dict()
-#| 
+#|
 #|     #ST_list_ab_small = [
 #|     #    (a,b) for (a,b) in ST_list.keys() if Integer(a).nbits() < 64 and Integer(b).nbits() < 64
 #|     #]
 #|     #ST_list_ab_big = [
 #|     #    (a,b) for (a,b) in ST_list.keys() #if Integer(a).nbits() >= 64 or Integer(b).nbits() >= 64
 #|     #]
-#| 
+#|
 #|     timeprint("Starting compute_sm_block")
 #|     for method, APP in compute_sm_flags.items():
 #|         if write_matrix:
@@ -8754,29 +8944,29 @@ if __name__ == "__main__":
 #|         else:
 #|             major_message("Loading existing S_block from file.")
 #|             S_block = fast_persistent_load(S_block_saved_file)
-#| 
+#|
 #|         D = APP.maps_from_more_ab(ST_list.keys())
-#| 
+#|
 #|         # OLD DEBUGGING:
 #|         #D = APP.maps_from_more_ab(ST_list_ab_small)
 #|         #D = dict()
 #|         #timeprint("Finished the ST_list_ab_small")
 #|         #timeprint("Starting the ST_list_ab_big")
-#| 
+#|
 #|         #K = params.poly.K[1]
 #|         #alpha = K.gen()
 #|         #Kw = params.poly.nt[1]
 #|         #sm_maps = Kw.schirokauer_maps(params.parameters['e'])
-#| 
+#|
 #|         #print("Len of sm_maps", str(len(sm_maps)))
-#| 
+#|
 #|         #for (big_a, big_b) in ST_list_ab_big:
 #|         #    print("Handling a big a,b...")
 #|         #    vv = vector(Integers(params.parameters['e']),
 #|         #                sum([s(big_a-big_b*alpha).list() for s in sm_maps], [])
 #|         #                )
 #|         #    D[(big_a,big_b)] = vv
-#| 
+#|
 #|         starttime = time.time()
 #|         C_block = sum([m * D[a,b] for (a,b),m in ST_list.items()])
 #|         endtime = time.time()
@@ -8784,13 +8974,13 @@ if __name__ == "__main__":
 #|         timeprint("C_block took",endtime-starttime)
 #|         variants[method] = (S_block, C_block)
 #|     timeprint("Finished compute_sm_block")
-#| 
+#|
 #|     for method, (S_block, C_block) in variants.items():
 #|         timeprint(f"S block computed by {method}:",
 #|                   f"{S_block.nrows()}x{S_block.ncols()}")
 #|         timeprint(f"C block computed by {method}:",
 #|                   f"{len(C_block)}")
-#| 
+#|
 #|     starttime = time.time()
 #|     all_variants = list(variants.items())
 #|     for i in range(len(all_variants)):
@@ -8811,30 +9001,30 @@ if __name__ == "__main__":
 #|                     tail = f' (but they agree on the first {c} coordinates)'
 #|                 warning_message(f"vector C_block computed by {k} differs from",
 #|                                 f"the one computed by {k0}" + tail)
-#| 
+#|
 #| #    S_block, C_block =  variants['cado_sage']
 #|     S_block, C_block = variants[params.sm_alg]
 #| #    endtime = time.time()
 #| #    params.timing['variants'] = endtime-starttime
 #| #    print("variants took",endtime-starttime)
-#| 
+#|
 #|     timeprint(f"M: {matrix.nrows} x {matrix.ncols}")
 #|     timeprint(f"S_block: {S_block.nrows()} x {S_block.ncols()}")
-#| 
+#|
 #|     timeprint(type(matrix.matrix()))
 #|     timeprint(type(S_block))
 #|     timeprint(type(C_block))
 #|     timeprint(repr(matrix.matrix()))
 #|     timeprint(repr(S_block))
 #|     timeprint(repr(C_block))
-#| 
+#|
 #|     if write_matrix:
 #|         starttime = time.time()
-#| 
+#|
 #|         S_block_ZZ = S_block.change_ring(ZZ)
 #|         timeprint("type of S_block_ZZ", str(type(S_block_ZZ)))
 #|         timeprint(repr(S_block_ZZ))
-#| 
+#|
 #|         if params.scipy_matrix:
 #|             # No need to make MC at this moment.
 #|             # We will get it later as M || S_block_ZZ
@@ -8842,7 +9032,7 @@ if __name__ == "__main__":
 #|             MC = MC_wrapper(matrix.matrix().nrows(), matrix.matrix().ncols() + S_block_ZZ.ncols())
 #|         else:
 #|             MC = block_matrix(1, 2, [ matrix.matrix(), S_block_ZZ ], sparse=True)
-#| 
+#|
 #|         endtime = time.time()
 #|         params.timing['block_matrix'] = endtime-starttime
 #|         timeprint("block_matrix took", endtime-starttime)
@@ -8850,9 +9040,9 @@ if __name__ == "__main__":
 #|     else:
 #|         major_message("Loading existing MC from file.")
 #|         MC = fast_persistent_load(MC_saved_file)
-#| 
+#|
 #|     timeprint(f"ST_alg_vector: {len(ST_alg_vector)}")
-#| 
+#|
 #|     starttime = time.time()
 #|     assert ST_alg_vector.is_sparse()
 #|     SC_vector = vector(matrix.base_ring(),
@@ -8863,37 +9053,37 @@ if __name__ == "__main__":
 #|     endtime = time.time()
 #|     params.timing['SC_vector'] = endtime-starttime
 #|     timeprint("SC_vector took", endtime-starttime)
-#| 
+#|
 #|     timeprint(f"SC_vector: {len(SC_vector)}")
-#| 
+#|
 #|     return MC, SC_vector, S_block, C_block
-#| 
+#|
 #| @timing
 #| def build_killer_rels_dict(params, MM):
 #|     num_og_prime_ideals = params.R.number_of_fb_valuations(params.BOUNDA_queries)
-#| 
+#|
 #|     killers = { i:None for i in MM.column_shrink_map().keys() }
 #|     indexed_relations_file = params.files['AQRELS_FILE'] + ".indexed"
 #|     purged_file            = indexed_relations_file + ".purged"
 #|     relsdel_file           = indexed_relations_file + ".relsdel"
 #|     unlinked = {i:None for i in range(num_og_prime_ideals) if (not params.R.column_to_renumber(i) in killers)}
-#| 
+#|
 #|     rels  = {(i.a, i.b): ([ c for c in i.indices if (not c in killers) and (params.R.renumber_to_column(c)>0) ],i)
 #|              for i in indexed_relations_from_file(relsdel_file) }
 #|     rels |= {(i.a, i.b): ([ c for c in i.indices if (not c in killers) and (params.R.renumber_to_column(c)>0) ],i)
 #|              for i in indexed_relations_from_file(purged_file) }
-#| 
+#|
 #|     still_cancelling = True
 #|     num_iters = 0
 #|     order_of_cancellation = []
-#| 
+#|
 #|     while still_cancelling:
 #|         timeprint(f"Still cancelling (iteration {num_iters})...")
 #|         timeprint(f"unknowns:  {num_og_prime_ideals - len(killers)}")
 #|         timeprint(f"num rels:  {len(rels)}")
 #|         still_cancelling = False
 #|         num_iters += 1
-#| 
+#|
 #|         drops = []
 #|         for ab,(r,rr) in rels.items():
 #|             # get the indices in o for which we don't have a killer rel yet.
@@ -8917,25 +9107,25 @@ if __name__ == "__main__":
 #|                 still_cancelling = True
 #|         for ab in drops:
 #|             del rels[ab]
-#| 
+#|
 #|         timeprint("Made progress?", still_cancelling)
-#| 
+#|
 #|     killers = {str(params.R.renumber_to_column(i)):str(k)
 #|                for i,k in killers.items()
 #|                if k is not None}
 #|     order_of_cancellation = list(reversed(order_of_cancellation))
-#| 
+#|
 #|     fast_json_dump(killers, params.files['KILLER_RELS_DICT'])
-#| 
+#|
 #|     fast_json_dump(order_of_cancellation, params.files['KILLER_RELS_ORDER'])
-#| 
+#|
 #|     num_unlinked = 0
 #|     with open(params.files['FILT_UNLINKED_IDEALS'], "w") as ul_file:
 #|         for col in unlinked.keys():
 #|             renum_index = params.R.column_to_renumber(col)
 #|             ul_file.write(str(renum_index) + "\n")
 #|             num_unlinked += 1
-#| 
+#|
 #|     with open(params.files['FILT_UNLINKED_TODOS'], "w") as todo_file:
 #|         for col in unlinked.keys():
 #|             ideal = params.R.side_and_index_to_ideal(1, col)
@@ -8944,16 +9134,16 @@ if __name__ == "__main__":
 #|                 major_message("Warning: a nonlinear todo q.")
 #|             else:
 #|                 print(f"0 {q} {rho}", file=todo_file)
-#| 
+#|
 #|     assert(num_unlinked == num_og_prime_ideals - len(killers) - len(MM.column_shrink_map()))
 #|     print(f"Unknowns at the end of build_killer_rels: {num_unlinked}")
-#| 
+#|
 #|     pct_unknown = round(100.0 * num_unlinked / num_og_prime_ideals, 10)
 #|     timeprint(f"That means, of ideals up to BOUNDA_queries, the percent unlinked is: {pct_unknown}")
-#| 
+#|
 #|     return killers, order_of_cancellation
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def update_collection_of_unlinked_ideals(params, which_ones):
 #|     # Make sure the UNLINKED_IDEALS file accurately reflects which ideals are
@@ -8963,24 +9153,24 @@ if __name__ == "__main__":
 #|     # For our purposes in this function unlinked ideals come from call_todo_sieving.
 #|     # If we are running this, build_killer_rels and filtering will happen again anyway.
 #|     # Yeah, this could be slow, so we shouldn't run it all the time.
-#| 
+#|
 #|     assert (which_ones in ['alg', 'ext'])
-#| 
+#|
 #|     R = params.R
-#| 
+#|
 #|     # TEMPORARY, just testing something.
 #|     print("R.rational_prime_to_prime_index(2)", R.rational_prime_to_prime_index(2))
 #|     print("R.rational_prime_to_prime_index(3)", R.rational_prime_to_prime_index(3))
 #|     print("R.rational_prime_to_prime_index(5)", R.rational_prime_to_prime_index(5))
 #|     print("R.rational_prime_to_prime_index(7)", R.rational_prime_to_prime_index(7))
-#| 
+#|
 #|     print("R.renumber_to_rational_prime_index(9)", R.renumber_to_rational_prime_index(9))
 #|     print("R.renumber_to_rational_prime_index(11)", R.renumber_to_rational_prime_index(11))
 #|     print("R.renumber_to_rational_prime_index(14)", R.renumber_to_rational_prime_index(14))
-#| 
+#|
 #|     for jj in range(0, 17):
 #|         print(f"R.renumber_to_column({jj})", R.renumber_to_column(jj))
-#| 
+#|
 #|     if which_ones == 'alg':
 #|         basefile = params.files['AQRELS_FILE']
 #|         outstanding_renumber_indices = set(
@@ -9001,21 +9191,21 @@ if __name__ == "__main__":
 #|             ])
 #|         ul_file = params.files['EXT_UNLINKED_IDEALS']
 #|         todo_file = params.files['EXT_UNLINKED_TODOS']
-#| 
+#|
 #|     num_total = len(outstanding_renumber_indices)
-#| 
+#|
 #|     for r in convert_to_indexed_relation(las_relations_from_file(basefile), params):
 #|         for ii in r.indices:
 #|             outstanding_renumber_indices -= {ii}
-#| 
+#|
 #|     n = 0
-#| 
+#|
 #|     # we do overwrite an existing UNLINKED_IDEALS file
 #|     with open(ul_file, "w") as f:
 #|         for ii in outstanding_renumber_indices:
 #|             f.write(str(ii) + "\n")
 #|             n += 1
-#| 
+#|
 #|     # also create a TODO file, in the {0 q rho} format
 #|     with open(todo_file, "w") as f:
 #|         for ii in outstanding_renumber_indices:
@@ -9025,30 +9215,30 @@ if __name__ == "__main__":
 #|                 major_message("Warning: a nonlinear todo q.")
 #|             else:
 #|                 print(f"0 {q} {rho}", file=f)
-#| 
+#|
 #|     timeprint(f"Wrote {n} unlinked ideals to {ul_file}.")
 #|     pct_unlinked = round(100.0 * n / num_total, 10)
 #|     timeprint(f"The percent of unlinked {which_ones} ideals is: {pct_unlinked}")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def apply_filtering_to_target(params, M, MM, MC, SC_vector, killer_relations, order_of_cancellation):
 #|     num_character_cols = MC.ncols()-M.ncols()
 #|     len_tgt_full = len(SC_vector) - num_character_cols
 #|     tgt_full = [SC_vector[i] for i in range(len_tgt_full)]
-#| 
+#|
 #|     e = params.parameters['e']
 #|     #Kw = params.poly.nt[1]
 #|     #sm_maps = Kw.schirokauer_maps(e)
 #|     #K = params.poly.K[1]
 #|     #alpha = K.gen()
-#| 
+#|
 #|     sm_computer = {
 #|         'sm_simple': SchirokauerMapsAppender_sm_simple,
 #|         'sm_append': SchirokauerMapsAppender_sm_append,
 #|         'cado_sage': SchirokauerMapsAppender_cado_sage,
 #|     }[params.sm_alg](params)
-#| 
+#|
 #|     COMPUTE_SMS_ONE_AT_A_TIME = False
 #|     # If we compute the characters for killer relations all at once at the beginning,
 #|     # then we only invoke the (e.g.) sm_simple binary once, rather than once per killer rel.
@@ -9065,20 +9255,20 @@ if __name__ == "__main__":
 #|         killer_rel_ab_pairs = list(zip(killer_rel_a, killer_rel_b))
 #|         assert len(killer_rel_ab_pairs) == len(order_of_cancellation)
 #|         _a, _b = killer_rel_ab_pairs[0]
-#| 
+#|
 #|         maps_ab_start = time.time()
 #|         killer_rel_ab_sm_dict = sm_computer.maps_from_more_ab(killer_rel_ab_pairs)
 #|         params.timing["killer relations maps_from_more_ab"] = time.time() - maps_ab_start
-#| 
+#|
 #|     updated_characters = vector(Integers(e), num_character_cols)
 #|     # Start with the target characters, then iteratively update in agreement
 #|     # with the killer relations.
 #|     for i in range(num_character_cols):
 #|         updated_characters[i] = SC_vector[len_tgt_full + i]
 #|     assert(len_tgt_full + num_character_cols == len(SC_vector))
-#| 
+#|
 #|     saved_kr_rels = []
-#| 
+#|
 #|     for col_i in order_of_cancellation:
 #|         if tgt_full[col_i] == 0:
 #|             # No need to do anything here
@@ -9104,9 +9294,9 @@ if __name__ == "__main__":
 #|             assert(len(ab_sm_vector) == num_character_cols)
 #|             for jj in range(num_character_cols):
 #|                 updated_characters[jj] = updated_characters[jj] - coeff*ab_sm_vector[jj]
-#| 
+#|
 #|     SC_vector_filtered = vector(MM.base_ring(), MC.ncols())
-#| 
+#|
 #|     for i in range(len(tgt_full)):
 #|         if tgt_full[i] == 0:
 #|             continue
@@ -9129,14 +9319,14 @@ if __name__ == "__main__":
 #|                                " however it is not linked to the others."
 #|                                " Too bad, really.")
 #|             exit(0)
-#| 
+#|
 #|     num_filtered_ideals = len(SC_vector_filtered) - num_character_cols
 #|     for j in range(num_character_cols):
 #|         SC_vector_filtered[num_filtered_ideals + j] = updated_characters[j]
-#| 
+#|
 #|     return SC_vector_filtered, saved_kr_rels
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def solve_filtering_plus_sage(params, M, MM, MC, SC_vector):
 #|     '''
@@ -9151,22 +9341,22 @@ if __name__ == "__main__":
 #|     num_character_cols = MC.ncols()-M.ncols()
 #|     len_tgt_full = len(SC_vector) - num_character_cols
 #|     e = params.parameters['e']
-#| 
+#|
 #|     #killer_relations, order_of_cancellation = build_killer_rels_dict(params, MM, len_tgt_full)
-#| 
+#|
 #|     killer_relations = fast_json_load(params.files['KILLER_RELS_DICT'])
 #|     order_of_cancellation = fast_json_load(params.files['KILLER_RELS_ORDER'])
-#| 
+#|
 #|     SC_vector_filtered, saved_kr_rels = apply_filtering_to_target(
 #|         params, M, MM, MC, SC_vector, killer_relations, order_of_cancellation
 #|     )
-#| 
+#|
 #|     # At this point, killer_relations should have all our necessary info.
 #|     # We go in the order of order_of_cancellation, where the first item in the list
 #|     # was the most recently cancelled. That is, we can write the ideal at index i
 #|     # in terms of ideals at indices from i+1 on.
 #|     # The surviving ideals should never show up in order_of_cancellation.
-#| 
+#|
 #|     timeprint("Updated target! Created SC_vector_filtered.")
 #|     # print("Number of ideals that survived filtering is " + str(num_filtered_ideals))
 #|     timeprint("The SC filtered vector is of length " + str(len(SC_vector_filtered)))
@@ -9174,13 +9364,13 @@ if __name__ == "__main__":
 #|     assert(M.nrows()==len(sol_filtered))
 #|     assert sol_filtered * MC == SC_vector_filtered
 #|     timeprint("Solved the filtered linalg system using sage.")
-#| 
-#| 
+#|
+#|
 #|     row_to_aquery = MM.row_to_aquery
 #|     ab_per_row = MM.ab_per_row(params)
-#| 
+#|
 #|     aquery_to_row = {q:r for r,q in enumerate(row_to_aquery)}
-#| 
+#|
 #|     sol = vector(Integers(e), len(row_to_aquery))
 #|     for row_in_filtered_M, (coeff, abs) in enumerate(zip(sol_filtered, ab_per_row)):
 #|         for ab in abs.keys():
@@ -9189,19 +9379,19 @@ if __name__ == "__main__":
 #|             b = ab[1]
 #|             row_in_og_M = aquery_to_row[(a,b)]
 #|             sol[row_in_og_M] += (c * coeff)
-#| 
+#|
 #|     for (coeff, killer_rel) in saved_kr_rels:
 #|         a = int(killer_rel.split(":")[0].split(",")[0], 16)
 #|         b = int(killer_rel.split(":")[0].split(",")[1], 16)
 #|         r = aquery_to_row[(a,b)]
 #|         sol[r] += coeff
-#| 
+#|
 #|     return sol
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def run_linalg_nobwc(params, use_target_info_file):
-#| 
+#|
 #|     timeprint("Loading LinearAlgebraMatrix_Filtered...")
 #|     indexed_relations_file = params.files['AQRELS_FILE'] + ".indexed"
 #|     purged_file = indexed_relations_file + ".purged"
@@ -9214,24 +9404,24 @@ if __name__ == "__main__":
 #|                                       ideals_file, index_file,
 #|                                       matrix_file)
 #|     timeprint("Finished loading LinearAlgebraMatrix_Filtered.")
-#| 
+#|
 #|     target_info = json.load(open(use_target_info_file))
 #|     seed_ten = str(target_info['seed'])[:10]
-#| 
+#|
 #|     M = MM.matrix()
-#| 
+#|
 #|     u = ZZ(target_info['u'])
 #|     v = ZZ(target_info['v'])
 #|     uv_fac = get_uv_fac(u, v, target_info)
-#| 
+#|
 #|     DRELS_FILE = target_info['DRELS_FILE']
 #|     DRELS_INDEXED = DRELS_FILE + ".cond.indexed"
-#| 
+#|
 #|     if 'n1024' in params.files['RENUMBERFILE']:
 #|         partial_R=True
 #|     else:
 #|         partial_R=False
-#| 
+#|
 #|     timeprint("Start make_linalg_system")
 #|     S_list, S_alg_vector, S_rat_vector = construct_S(
 #|         params, DRELS_FILE, DRELS_INDEXED, u, v, already_indexed=False, partial_R=partial_R, uv_fac=uv_fac
@@ -9243,38 +9433,38 @@ if __name__ == "__main__":
 #|         params, MM, ST_list, ST_alg_vector
 #|     )
 #|     timeprint("Finished make_linalg_system")
-#| 
+#|
 #|     # Now we have all of M, MM, MC, SC_vector, S_block, C_block
-#| 
+#|
 #|     num_character_cols = MC.ncols()-M.ncols()
 #|     len_tgt_full = len(SC_vector) - num_character_cols
 #|     e = params.parameters['e']
-#| 
+#|
 #|     killer_relations = fast_json_load(params.files['KILLER_RELS_DICT'])
 #|     order_of_cancellation = fast_json_load(params.files['KILLER_RELS_ORDER'])
-#| 
+#|
 #|     SC_vector_filtered, saved_kr_rels = apply_filtering_to_target(
 #|         params, M, MM, MC, -SC_vector, killer_relations, order_of_cancellation
 #|     )
-#| 
+#|
 #|     SC_filtered_chars = SC_vector_filtered[-num_character_cols:]
 #|     SC_filtered_nochars = SC_vector_filtered[:-num_character_cols]
 #|     timeprint("Updated target! Created SC_vector_filtered.")
 #|     timeprint("The rhs vector is of length " + str(len(SC_filtered_nochars)))
-#| 
+#|
 #|     matrix_file = MM.get_matrix_file(params)
 #|     timeprint(f"Matrix file MM ({type(MM)}) is {matrix_file} of size {MM.nrows}x{MM.ncols}")
 #|     timeprint(f"Matrix MC ({type(MC)}) of size {MC.nrows()}x{MC.ncols()}")
 #|     timeprint(f"Matrix M ({type(M)}) of size {M.nrows()}x{M.ncols()}")
-#| 
+#|
 #|     assert(M.ncols()==len(SC_filtered_nochars))
 #|     FILES_DIR = params.dirs['TEMP_OUTPUT_DIR']
 #|     WORKDIR = os.path.join(FILES_DIR,"bwc/")
-#| 
+#|
 #|     bwc_mn = min(params.parameters['POLY_DEG']+1, num_character_cols+1)
 #|     if 'bwc.numsols' in params.parameters and int(params.parameters['bwc.numsols']) > bwc_mn:
 #|         bwc_mn = int(params.parameters['bwc.numsols'])
-#| 
+#|
 #|     timeprint("bwc completed! Starting some sage matrix multiplications.")
 #|     Ze = Integers(e)
 #|     start_makesolmatrix = time.time()
@@ -9282,28 +9472,28 @@ if __name__ == "__main__":
 #|     for j in range(bwc_mn):
 #|         with open(f"{WORKDIR}/K.sols{j}-{j+1}.0.txt",'r') as f:
 #|             sol_matrix_rows.append([int(line) for line in f])
-#| 
+#|
 #|     sol_matrix = matrix(Ze, sol_matrix_rows, sparse=True)
 #|     end_makesolmatrix = time.time()
-#| 
+#|
 #|     # The optimization only works if all occurring integers can be represented as float64
 #|     # (i.e., without losing precision).
 #|     # This is the case for all integers up to 2^53.
 #|     do_parallelized_mat_mult = (max(M.ncols(), S_block.ncols()) * e * e).bit_length() <= 53
-#| 
+#|
 #|     timeprint("do_parallelized_mat_mult", str(do_parallelized_mat_mult))
 #|     check_value = (max(M.ncols(), S_block.ncols()) * e * e).bit_length()
 #|     timeprint("check_value", str(check_value))
-#| 
+#|
 #|     # assert do_parallelized_mat_mult   # Fails but it may still be ok
 #|     assert params.scipy_matrix
-#| 
+#|
 #|     from sparse_dot_mkl import dot_product_mkl
 #|     import numpy as np
 #|     from scipy.sparse import csr_array, bmat
-#| 
+#|
 #|     timeprint("Use scipy and Intel MKL for parallelized sparse matrix multiplication (interpreting entries in Z(e) as float64 and reducing mod e later; the code ensures this precision is not an issue, i.e., all integers are < 2^53)")
-#| 
+#|
 #|     def convert_sparse_matrix_scipy_to_sage(R, m):
 #|         """
 #|         Convert scipy.sparse array to a sparse sage matrix *without*
@@ -9314,7 +9504,7 @@ if __name__ == "__main__":
 #|         m_coo = m.astype(int).tocoo()
 #|         row_col_val_dict = {(r, c): v for r, c, v in zip(m_coo.row, m_coo.col, m_coo.data)}
 #|         return matrix(R, *(m.shape), row_col_val_dict, sparse=True)
-#| 
+#|
 #|     def convert_sparse_matrix_sage_to_scipy(m, dtype):
 #|         """
 #|         Convert sparse sage matrix to scipy.sparse.csr_array *without*
@@ -9325,18 +9515,18 @@ if __name__ == "__main__":
 #|         """
 #|         m_dict = m.dict()
 #|         l = len(m_dict)
-#| 
+#|
 #|         rows = [None] * l
 #|         cols = [None] * l
 #|         data = [None] * l
 #|         i = 0
-#| 
+#|
 #|         if hasattr(m, "is_vector"):
 #|             shape = (1, m.degree())
 #|             r = 0
 #|         else:
 #|             shape = m.dimensions()
-#| 
+#|
 #|         for k, d in m_dict.items():
 #|             if hasattr(m, "is_vector"):
 #|                 c = k
@@ -9346,12 +9536,12 @@ if __name__ == "__main__":
 #|             cols[i] = c
 #|             data[i] = d
 #|             i += 1
-#| 
+#|
 #|         return csr_array((data, (rows, cols)), shape=shape, dtype=dtype)
-#| 
+#|
 #|     ### Time assert
 #|     start_assert = time.time()
-#| 
+#|
 #|     timeprint("Convert sparse sage matrices to scipy (sol_matrix, block_matrix = [[M], [SC_filtered_nochars]])")
 #|     timeprint("type of M", type(M))
 #|     sol_matrix_sc = convert_sparse_matrix_sage_to_scipy(sol_matrix, dtype=np.float64)
@@ -9365,13 +9555,13 @@ if __name__ == "__main__":
 #|         [M_sc],
 #|         [SC_filtered_nochars_sc]
 #|     ])
-#| 
+#|
 #|     timeprint("Multiply sol_matrix * block_matrix = sol_times_filtered_nochars")
 #|     sol_times_filtered_nochars_sc = dot_product_mkl(sol_matrix_sc, block_matrix_filtered_nochars_sc)
 #|     sol_times_filtered_nochars = convert_sparse_matrix_scipy_to_sage(Ze, sol_times_filtered_nochars_sc)
 #|     assert sol_times_filtered_nochars.is_zero()
 #|     end_assert = time.time()
-#| 
+#|
 #|     ### Time matonright
 #|     start_matonright = time.time()
 #|     timeprint("Convert sparse sage matrices to scipy (block_matrix_2 = [[S_block], [SC_filtered_chars]])")
@@ -9381,18 +9571,18 @@ if __name__ == "__main__":
 #|         [S_block_sc],
 #|         [SC_filtered_chars_sc]
 #|     ])
-#| 
+#|
 #|     timeprint("Multiply sol_matrix * block_matrix_2 = small_matrix_on_the_right")
 #|     small_matrix_on_the_right_sc = dot_product_mkl(sol_matrix_sc, block_matrix_filtered_chars_sc)
 #|     small_matrix_on_the_right = convert_sparse_matrix_scipy_to_sage(Ze, small_matrix_on_the_right_sc)
 #|     end_matonright = time.time()
-#| 
+#|
 #|     params.timing["making sol_matrix"] = end_makesolmatrix - start_makesolmatrix
 #|     params.timing["assert sol_matrix"] = end_assert - start_assert
 #|     params.timing["small_matrix_on_the_right"] = end_matonright-start_matonright
-#| 
+#|
 #|     timeprint(f"found sol_matrix, {sol_matrix.nrows()}x{sol_matrix.ncols()}")
-#| 
+#|
 #|     # At this point, SC_filtered_chars is the target characters.  We need
 #|     # to compute the characters for each of the rows in the sol_matrix.
 #|     # Then, some combination of sol_matrix should give us
@@ -9400,7 +9590,7 @@ if __name__ == "__main__":
 #|     # (something in the nullspace of M|t).  Recall also that S_block is
 #|     # the character portion of the matrix.  C_block we totally ignore,
 #|     # since that is from the pre-filtered target vector.
-#| 
+#|
 #|     # First get the left nullspace of small_matrix_on_the_right
 #|     second_solve = small_matrix_on_the_right
 #|     start_secondsolve = time.time()
@@ -9408,13 +9598,13 @@ if __name__ == "__main__":
 #|     end_secondsolve = time.time()
 #|     params.timing["second_solve.left_kernel"] = end_secondsolve-start_secondsolve
 #|     timeprint("Started the second solve!")
-#| 
+#|
 #|     timeprint("ns2 nrows = " + str(ns2.nrows()))
 #|     timeprint("ns2 ncols = " + str(ns2.ncols()))
-#| 
+#|
 #|     if ns2.nrows() == 0:
 #|         raise RuntimeError("Cannot solve the small linear system after bwc.")
-#| 
+#|
 #|     start_lastsolve = time.time()
 #|     # find a row combination that reaches -1 on the last coordinate
 #|     assert not (ns2 * sol_matrix[:,-1:]).is_zero(), "The last column of ns2*sol_matrix is zero, which (I think) means that no combination of the solutions bwc found to the non-character part of the matrix will be able to cancel out the target characters"
@@ -9422,31 +9612,31 @@ if __name__ == "__main__":
 #|     end_lastsolve = time.time()
 #|     params.timing["final solve_left"] = end_lastsolve-start_lastsolve
 #|     timeprint("Completed the final solve_left!")
-#| 
+#|
 #|     start_solf = time.time()
 #|     sol_f = combine * ns2 * sol_matrix[:,:-1]
-#| 
+#|
 #|     # This is the same assert that we have in solve_filtering_plus_sage.
 #|     # It must hold!
 #|     timeprint("type of sol_f:", str(type(sol_f)))
 #|     timeprint("type of MC:", str(type(MC)))
 #|     timeprint("type of SC_vector_filtered:", str(type(SC_vector_filtered)))
-#| 
+#|
 #|     def convert_sparse_vector_scipy_to_sage_dense(R, v):
 #|         v_coo = v.astype(int).tocoo()
 #|         row_col_val_dict = {(r, c): v for r, c, v in zip(v_coo.row, v_coo.col, v_coo.data)}
 #|         assert v.shape[0] == 1
 #|         v_len = v.shape[1]
 #|         v_s = vector(R, v_len)  # not sparse
-#| 
+#|
 #|         for k in row_col_val_dict.keys():
 #|             (r,c) = k
 #|             v = row_col_val_dict[k]
 #|             assert r == 0
 #|             v_s[c] = R(v)
-#| 
+#|
 #|         return v_s
-#| 
+#|
 #|     def convert_sage_dense_vector_to_scipy(v, dtype):
 #|         # vector is not sparse!
 #|         l = len(v)
@@ -9454,7 +9644,7 @@ if __name__ == "__main__":
 #|         cols = [None] * l
 #|         data = [None] * l
 #|         i = 0
-#| 
+#|
 #|         for c in range(len(v)):
 #|             r = 0
 #|             d = int(v[c])
@@ -9462,9 +9652,9 @@ if __name__ == "__main__":
 #|             cols[i] = c
 #|             data[i] = d
 #|             i += 1
-#| 
+#|
 #|         return csr_array((data, (rows, cols)), shape=(1,len(v)), dtype=dtype)
-#| 
+#|
 #|     sol_f_scipy = convert_sage_dense_vector_to_scipy(sol_f, dtype=np.float64)
 #|     M_scipy = M.scipy_M()
 #|     S_block_scipy = convert_sparse_matrix_sage_to_scipy(S_block, dtype=np.float64)
@@ -9475,19 +9665,19 @@ if __name__ == "__main__":
 #|     ]])
 #|     leftside_scipy = dot_product_mkl(sol_f_scipy, MC_scipy)
 #|     leftside_sage = convert_sparse_vector_scipy_to_sage_dense(Ze, leftside_scipy)
-#| 
+#|
 #|     timeprint("type of leftside_sage", str(type(leftside_sage)))
 #|     timeprint("type of SC_vector_filtered", str(type(SC_vector_filtered)))
 #|     assert leftside_sage == SC_vector_filtered
-#| 
+#|
 #|     end_solf = time.time()
 #|     params.timing["sol_f computations"] = end_solf-start_solf
-#| 
+#|
 #|     start_filtering = time.time()
 #|     row_to_aquery = MM.row_to_aquery
 #|     ab_per_row = MM.ab_per_row(params)
 #|     aquery_to_row = {q:r for r,q in enumerate(row_to_aquery)}
-#| 
+#|
 #|     sol = vector(Integers(e), len(row_to_aquery))
 #|     for row_in_filtered_M, (coeff, abs) in enumerate(zip(sol_f, ab_per_row)):
 #|         for ab in abs.keys():
@@ -9496,16 +9686,16 @@ if __name__ == "__main__":
 #|             b = ab[1]
 #|             row_in_og_M = aquery_to_row[(a,b)]
 #|             sol[row_in_og_M] += (c * coeff)
-#| 
+#|
 #|     for (coeff, killer_rel) in saved_kr_rels:
 #|         a = int(killer_rel.split(":")[0].split(",")[0], 16)
 #|         b = int(killer_rel.split(":")[0].split(",")[1], 16)
 #|         r = aquery_to_row[(a,b)]
 #|         sol[r] += coeff
-#| 
+#|
 #|     end_filtering = time.time()
 #|     params.timing["recover sol from sol_f"] = end_filtering - start_filtering
-#| 
+#|
 #|     # save stuff to files, not sure if these are all small enough...
 #|     sol_sparse = sol.sparse_vector()
 #|     fast_persistent_save(sol_sparse, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-sol_sparse.sobj")
@@ -9514,24 +9704,24 @@ if __name__ == "__main__":
 #|     fast_persistent_save(T_list, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-T_list.sobj")
 #|     fast_persistent_save(ST_alg_vector, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-ST_alg_vector.sobj")
 #|     fast_persistent_save(S_rat_vector, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-S_rat_vector.sobj")
-#| 
+#|
 #|     toreturn = LinalgOutput(sol=sol_sparse, ST_list=ST_list, ST_alg_vector=ST_alg_vector, T_list=T_list, row_to_aquery=row_to_aquery, S_rat_vector=S_rat_vector, indexed_relations_file=indexed_relations_file)
-#| 
+#|
 #|     fast_persistent_save(toreturn, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-linalgoutput.sobj")
-#| 
+#|
 #|     run_sol_sanity_checks(params, sol, ST_alg_vector, indexed_relations_file)
 #|     timeprint("Found a solution! We have sol*M = ST mod e.")
-#| 
+#|
 #|     timeprint("Making indexed relations table-of-contents file...")
 #|     tocfile.maketoc(indexed_relations_file, indexed_relations_file + ".toc")
 #|     timeprint("Done making indexed relations table-of-contents file")
-#| 
+#|
 #|     return toreturn
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def run_linalg_nobwc_noairbags(params, use_target_info_file):
-#| 
+#|
 #|     timeprint("Loading LinearAlgebraMatrix_Filtered...")
 #|     indexed_relations_file = params.files['AQRELS_FILE'] + ".indexed"
 #|     purged_file = indexed_relations_file + ".purged"
@@ -9544,24 +9734,24 @@ if __name__ == "__main__":
 #|                                       ideals_file, index_file,
 #|                                       matrix_file)
 #|     timeprint("Finished loading LinearAlgebraMatrix_Filtered.")
-#| 
+#|
 #|     target_info = json.load(open(use_target_info_file))
 #|     seed_ten = str(target_info['seed'])[:10]
-#| 
+#|
 #|     M = MM.matrix()
-#| 
+#|
 #|     u = ZZ(target_info['u'])
 #|     v = ZZ(target_info['v'])
 #|     uv_fac = get_uv_fac(u, v, target_info)
-#| 
+#|
 #|     DRELS_FILE = target_info['DRELS_FILE']
 #|     DRELS_INDEXED = DRELS_FILE + ".cond.indexed"
-#| 
+#|
 #|     if 'n1024' in params.files['RENUMBERFILE']:
 #|         partial_R=True
 #|     else:
 #|         partial_R=False
-#| 
+#|
 #|     timeprint("Start make_linalg_system")
 #|     S_list, S_alg_vector, S_rat_vector = construct_S(
 #|         params, DRELS_FILE, DRELS_INDEXED, u, v, already_indexed=False, partial_R=partial_R, uv_fac=uv_fac
@@ -9573,38 +9763,38 @@ if __name__ == "__main__":
 #|         params, MM, ST_list, ST_alg_vector
 #|     )
 #|     timeprint("Finished make_linalg_system")
-#| 
+#|
 #|     # Now we have all of M, MM, MC, SC_vector, S_block, C_block
-#| 
+#|
 #|     num_character_cols = MC.ncols()-M.ncols()
 #|     len_tgt_full = len(SC_vector) - num_character_cols
 #|     e = params.parameters['e']
-#| 
+#|
 #|     killer_relations = fast_json_load(params.files['KILLER_RELS_DICT'])
 #|     order_of_cancellation = fast_json_load(params.files['KILLER_RELS_ORDER'])
-#| 
+#|
 #|     SC_vector_filtered, saved_kr_rels = apply_filtering_to_target(
 #|         params, M, MM, MC, -SC_vector, killer_relations, order_of_cancellation
 #|     )
-#| 
+#|
 #|     SC_filtered_chars = SC_vector_filtered[-num_character_cols:]
 #|     SC_filtered_nochars = SC_vector_filtered[:-num_character_cols]
 #|     timeprint("Updated target! Created SC_vector_filtered.")
 #|     timeprint("The rhs vector is of length " + str(len(SC_filtered_nochars)))
-#| 
+#|
 #|     matrix_file = MM.get_matrix_file(params)
 #|     timeprint(f"Matrix file MM ({type(MM)}) is {matrix_file} of size {MM.nrows}x{MM.ncols}")
 #|     timeprint(f"Matrix MC ({type(MC)}) of size {MC.nrows()}x{MC.ncols()}")
 #|     timeprint(f"Matrix M ({type(M)}) of size {M.nrows()}x{M.ncols()}")
-#| 
+#|
 #|     assert(M.ncols()==len(SC_filtered_nochars))
 #|     FILES_DIR = params.dirs['TEMP_OUTPUT_DIR']
 #|     WORKDIR = os.path.join(FILES_DIR,"bwc/")
-#| 
+#|
 #|     bwc_mn = min(params.parameters['POLY_DEG']+1, num_character_cols+1)
 #|     if 'bwc.numsols' in params.parameters and int(params.parameters['bwc.numsols']) > bwc_mn:
 #|         bwc_mn = int(params.parameters['bwc.numsols'])
-#| 
+#|
 #|     timeprint("bwc completed! Starting some sage matrix multiplications.")
 #|     Ze = Integers(e)
 #|     start_makesolmatrix = time.time()
@@ -9612,19 +9802,19 @@ if __name__ == "__main__":
 #|     for j in range(bwc_mn):
 #|         with open(f"{WORKDIR}/K.sols{j}-{j+1}.0.txt",'r') as f:
 #|             sol_matrix_rows.append([int(line) for line in f])
-#| 
+#|
 #|     sol_matrix = matrix(Ze, sol_matrix_rows, sparse=True)
 #|     end_makesolmatrix = time.time()
-#| 
+#|
 #|     start_matonright = time.time()
 #|     small_matrix_on_the_right = sol_matrix * block_matrix(2,1,[S_block,matrix([SC_filtered_chars])], sparse=True)
 #|     end_matonright = time.time()
-#| 
+#|
 #|     params.timing["making sol_matrix"] = end_makesolmatrix - start_makesolmatrix
 #|     params.timing["small_matrix_on_the_right"] = end_matonright-start_matonright
-#| 
+#|
 #|     timeprint(f"found sol_matrix, {sol_matrix.nrows()}x{sol_matrix.ncols()}")
-#| 
+#|
 #|     # At this point, SC_filtered_chars is the target characters.  We need
 #|     # to compute the characters for each of the rows in the sol_matrix.
 #|     # Then, some combination of sol_matrix should give us
@@ -9632,7 +9822,7 @@ if __name__ == "__main__":
 #|     # (something in the nullspace of M|t).  Recall also that S_block is
 #|     # the character portion of the matrix.  C_block we totally ignore,
 #|     # since that is from the pre-filtered target vector.
-#| 
+#|
 #|     # First get the left nullspace of small_matrix_on_the_right
 #|     second_solve = small_matrix_on_the_right
 #|     start_secondsolve = time.time()
@@ -9640,13 +9830,13 @@ if __name__ == "__main__":
 #|     end_secondsolve = time.time()
 #|     params.timing["second_solve.left_kernel"] = end_secondsolve-start_secondsolve
 #|     timeprint("Started the second solve!")
-#| 
+#|
 #|     timeprint("ns2 nrows = " + str(ns2.nrows()))
 #|     timeprint("ns2 ncols = " + str(ns2.ncols()))
-#| 
+#|
 #|     if ns2.nrows() == 0:
 #|         raise RuntimeError("Cannot solve the small linear system after bwc.")
-#| 
+#|
 #|     start_lastsolve = time.time()
 #|     # find a row combination that reaches -1 on the last coordinate
 #|     assert not (ns2 * sol_matrix[:,-1:]).is_zero(), "The last column of ns2*sol_matrix is zero, which (I think) means that no combination of the solutions bwc found to the non-character part of the matrix will be able to cancel out the target characters"
@@ -9654,17 +9844,17 @@ if __name__ == "__main__":
 #|     end_lastsolve = time.time()
 #|     params.timing["final solve_left"] = end_lastsolve-start_lastsolve
 #|     timeprint("Completed the final solve_left!")
-#| 
+#|
 #|     start_solf = time.time()
 #|     sol_f = combine * ns2 * sol_matrix[:,:-1]
 #|     end_solf = time.time()
 #|     params.timing["sol_f computations"] = end_solf-start_solf
-#| 
+#|
 #|     start_filtering = time.time()
 #|     row_to_aquery = MM.row_to_aquery
 #|     ab_per_row = MM.ab_per_row(params)
 #|     aquery_to_row = {q:r for r,q in enumerate(row_to_aquery)}
-#| 
+#|
 #|     sol = vector(Integers(e), len(row_to_aquery))
 #|     for row_in_filtered_M, (coeff, abs) in enumerate(zip(sol_f, ab_per_row)):
 #|         for ab in abs.keys():
@@ -9673,16 +9863,16 @@ if __name__ == "__main__":
 #|             b = ab[1]
 #|             row_in_og_M = aquery_to_row[(a,b)]
 #|             sol[row_in_og_M] += (c * coeff)
-#| 
+#|
 #|     for (coeff, killer_rel) in saved_kr_rels:
 #|         a = int(killer_rel.split(":")[0].split(",")[0], 16)
 #|         b = int(killer_rel.split(":")[0].split(",")[1], 16)
 #|         r = aquery_to_row[(a,b)]
 #|         sol[r] += coeff
-#| 
+#|
 #|     end_filtering = time.time()
 #|     params.timing["recover sol from sol_f"] = end_filtering - start_filtering
-#| 
+#|
 #|     # save stuff to files, not sure if these are all small enough...
 #|     sol_sparse = sol.sparse_vector()
 #|     fast_persistent_save(sol_sparse, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-sol_sparse.sobj")
@@ -9691,44 +9881,44 @@ if __name__ == "__main__":
 #|     fast_persistent_save(T_list, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-T_list.sobj")
 #|     fast_persistent_save(ST_alg_vector, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-ST_alg_vector.sobj")
 #|     fast_persistent_save(S_rat_vector, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-S_rat_vector.sobj")
-#| 
+#|
 #|     run_sol_sanity_checks(params, sol, ST_alg_vector, indexed_relations_file)
 #|     timeprint("Found a solution! We have sol*M = ST mod e.")
-#| 
+#|
 #|     timeprint("Making indexed relations table-of-contents file...")
 #|     tocfile.maketoc(indexed_relations_file, indexed_relations_file + ".toc")
 #|     timeprint("Done making indexed relations table-of-contents file")
-#| 
+#|
 #|     toreturn = LinalgOutput(sol=sol_sparse, ST_list=ST_list, ST_alg_vector=ST_alg_vector, T_list=T_list, row_to_aquery=row_to_aquery, S_rat_vector=S_rat_vector, indexed_relations_file=indexed_relations_file)
-#| 
+#|
 #|     fast_persistent_save(toreturn, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-linalgoutput.sobj")
-#| 
+#|
 #|     return toreturn
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def solve_filtering_plus_bwc(params, M, MM, MC, SC_vector, S_block, C_block, seed_ten=None):
 #|     # Notes: S_block is the character portion of the matrix. C_block is the
 #|     # character portion of the target vector, BEFORE filtering. The BWC-output
 #|     # matrix (the ...matrix.bin file) does NOT include character columns.
-#| 
+#|
 #|     num_character_cols = MC.ncols()-M.ncols()
 #|     len_tgt_full = len(SC_vector) - num_character_cols
 #|     e = params.parameters['e']
-#| 
+#|
 #|     #killer_relations, order_of_cancellation = build_killer_rels_dict(params, M, MM, MC, len_tgt_full)
-#| 
+#|
 #|     killer_relations = fast_json_load(params.files['KILLER_RELS_DICT'])
 #|     order_of_cancellation = fast_json_load(params.files['KILLER_RELS_ORDER'])
-#| 
+#|
 #|     if seed_ten is None:
 #|         seed_pfx = ""
 #|     else:
 #|         seed_pfx = seed_ten + "-"
-#| 
+#|
 #|     SC_vector_filtered_file = params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"SC_vector_filtered.sobj"
 #|     saved_kr_rels_file = params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"saved_kr_rels.sobj"
-#| 
+#|
 #|     if os.path.exists(SC_vector_filtered_file) and os.path.exists(saved_kr_rels_file):
 #|         SC_vector_filtered = fast_persistent_load(SC_vector_filtered_file)
 #|         saved_kr_rels = fast_persistent_load(saved_kr_rels_file)
@@ -9736,50 +9926,50 @@ if __name__ == "__main__":
 #|         SC_vector_filtered, saved_kr_rels = apply_filtering_to_target(
 #|             params, M, MM, MC, -SC_vector, killer_relations, order_of_cancellation
 #|         )
-#| 
+#|
 #|         if 'n1024' not in params.files['RENUMBERFILE']:
 #|             fast_persistent_save(SC_vector_filtered, params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"SC_vector_filtered.sobj")
 #|             fast_persistent_save(saved_kr_rels, params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"saved_kr_rels.sobj")
-#| 
+#|
 #|     # separate out character columns
 #|     SC_filtered_chars = SC_vector_filtered[-num_character_cols:]
 #|     SC_filtered_nochars = SC_vector_filtered[:-num_character_cols]
-#| 
+#|
 #|     timeprint("Updated target! Created SC_vector_filtered.")
 #|     timeprint("The rhs vector is of length " + str(len(SC_filtered_nochars)))
-#| 
+#|
 #|     matrix_file = MM.get_matrix_file(params)
 #|     timeprint(f"Matrix file MM ({type(MM)}) is {matrix_file} of size {MM.nrows}x{MM.ncols}")
 #|     timeprint(f"Matrix MC ({type(MC)}) of size {MC.nrows()}x{MC.ncols()}")
 #|     timeprint(f"Matrix M ({type(M)}) of size {M.nrows()}x{M.ncols()}")
 #|     vector_file = params.dirs['TEMP_OUTPUT_DIR'] + "tgt.ascii"
-#| 
+#|
 #|     start_writetgt = time.time()
 #|     assert(M.ncols()==len(SC_filtered_nochars))
 #|     write_ascii_vector(vector_file, SC_filtered_nochars, e)
 #|     end_writetgt = time.time()
 #|     params.timing["write_tgt_vector"] = end_writetgt-start_writetgt
-#| 
+#|
 #|     FILES_DIR = params.dirs['TEMP_OUTPUT_DIR']
 #|     WORKDIR = os.path.join(FILES_DIR,"bwc/")
 #|     e = int(params.parameters['e'])
 #|     Path(WORKDIR).mkdir(exist_ok=True)
 #|     make_and_clean(WORKDIR)
-#| 
+#|
 #|     bwc_mn = min(params.parameters['POLY_DEG']+1, num_character_cols+1)
 #|     if 'bwc.numsols' in params.parameters and int(params.parameters['bwc.numsols']) > bwc_mn:
 #|         bwc_mn = int(params.parameters['bwc.numsols'])
-#| 
+#|
 #|     CPUBINDING_CONF_FILE = params.files['CPUBINDING_CONF_FILE']
-#| 
+#|
 #|     # given the bwc sequence length, set the checkpointing interval
 #|     # close to its square root -- actually slightly larger because
 #|     # I like it better with fewer checkpints.
 #|     L = MC.ncols() / bwc_mn + MC.ncols() / bwc_mn + 32
 #|     interval = min(2**int(log(L,2)/2 + 3), L)
-#| 
+#|
 #|     bwc_executable = "linalg/bwc/bwc.pl"
-#| 
+#|
 #|     bwc_common_args = [
 #|         "--matrix", os.path.realpath(matrix_file),
 #|         "--prime", params.parameters['e'],
@@ -9792,7 +9982,7 @@ if __name__ == "__main__":
 #|         f"cpubinding={CPUBINDING_CONF_FILE}",
 #|         "verbose_flags=^all-cmdline,^bwc-timing-grids,^all-bwc-dispatch,^bwc-cache-major-info,perl-cmdline,perl-sections,^perl-checks,^bwc-iteration-timings,^bwc-loading-mksol-files",
 #|     ]
-#| 
+#|
 #|     bwc_add_args = []
 #|     if params.mpi:
 #|         timeprint("Run bwc.pl from solve_filtering_plus_bwc with MPI enabled.")
@@ -9800,19 +9990,19 @@ if __name__ == "__main__":
 #|             bwc_add_args += [
 #|                 "--mpi", params.parameters['bwc.mpi']
 #|             ]
-#| 
+#|
 #|         # Escape spaces in arguments correctly, depending on whether the command is
 #|         # written to a file (slurm), or executed with subprocess (non-slurm).
 #|         if params.bwc_slurm:
 #|             bwc_add_args.append(f"mpi_extra_args='{params.mpi_extra_args}'")
 #|         else:
 #|             bwc_add_args.append(f"mpi_extra_args={params.mpi_extra_args}")
-#| 
+#|
 #|     start_bwc = time.time()
-#| 
+#|
 #|     if params.bwc_slurm:
 #|         bwc_tasks = ["prep", "krylov", "lingen", "mksol", "gather", "cleanup"]
-#| 
+#|
 #|         if params.mpi:
 #|             if params.parameters["bwc.mpi_slurm"] == "auto":
 #|                 a, b = map(int, params.parameters["bwc.mpi"].split("x"))
@@ -9821,32 +10011,32 @@ if __name__ == "__main__":
 #|             else:
 #|                 bwc_mpi_slurm = params.parameters["bwc.mpi_slurm"]
 #|                 timeprint(f"Setting bwc.mpi_slurm to user-defined value of {bwc_mpi_slurm}")
-#| 
+#|
 #|         single_threaded_tasks = ["prep", "lingen", "cleanup"]
-#| 
+#|
 #|         setup_commands_common = [
 #|             params.files['PYTHON'],
 #|             "wait_for_file.py",
 #|             "-m", "30000",
 #|             "-f"
 #|         ]
-#| 
+#|
 #|         # XXX: It seems that parallelizing mksol across 6 nodes
 #|         # is already working. Maybe we already include the SM columns
 #|         # in the matrix?
 #|         # if not params.chars_in_mat:
 #|         #     single_threaded_tasks.append("mksol")
-#| 
+#|
 #|         for bwc_task in bwc_tasks:
 #|             start_task = time.time()
-#| 
+#|
 #|             processes = []
 #|             njobs = bwc_mn if bwc_task not in single_threaded_tasks else 1
-#| 
+#|
 #|             for jobnum in range(njobs):
 #|                 task_args = []
 #|                 setup_commands = setup_commands_common[::] if bwc_task != "prep" else []
-#| 
+#|
 #|                 if bwc_task == "krylov":
 #|                     task_args += [
 #|                         "--ys", f"{jobnum}..{jobnum+1}",
@@ -9875,7 +10065,7 @@ if __name__ == "__main__":
 #|                 elif bwc_task == "cleanup":
 #|                     for jobnum in range(bwc_mn):
 #|                         setup_commands.append(f"{WORKDIR}K.sols{jobnum}-{jobnum+1}.*")
-#| 
+#|
 #|                 if params.mpi:
 #|                     # Running prep with different mpi= argument results in file corruption that
 #|                     # surfaces as the following bug:
@@ -9894,7 +10084,7 @@ if __name__ == "__main__":
 #|                         task_args += [
 #|                             "--mpi", bwc_mpi_slurm
 #|                         ]
-#| 
+#|
 #|                 command_list = [
 #|                     params.files['SAGE'],
 #|                     "cado_nfs_binaries.py",
@@ -9906,10 +10096,10 @@ if __name__ == "__main__":
 #|                     *task_args,
 #|                     *bwc_add_args
 #|                 ]
-#| 
+#|
 #|                 # all ints must be str to pass on command line.
 #|                 command_list = list(map(str, command_list))
-#| 
+#|
 #|                 processes.append(
 #|                     slurmit(
 #|                         params,
@@ -9921,20 +10111,20 @@ if __name__ == "__main__":
 #|                         nested_mpi=params.mpi
 #|                     )
 #|                 )
-#| 
+#|
 #|             _, cputime_task = slurm_wait(processes, throw_error_on_failed_job=True, params=params)
 #|             overall_cputime.add(cputime_task)
-#| 
+#|
 #|             end_task = time.time()
 #|             params.timing[f"bwc {bwc_task}"] = end_task - start_task
 #|             params.timing[f"bwc {bwc_task}_cputime"] = cputime_task
 #|     else:
 #|         with open(os.path.join(WORKDIR,"bwc.out"),"w") as outfile, \
 #|             open(os.path.join(WORKDIR,"bwc.err"),"w") as errfile:
-#| 
+#|
 #|             print(f"Writing bwc stdout to {outfile.name}")
 #|             print(f"Writing bwc stderr to {errfile.name}")
-#| 
+#|
 #|             CadoNFS(bwc_executable,
 #|                 ":complete",
 #|                 *bwc_common_args,
@@ -9944,27 +10134,27 @@ if __name__ == "__main__":
 #|                 capture=outfile,
 #|                 stderr=errfile
 #|             )
-#| 
+#|
 #|     end_bwc = time.time()
 #|     params.timing["linalg/bwc/bwc.pl (complete)"] = end_bwc-start_bwc
-#| 
+#|
 #|     timeprint("bwc completed! Starting some sage matrix multiplications.")
-#| 
+#|
 #|     Ze = Integers(e)
-#| 
+#|
 #|     start_makesolmatrix = time.time()
 #|     sol_matrix_rows = []
 #|     for j in range(bwc_mn):
 #|         with open(f"{WORKDIR}/K.sols{j}-{j+1}.0.txt",'r') as f:
 #|             sol_matrix_rows.append([int(line) for line in f])
-#| 
+#|
 #|     sol_matrix = matrix(Ze, sol_matrix_rows, sparse=True)
 #|     end_makesolmatrix = time.time()
-#| 
+#|
 #|     # The optimization only works if all occurring integers can be represented as float64 (i.e., without losing precision).
 #|     # This is the case for all integers up to 2^53.
 #|     do_parallelized_mat_mult = (max(M.ncols(), S_block.ncols()) * e * e).bit_length() <= 53
-#| 
+#|
 #|     if do_parallelized_mat_mult:
 #|         try:
 #|             from sparse_dot_mkl import dot_product_mkl
@@ -9973,10 +10163,10 @@ if __name__ == "__main__":
 #|         except:
 #|             timeprint("To speed up the following matrix multiplications, install the following python packages: sparse_dot_mkl, numpy, scipy.")
 #|             do_parallelized_mat_mult = False
-#| 
+#|
 #|         if do_parallelized_mat_mult:
 #|             timeprint("Use scipy and Intel MKL for parallelized sparse matrix multiplication (interpreting entries in Z(e) as float64 and reducing mod e later; the code ensures this precision is not an issue, i.e., all integers are < 2^53)")
-#| 
+#|
 #|             def convert_sparse_matrix_scipy_to_sage(R, m):
 #|                 """
 #|                 Convert scipy.sparse array to a sparse sage matrix *without*
@@ -9987,7 +10177,7 @@ if __name__ == "__main__":
 #|                 m_coo = m.astype(int).tocoo()
 #|                 row_col_val_dict = {(r, c): v for r, c, v in zip(m_coo.row, m_coo.col, m_coo.data)}
 #|                 return matrix(R, *(m.shape), row_col_val_dict, sparse=True)
-#| 
+#|
 #|             def convert_sparse_matrix_sage_to_scipy(m, dtype):
 #|                 """
 #|                 Convert sparse sage matrix to scipy.sparse.csr_array *without*
@@ -9998,18 +10188,18 @@ if __name__ == "__main__":
 #|                 """
 #|                 m_dict = m.dict()
 #|                 l = len(m_dict)
-#| 
+#|
 #|                 rows = [None] * l
 #|                 cols = [None] * l
 #|                 data = [None] * l
 #|                 i = 0
-#| 
+#|
 #|                 if hasattr(m, "is_vector"):
 #|                     shape = (1, m.degree())
 #|                     r = 0
 #|                 else:
 #|                     shape = m.dimensions()
-#| 
+#|
 #|                 for k, d in m_dict.items():
 #|                     if hasattr(m, "is_vector"):
 #|                         c = k
@@ -10019,12 +10209,12 @@ if __name__ == "__main__":
 #|                     cols[i] = c
 #|                     data[i] = d
 #|                     i += 1
-#| 
+#|
 #|                 return csr_array((data, (rows, cols)), shape=shape, dtype=dtype)
-#| 
+#|
 #|             ### Time assert
 #|             start_assert = time.time()
-#| 
+#|
 #|             timeprint("Convert sparse sage matrices to scipy (sol_matrix, block_matrix = [[M], [SC_filtered_nochars]])")
 #|             timeprint("type of M", type(M))
 #|             sol_matrix_sc = convert_sparse_matrix_sage_to_scipy(sol_matrix, dtype=np.float64)
@@ -10038,17 +10228,17 @@ if __name__ == "__main__":
 #|                 [M_sc],
 #|                 [SC_filtered_nochars_sc]
 #|             ])
-#| 
+#|
 #|             timeprint("Multiply sol_matrix * block_matrix = sol_times_filtered_nochars")
 #|             sol_times_filtered_nochars_sc = dot_product_mkl(sol_matrix_sc, block_matrix_filtered_nochars_sc)
 #|             sol_times_filtered_nochars = convert_sparse_matrix_scipy_to_sage(Ze, sol_times_filtered_nochars_sc)
 #|             assert sol_times_filtered_nochars.is_zero()
-#| 
+#|
 #|             end_assert = time.time()
-#| 
+#|
 #|             ### Time matonright
 #|             start_matonright = time.time()
-#| 
+#|
 #|             timeprint("Convert sparse sage matrices to scipy (block_matrix_2 = [[S_block], [SC_filtered_chars]])")
 #|             S_block_sc = convert_sparse_matrix_sage_to_scipy(S_block, dtype=np.float64)
 #|             SC_filtered_chars_sc = convert_sparse_matrix_sage_to_scipy(SC_filtered_chars, dtype=np.float64)
@@ -10056,32 +10246,32 @@ if __name__ == "__main__":
 #|                 [S_block_sc],
 #|                 [SC_filtered_chars_sc]
 #|             ])
-#| 
+#|
 #|             timeprint("Multiply sol_matrix * block_matrix_2 = small_matrix_on_the_right")
 #|             small_matrix_on_the_right_sc = dot_product_mkl(sol_matrix_sc, block_matrix_filtered_chars_sc)
 #|             small_matrix_on_the_right = convert_sparse_matrix_scipy_to_sage(Ze, small_matrix_on_the_right_sc)
-#| 
+#|
 #|             end_matonright = time.time()
 #|     if not do_parallelized_mat_mult:
 #|         timeprint("Use sage matrix(Integers(e), entries, sparse=True) for multiplication [this is single threaded and can take hours]")
-#| 
+#|
 #|         # sol_matrix * vertical_join([MC, SC_vector_filtered]) decomposes as
 #|         # follows:
-#| 
+#|
 #|         start_assert = time.time()
 #|         assert (sol_matrix * block_matrix(2,1,[M,matrix(SC_filtered_nochars)], sparse=True)).is_zero()
 #|         end_assert = time.time()
-#| 
+#|
 #|         start_matonright = time.time()
 #|         small_matrix_on_the_right = sol_matrix * block_matrix(2,1,[S_block,matrix([SC_filtered_chars])], sparse=True)
 #|         end_matonright = time.time()
-#| 
+#|
 #|     params.timing["making sol_matrix"] = end_makesolmatrix - start_makesolmatrix
 #|     params.timing["assert sol_matrix"] = end_assert - start_assert
 #|     params.timing["small_matrix_on_the_right"] = end_matonright-start_matonright
-#| 
+#|
 #|     timeprint(f"found sol_matrix, {sol_matrix.nrows()}x{sol_matrix.ncols()}")
-#| 
+#|
 #|     # At this point, SC_filtered_chars is the target characters.  We need
 #|     # to compute the characters for each of the rows in the sol_matrix.
 #|     # Then, some combination of sol_matrix should give us
@@ -10089,7 +10279,7 @@ if __name__ == "__main__":
 #|     # (something in the nullspace of M|t).  Recall also that S_block is
 #|     # the character portion of the matrix.  C_block we totally ignore,
 #|     # since that is from the pre-filtered target vector.
-#| 
+#|
 #|     # First get the left nullspace of small_matrix_on_the_right
 #|     second_solve = small_matrix_on_the_right
 #|     start_secondsolve = time.time()
@@ -10097,13 +10287,13 @@ if __name__ == "__main__":
 #|     end_secondsolve = time.time()
 #|     params.timing["second_solve.left_kernel"] = end_secondsolve-start_secondsolve
 #|     timeprint("Started the second solve!")
-#| 
+#|
 #|     timeprint("ns2 nrows = " + str(ns2.nrows()))
 #|     timeprint("ns2 ncols = " + str(ns2.ncols()))
-#| 
+#|
 #|     if ns2.nrows() == 0:
 #|         raise RuntimeError("Cannot solve the small linear system after bwc.")
-#| 
+#|
 #|     start_lastsolve = time.time()
 #|     # find a row combination that reaches -1 on the last coordinate
 #|     assert not (ns2 * sol_matrix[:,-1:]).is_zero(), "The last column of ns2*sol_matrix is zero, which (I think) means that no combination of the solutions bwc found to the non-character part of the matrix will be able to cancel out the target characters"
@@ -10111,38 +10301,38 @@ if __name__ == "__main__":
 #|     end_lastsolve = time.time()
 #|     params.timing["final solve_left"] = end_lastsolve-start_lastsolve
 #|     timeprint("Completed the final solve_left!")
-#| 
+#|
 #|     start_solf = time.time()
 #|     sol_f = combine * ns2 * sol_matrix[:,:-1]
-#| 
+#|
 #|     # This is the same assert that we have in solve_filtering_plus_sage.
 #|     # It must hold!
 #|     timeprint("type of sol_f:", str(type(sol_f)))
 #|     timeprint("type of MC:", str(type(MC)))
 #|     timeprint("type of SC_vector_filtered:", str(type(SC_vector_filtered)))
-#| 
-#| 
+#|
+#|
 #|     if params.scipy_matrix:
-#| 
+#|
 #|         from sparse_dot_mkl import dot_product_mkl
 #|         import numpy as np
 #|         from scipy.sparse import csr_array, bmat
-#| 
+#|
 #|         def convert_sparse_vector_scipy_to_sage_dense(R, v):
 #|             v_coo = v.astype(int).tocoo()
 #|             row_col_val_dict = {(r, c): v for r, c, v in zip(v_coo.row, v_coo.col, v_coo.data)}
 #|             assert v.shape[0] == 1
 #|             v_len = v.shape[1]
 #|             v_s = vector(R, v_len)  # not sparse
-#| 
+#|
 #|             for k in row_col_val_dict.keys():
 #|                 (r,c) = k
 #|                 v = row_col_val_dict[k]
 #|                 assert r == 0
 #|                 v_s[c] = R(v)
-#| 
+#|
 #|             return v_s
-#| 
+#|
 #|         def convert_sage_dense_vector_to_scipy(v, dtype):
 #|             # vector is not sparse!
 #|             l = len(v)
@@ -10150,7 +10340,7 @@ if __name__ == "__main__":
 #|             cols = [None] * l
 #|             data = [None] * l
 #|             i = 0
-#| 
+#|
 #|             for c in range(len(v)):
 #|                 r = 0
 #|                 d = int(v[c])
@@ -10158,9 +10348,9 @@ if __name__ == "__main__":
 #|                 cols[i] = c
 #|                 data[i] = d
 #|                 i += 1
-#| 
+#|
 #|             return csr_array((data, (rows, cols)), shape=(1,len(v)), dtype=dtype)
-#| 
+#|
 #|         def convert_sparse_matrix_sage_to_scipy(m, dtype):
 #|             """
 #|             Convert sparse sage matrix to scipy.sparse.csr_array *without*
@@ -10171,18 +10361,18 @@ if __name__ == "__main__":
 #|             """
 #|             m_dict = m.dict()
 #|             l = len(m_dict)
-#| 
+#|
 #|             rows = [None] * l
 #|             cols = [None] * l
 #|             data = [None] * l
 #|             i = 0
-#| 
+#|
 #|             if hasattr(m, "is_vector"):
 #|                 shape = (1, m.degree())
 #|                 r = 0
 #|             else:
 #|                 shape = m.dimensions()
-#| 
+#|
 #|             for k, d in m_dict.items():
 #|                 if hasattr(m, "is_vector"):
 #|                     c = k
@@ -10192,9 +10382,9 @@ if __name__ == "__main__":
 #|                 cols[i] = c
 #|                 data[i] = d
 #|                 i += 1
-#| 
+#|
 #|             return csr_array((data, (rows, cols)), shape=shape, dtype=dtype)
-#| 
+#|
 #|         sol_f_scipy = convert_sage_dense_vector_to_scipy(sol_f, dtype=np.float64)
 #|         M_scipy = M.scipy_M()
 #|         S_block_scipy = convert_sparse_matrix_sage_to_scipy(S_block, dtype=np.float64)
@@ -10205,27 +10395,27 @@ if __name__ == "__main__":
 #|         ]])
 #|         leftside_scipy = dot_product_mkl(sol_f_scipy, MC_scipy)
 #|         leftside_sage = convert_sparse_vector_scipy_to_sage_dense(Ze, leftside_scipy)
-#| 
+#|
 #|         timeprint("type of leftside_sage", str(type(leftside_sage)))
 #|         timeprint("type of SC_vector_filtered", str(type(SC_vector_filtered)))
 #|         assert leftside_sage == SC_vector_filtered
-#| 
+#|
 #|     else:
 #|         # Usual path
 #|         leftside = sol_f * MC
 #|         timeprint("type of leftside:", str(type(leftside)))
 #|         assert sol_f * MC == SC_vector_filtered
-#| 
+#|
 #|     end_solf = time.time()
 #|     params.timing["sol_f computations"] = end_solf-start_solf
-#| 
+#|
 #|     start_filtering = time.time()
-#| 
+#|
 #|     row_to_aquery = MM.row_to_aquery
 #|     ab_per_row = MM.ab_per_row(params)
-#| 
+#|
 #|     aquery_to_row = {q:r for r,q in enumerate(row_to_aquery)}
-#| 
+#|
 #|     sol = vector(Integers(e), len(row_to_aquery))
 #|     for row_in_filtered_M, (coeff, abs) in enumerate(zip(sol_f, ab_per_row)):
 #|         for ab in abs.keys():
@@ -10234,38 +10424,38 @@ if __name__ == "__main__":
 #|             b = ab[1]
 #|             row_in_og_M = aquery_to_row[(a,b)]
 #|             sol[row_in_og_M] += (c * coeff)
-#| 
+#|
 #|     for (coeff, killer_rel) in saved_kr_rels:
 #|         a = int(killer_rel.split(":")[0].split(",")[0], 16)
 #|         b = int(killer_rel.split(":")[0].split(",")[1], 16)
 #|         r = aquery_to_row[(a,b)]
 #|         sol[r] += coeff
-#| 
+#|
 #|     end_filtering = time.time()
 #|     params.timing["recover sol from sol_f"] = end_filtering - start_filtering
 #|     return sol
-#| 
+#|
 #| @timing
 #| def solve_filtering_plus_bwc_chars(params, M, MM, MC, SC_vector, S_block, C_block, use_existing_M_binary=False):
-#| 
+#|
 #|     # Notes: S_block is the character portion of the matrix. C_block is the
 #|     # character portion of the target vector, BEFORE filtering. The BWC-output
 #|     # matrix (the ...matrix.bin file) does NOT include character columns.
-#| 
+#|
 #|     e = params.parameters['e']
-#| 
+#|
 #|     killer_relations = fast_json_load(params.files['KILLER_RELS_DICT'])
 #|     order_of_cancellation = fast_json_load(params.files['KILLER_RELS_ORDER'])
-#| 
+#|
 #|     SC_vector_filtered, saved_kr_rels = apply_filtering_to_target(
 #|         params, M, MM, MC, -SC_vector, killer_relations, order_of_cancellation
 #|     )
-#| 
+#|
 #|     timeprint("Updated target! Created SC_vector_filtered.")
 #|     timeprint("The rhs vector is of length " + str(len(SC_vector_filtered)))
-#| 
+#|
 #|     matrix_wchar_file = params.dirs['TEMP_OUTPUT_DIR'] + "matrix_wchar.bin"
-#| 
+#|
 #|     if not use_existing_M_binary:
 #|         # Writing this file is super slow, so don't repeat if it exists
 #|         with open(matrix_wchar_file, "wb") as f:
@@ -10276,51 +10466,51 @@ if __name__ == "__main__":
 #|                 for j in nz:
 #|                     f.write(int.to_bytes(j, length=4, byteorder='little'))
 #|                     f.write(int.to_bytes(int(MC[i,j]), length=4, byteorder='little', signed=True))
-#| 
+#|
 #|         timeprint("Wrote matrix with chars file!")
-#| 
+#|
 #|     CadoNFS("linalg/bwc/mf_scan2", "-withcoeffs", "-mfile", matrix_wchar_file)
-#| 
+#|
 #|     timeprint(f"Matrix file MM ({type(MM)}) is {MM.get_matrix_file(params)} of size {MM.nrows}x{MM.ncols}")
 #|     timeprint(f"Matrix MC ({type(MC)}) of size {MC.nrows()}x{MC.ncols()}")
 #|     timeprint(f"Matrix M ({type(M)}) of size {M.nrows()}x{M.ncols()}")
 #|     vector_file = params.dirs['TEMP_OUTPUT_DIR'] + "tgt.ascii"
-#| 
+#|
 #|     assert(MC.ncols()==len(SC_vector_filtered))
-#| 
+#|
 #|     write_ascii_vector(vector_file, SC_vector_filtered, e)
-#| 
+#|
 #|     FILES_DIR = params.dirs['TEMP_OUTPUT_DIR']
 #|     WORKDIR = os.path.join(FILES_DIR,"bwc/")
 #|     e = int(params.parameters['e'])
 #|     Path(WORKDIR).mkdir(exist_ok=True)
 #|     make_and_clean(WORKDIR)
-#| 
+#|
 #|     bwc_add_args = []
 #|     if params.mpi:
 #|         timeprint("Run bwc.pl from solve_filtering_plus_bwc_chars with MPI enabled.")
 #|         bwc_add_args += [
 #|             "--mpi", params.parameters['bwc.mpi']
 #|         ]
-#| 
+#|
 #|         # Escape spaces in arguments correctly, depending on whether the command is
 #|         # written to a file (slurm), or executed with subprocess (non-slurm).
 #|         if params.bwc_slurm:
 #|             bwc_add_args.append(f"mpi_extra_args='{params.mpi_extra_args}'")
 #|         else:
 #|             bwc_add_args.append(f"mpi_extra_args={params.mpi_extra_args}")
-#| 
+#|
 #|     if params.parameters['bwc.numsols']:
 #|         bwc_mn = int(params.parameters['bwc.numsols'])
 #|     else:
 #|         bwc_mn = 1
-#| 
+#|
 #|     with open(os.path.join(WORKDIR,"bwc.out"),"w") as outfile, \
 #|          open(os.path.join(WORKDIR,"bwc.err"),"w") as errfile:
-#| 
+#|
 #|         print(f"Writing bwc stdout to {outfile.name}")
 #|         print(f"Writing bwc stderr to {errfile.name}")
-#| 
+#|
 #|         CadoNFS("linalg/bwc/bwc.pl",
 #|             ":complete",
 #|             "--matrix", os.path.realpath(matrix_wchar_file),
@@ -10337,9 +10527,9 @@ if __name__ == "__main__":
 #|             capture=outfile,
 #|             stderr=errfile
 #|         )
-#| 
+#|
 #|     Ze = Integers(e)
-#| 
+#|
 #|     found = False
 #|     for j in range(bwc_mn):
 #|         if found:
@@ -10351,24 +10541,24 @@ if __name__ == "__main__":
 #|                 found = True
 #|             else:
 #|                 timeprint("Found a solution... with zero coefficient on the target.")
-#| 
+#|
 #|     if sol_f[-1] == 0:
 #|         raise RuntimeError("Bwc didn't find any solutions with nonzero coefficient on the target.")
-#| 
+#|
 #|     timeprint("Found sol_f! (The filtered solution.)")
 #|     timeprint(len(sol_f))
-#| 
+#|
 #|     assert sol_f[:-1] * MC == -1 * sol_f[-1] * SC_vector_filtered
-#| 
+#|
 #|     sol_ff = sol_f[:-1]
 #|     for i in range(len(sol_ff)):
 #|         sol_ff[i] = sol_ff[i] * inverse_mod(-1 * sol_f[-1], e)
-#| 
+#|
 #|     row_to_aquery = MM.row_to_aquery
 #|     ab_per_row = MM.ab_per_row(params)
-#| 
+#|
 #|     aquery_to_row = {q:r for r,q in enumerate(row_to_aquery)}
-#| 
+#|
 #|     sol = vector(Integers(e), len(row_to_aquery))
 #|     for row_in_filtered_M, (coeff, abs) in enumerate(zip(sol_ff, ab_per_row)):
 #|         for ab in abs.keys():
@@ -10377,15 +10567,15 @@ if __name__ == "__main__":
 #|             b = ab[1]
 #|             row_in_og_M = aquery_to_row[(a,b)]
 #|             sol[row_in_og_M] += (c * coeff)
-#| 
+#|
 #|     for (coeff, killer_rel) in saved_kr_rels:
 #|         a = int(killer_rel.split(":")[0].split(",")[0], 16)
 #|         b = int(killer_rel.split(":")[0].split(",")[1], 16)
 #|         r = aquery_to_row[(a,b)]
 #|         sol[r] += coeff
-#| 
+#|
 #|     return sol
-#| 
+#|
 #| @timing
 #| def CRT_R_alpha(params, current_num_primes, extra_abks, abm_list):
 #|     e = params.parameters['e']
@@ -10395,31 +10585,31 @@ if __name__ == "__main__":
 #|     ZN = Integers(N)
 #|     K = params.poly.K[1]
 #|     alpha = K.gen()
-#| 
+#|
 #|     R_m = ZN(0)
 #|     R_alpha = 0
-#| 
+#|
 #|     ts = time.time()
-#| 
+#|
 #|     if params.mpi:
 #|         from mpi4py.futures import MPIPoolExecutor
 #|         from mpi4py.futures import wait as mpi_wait
-#| 
+#|
 #|         with MPIPoolExecutor(max_workers=params.parameters['mpi.thr']) as executor:
 #|             proccount = executor.num_workers
 #|             timeprint(f"Running find_good_primes on {proccount} workers.")
-#| 
+#|
 #|             futures = [executor.submit(find_good_primes,f,e,num=current_num_primes/proccount,start=2**41+ZZ.random_element(2**41)) for i in range(proccount)]
 #|             mpi_wait(futures)
 #|             prime_list = [p for future in futures for p in future.result()]
 #|             prime_list = list(set(prime_list))
-#| 
+#|
 #|             timeprint("prime_gen took",time.time()-ts)
 #|             ts = time.time()
-#| 
+#|
 #|             proccount = executor.num_workers
 #|             timeprint(f"Running ethroot_p on {proccount} workers.")
-#| 
+#|
 #|             futures = [executor.submit(ethroot_p,abm_list,f,e,N,p) for p in prime_list]
 #|             mpi_wait(futures)
 #|             local_solns = [future.result() for future in futures]
@@ -10430,16 +10620,16 @@ if __name__ == "__main__":
 #|             concurrent.futures.wait(futures)
 #|             prime_list = [p for future in futures for p in future.result()]
 #|             prime_list = list(set(prime_list))
-#| 
+#|
 #|         timeprint("prime_gen took",time.time()-ts)
-#| 
+#|
 #|         ts = time.time()
-#| 
+#|
 #|         with concurrent.futures.ProcessPoolExecutor() as executor:
 #|             futures = [executor.submit(ethroot_p,abm_list,f,e,N,p) for p in prime_list]
 #|             concurrent.futures.wait(futures)
 #|             local_solns = [future.result() for future in futures]
-#| 
+#|
 #|     timeprint("local_solns/ethroot_gen took",time.time()-ts)
 #|     ps, coeffs_mod_ps = zip(*local_solns)
 #|     ps = list(ps)
@@ -10448,58 +10638,58 @@ if __name__ == "__main__":
 #|     coeffs_by_position = list(itertools.zip_longest(*coeffs_mod_ps, fillvalue=0)) # [[x^0 coeff mod each p], [x^1 coeff mod each p], ...]
 #|     coeffs_over_z = [crt(list(coeffs_i), ps) for coeffs_i in coeffs_by_position]
 #|     coeffs_over_z = [(c - prodps) if c >= prodps//2 else c for c in coeffs_over_z]
-#| 
+#|
 #|     cand_R_alpha = ZZ['x'](coeffs_over_z)(alpha)
 #|     cand_R_alpha /= prod([(a-b*alpha)**k for (a,b,k) in extra_abks])
-#| 
+#|
 #|     return cand_R_alpha
-#| 
+#|
 #| def CRT_R_m(params, *args):
 #|     N = params.poly.N
 #|     m = params.poly.m
 #|     ZN = Integers(N)
 #|     cand_R_alpha = CRT_R_alpha(params, *args)
-#| 
+#|
 #|     return cand_R_alpha.polynomial().change_ring(ZN)(m)
-#| 
+#|
 #| def handle_very_large_special_q(params, q, side, working_pfx, rho=None):
 #|     # This is part of descent initialization, if we are in a parameter regime
 #|     # where we have special-q's over ~100 bits.
-#| 
+#|
 #|     og_polyfile = params.files['POLYFILE']
 #|     og_poly = CadoPolyFile(og_polyfile); og_poly.read()
-#| 
+#|
 #|     m = og_poly.m
 #|     f = og_poly.f[1]
 #|     g = og_poly.f[0]
-#| 
+#|
 #|     q_nickname = str(q)[0:10]
 #|     mod_polyfile = working_pfx + "largeq." + q_nickname + ".poly"
 #|     mod_fbfile = working_pfx + "largeq." + q_nickname + ".fb"
 #|     las_output = working_pfx + "largeq." + q_nickname + ".rels.out"
-#| 
+#|
 #|     if rho is None and side == 0:
 #|         rho = ZZ(g.roots(GF(q))[0][0])
 #|     else:
 #|         raise NotImplementedError("handle_very_large_special_q on side=1")
-#| 
+#|
 #|     newg, newf, coeff = transform_polys_by_q(g, f, q, rho, side)
-#| 
+#|
 #|     rr = Integer(newg.resultant(newf))
-#| 
+#|
 #|     assert(newg.degree() == 1)
 #|     c0 = Integer(newg.list()[0])
 #|     c1 = Integer(newg.list()[1])
-#| 
+#|
 #|     if gcd(c1, rr) > 1:
 #|         print("Hm! The new modulus rr has some nontrivial factors so we will try to get rid of them.")
 #|         major_message("Not actually sure if this is allowed... If something breaks this could be why!")
-#| 
+#|
 #|     extra = gcd(c1, rr)
 #|     rr = Integer(rr / extra)
 #|     if rr < 0:
 #|         rr = rr * -1
-#| 
+#|
 #|     looking = True
 #|     while looking:
 #|         res = ecmfactor(rr, 2**20)
@@ -10509,33 +10699,33 @@ if __name__ == "__main__":
 #|             rr = rr / res[1]
 #|         else:
 #|             looking = False
-#| 
+#|
 #|     new_shared_root = -1 * c0 * inverse_mod(c1, rr) % rr
-#| 
+#|
 #|     print("newg", str(newg))
 #|     print("newf", str(newf))
 #|     print("new_shared_root", str(new_shared_root))
 #|     print("rr", str(rr))
-#| 
+#|
 #|     assert(newg(new_shared_root) % rr == 0)
 #|     assert(newf(new_shared_root) % rr == 0)
-#| 
+#|
 #|     if True:
 #|         write_polyfile(
 #|             params,'hardcoded',rr, params.parameters['e'],
 #|             newf.degree(), mod_polyfile, hardcoded_m=new_shared_root, hardcoded_polys=[newg,newf]
 #|         )
-#| 
+#|
 #|         polyinfo = CadoPolyFile(mod_polyfile)
 #|         polyinfo.read()
 #|         minskew = float(params.parameters.get('desc.lq.skewmin', 0.2))
-#| 
+#|
 #|         if float(polyinfo.skewness) < minskew:
 #|             # Throw it out.
 #|             # Practically, these end up discarding every q.
 #|             timeprint("Throwing out because of skewness " + str(polyinfo.skewness))
 #|             sys.exit(1)
-#| 
+#|
 #|         CadoNFS("sieve/makefb",
 #|                 "-poly", 'POLY',
 #|                 "-out", 'FB',
@@ -10548,11 +10738,11 @@ if __name__ == "__main__":
 #|                     'FB': mod_fbfile,
 #|                     }
 #|                 )
-#| 
+#|
 #|         lim0 = params.parameters.get('desc.lq.lim', 2000000000)
 #|         lim1 = params.parameters.get('desc.lq.lim', 2000000000)
 #|         bkthresh = int(round(min(lim0, lim1)/2))
-#| 
+#|
 #|         CadoNFS("sieve/las",
 #|             "-poly", 'POLY',
 #|             "-fb1", 'FB1',
@@ -10581,7 +10771,7 @@ if __name__ == "__main__":
 #|                 'POLY': mod_polyfile,
 #|             }
 #|             )
-#| 
+#|
 #|     winner = ''
 #|     with open(las_output, "r") as f:
 #|         for line in f.readlines():
@@ -10590,7 +10780,7 @@ if __name__ == "__main__":
 #|             else:
 #|                 winner = line
 #|                 break
-#| 
+#|
 #|     print("winning relation", str(winner))
 #|     ijf = winner.strip().split(':')
 #|     i = ijf[0].split(',')[0]
@@ -10599,10 +10789,10 @@ if __name__ == "__main__":
 #|     j = int(j, 10)
 #|     fac0 = [ int(x, 16) for x in ijf[1].split(',') ]
 #|     fac1 = [ int(x, 16) for x in ijf[2].split(',') ]
-#| 
+#|
 #|     print("fac0", str(fac0))
 #|     print("fac1", str(fac1))
-#| 
+#|
 #|     a0 = coeff[0][0]
 #|     b0 = coeff[0][1]
 #|     a1 = coeff[1][0]
@@ -10612,9 +10802,9 @@ if __name__ == "__main__":
 #|     if b < 0:
 #|         a = -a
 #|         b = -b
-#| 
+#|
 #|     return a, b, fac0, fac1, winner, newg, newf, rr, new_shared_root
-#| 
+#|
 #| def call_descent_large_init(target,params,seedval):
 #|     seedval = int(seedval)
 #|     completed_init = subprocess.run([
@@ -10625,14 +10815,14 @@ if __name__ == "__main__":
 #|         "--seed", str(seedval)
 #|     ], stderr=subprocess.PIPE, text=True)
 #|     overall_cputime.add(extract_time(completed_init.stderr))
-#| 
+#|
 #|     print(f"yay finished with seedval {seedval}")
 #|     print("returncode",completed_init.returncode)
-#| 
+#|
 #|     # TODO: check for errors, have returncodes?
-#| 
+#|
 #|     return None
-#| 
+#|
 #| @timing
 #| def call_descent_large_q_slurm(params, initdatafile):
 #|     if initdatafile == 'ALL':
@@ -10641,16 +10831,16 @@ if __name__ == "__main__":
 #|         filelist = glob.glob(params.dirs['DESC'] + 'ecminit.*.initdata')
 #|     else:
 #|         filelist = [ initdatafile ]
-#| 
+#|
 #|     processes = []
 #|     jobnum = 0
-#| 
+#|
 #|     for initdata in filelist:
-#| 
+#|
 #|         try:
 #|             with open(initdata, "r") as fp:
 #|                 init_dict = json.load(fp)
-#| 
+#|
 #|             todofile = init_dict['todofilename']
 #|             u = Integer(init_dict['u'])
 #|             v = Integer(init_dict['v'])
@@ -10665,16 +10855,16 @@ if __name__ == "__main__":
 #|             raise ex
 #|             sys.exit(1)
 #|             os._exit(1)
-#| 
+#|
 #|         large_q = []
 #|         for ff in u_fac + v_fac:
 #|             ffi = Integer(ff)
 #|             if ffi.nbits() > params.parameters.get('LARGEQ', 90):
 #|                 large_q.append(ffi)
-#| 
+#|
 #|         # TODO: Have some guardrail for the number of slurm jobs?
 #|         # But it's usually < 10, for each initdata
-#| 
+#|
 #|         for lq in large_q:
 #|             jobnum += 1
 #|             command_list = [
@@ -10685,11 +10875,11 @@ if __name__ == "__main__":
 #|                 "--lq", str(lq)
 #|             ]
 #|             processes.append(slurmit(params, " ".join(command_list), params.prefix[:-1]+"-largeq", jobnum))
-#| 
+#|
 #|     finished_processes, cputime_slurm = slurm_wait(processes)
 #|     overall_cputime.add(cputime_slurm)
 #|     print(f"Finished running {jobnum} large qs!")
-#| 
+#|
 #|     # TODO:
 #|     # It's pretty tedious to check on the status of this, and even to know when to stop.
 #|     # What we want is, for at least one initdata, all the associated special-q slurm jobs should
@@ -10701,45 +10891,45 @@ if __name__ == "__main__":
 #|     # long time.
 #|     # Alternatively, this can be run on one initdata file at a time and then it will at least be
 #|     # obvious when one succeeds.
-#| 
+#|
 #|     good_descent_inits = []
-#| 
+#|
 #|     for initdata in filelist:
 #|         with open(initdata, "r") as fp:
 #|             init_dict = json.load(fp)
-#| 
+#|
 #|         u_fac = init_dict['u_fac']
 #|         v_fac = init_dict['v_fac']
 #|         largeq_rels_file = init_dict['largeq_rels_file']
-#| 
+#|
 #|         if not os.path.exists(largeq_rels_file):
 #|             # no large-q relations found
 #|             continue
-#| 
+#|
 #|         large_q = []
 #|         for ff in u_fac + v_fac:
 #|             ffi = Integer(ff)
 #|             if ffi.nbits() > params.parameters.get('LARGEQ', 90):
 #|                 large_q.append(ffi)
-#| 
+#|
 #|         found_rels = ""
 #|         with open(largeq_rels_file, "r") as f:
 #|             for line in f.readlines():
 #|                 if "Taking" in line:
 #|                     found_rels += line
-#| 
+#|
 #|         good = True
-#| 
+#|
 #|         for lq in large_q:
 #|             if ("q=" + str(lq)) not in found_rels:
 #|                 good = False
-#| 
+#|
 #|         if good:
-#| 
+#|
 #|             todofile = init_dict['todofilename']
 #|             todo_list_0 = []
 #|             todo_list_1 = []
-#| 
+#|
 #|             with open(todofile) as td:
 #|                 for line in td.readlines():
 #|                     line = line.strip()
@@ -10750,7 +10940,7 @@ if __name__ == "__main__":
 #|                     elif lineinfo[0] == '1':
 #|                         qsize = Integer(lineinfo[1]).nbits()
 #|                         todo_list_1.append(qsize)
-#| 
+#|
 #|             with open(params.files['GOOD_DESCENT_INIT'], "a") as f:
 #|                 f.write(str(initdata) + "\n")
 #|                 f.write(f"Total todo qs: {len(todo_list_0) + len(todo_list_1)}\n")
@@ -10760,94 +10950,94 @@ if __name__ == "__main__":
 #|                 f.write("0: " + str(todo_list_0) + "\n")
 #|                 f.write("1: " + str(todo_list_1) + "\n")
 #|                 f.write("\n")
-#| 
+#|
 #|     return True
-#| 
+#|
 #| def do_cleanup_large_q(params):
 #|     filelist = glob.glob(params.dirs['DESC'] + 'ecminit.*.initdata')
 #|     good_descent_inits = []
-#| 
+#|
 #|     for initdata in filelist:
 #|         with open(initdata, "r") as fp:
 #|             init_dict = json.load(fp)
-#| 
+#|
 #|         u_fac = init_dict['u_fac']
 #|         v_fac = init_dict['v_fac']
 #|         largeq_rels_file = init_dict['largeq_rels_file']
-#| 
+#|
 #|         if not os.path.exists(largeq_rels_file):
 #|             # no large-q relations found
 #|             continue
-#| 
+#|
 #|         large_q = []
 #|         for ff in u_fac + v_fac:
 #|             ffi = Integer(ff)
 #|             if ffi.nbits() > params.parameters.get('LARGEQ', 90):
 #|                 large_q.append(ffi)
-#| 
+#|
 #|         found_rels = ""
 #|         with open(largeq_rels_file, "r") as f:
 #|             for line in f.readlines():
 #|                 if "Taking" in line:
 #|                     found_rels += line
-#| 
+#|
 #|         good = True
-#| 
+#|
 #|         for lq in large_q:
 #|             if ("q=" + str(lq)) not in found_rels:
 #|                 good = False
-#| 
+#|
 #|         if good:
 #|             with open(params.files['GOOD_DESCENT_INIT'], "a") as f:
 #|                 f.write(str(initdata) + "\n")
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def handle_bottom_special_q(
 #|     params, q, side, working_pfx, rho=None, hintinfo=None, overwrite_LPB0=None, overwrite_LPB1=None):
 #|     # Here the q is very close to LPB{0,1}.
-#| 
+#|
 #|     og_polyfile = params.files['POLYFILE']
 #|     og_poly = CadoPolyFile(og_polyfile); og_poly.read()
-#| 
+#|
 #|     f = og_poly.f[1]
 #|     g = og_poly.f[0]
-#| 
+#|
 #|     if side == 0:
 #|         q_nickname = 'side' + str(side) + '-' + str(q)
 #|     elif side == 1:
 #|         q_nickname = 'side' + str(side) + '-' + str(q) + '-' + str(rho)
-#| 
+#|
 #|     mod_polyfile = working_pfx + "botq." + q_nickname + ".poly"
 #|     mod_fbfile = working_pfx + "botq." + q_nickname + ".fb"
 #|     las_output = working_pfx + "botq." + q_nickname + ".rels.out"
-#| 
+#|
 #|     if rho is None and side == 0:
 #|         rho = ZZ(g.roots(GF(q))[0][0])
-#| 
+#|
 #|     newg, newf, coeff = transform_polys_by_q(g, f, q, rho, side)
-#| 
+#|
 #|     print("coeff from myxgcd")
 #|     for w in coeff:
 #|         for ww in w:
 #|             ww = Integer(ww)
 #|             print(str(ww) + " which is " + str(ww.nbits()) + " bits")
-#| 
+#|
 #|     rr = Integer(newg.resultant(newf))
-#| 
+#|
 #|     assert(newg.degree() == 1)
 #|     c0 = Integer(newg.list()[0])
 #|     c1 = Integer(newg.list()[1])
-#| 
+#|
 #|     if gcd(c1, rr) > 1:
 #|         print("Hm! The new modulus rr has some nontrivial factors so we will try to get rid of them.")
 #|         major_message("Not actually sure if this is allowed... If something breaks this could be why!")
-#| 
+#|
 #|     extra = gcd(c1, rr)
 #|     rr = Integer(rr / extra)
 #|     if rr < 0:
 #|         rr = rr * -1
-#| 
+#|
 #|     looking = True
 #|     while looking:
 #|         res = ecmfactor(rr, 2**20)
@@ -10857,26 +11047,26 @@ if __name__ == "__main__":
 #|             rr = rr / res[1]
 #|         else:
 #|             looking = False
-#| 
+#|
 #|     new_shared_root = -1 * c0 * inverse_mod(c1, rr) % rr
-#| 
+#|
 #|     print("newg", str(newg))
 #|     print("newf", str(newf))
 #|     print("new_shared_root", str(new_shared_root))
 #|     print("rr", str(rr))
-#| 
+#|
 #|     assert(newg(new_shared_root) % rr == 0)
 #|     assert(newf(new_shared_root) % rr == 0)
-#| 
+#|
 #|     if not os.path.exists(mod_fbfile):
 #|         write_polyfile(
 #|             params,'hardcoded',rr, params.parameters['e'],
 #|             newf.degree(), mod_polyfile, hardcoded_m=new_shared_root, hardcoded_polys=[newg,newf]
 #|         )
-#| 
+#|
 #|         lim1 = params.parameters.get('desc.botq.lim1', 2**20)
 #|         lim1 = min(2**31, lim1, 2**int(params.parameters['LPB1']))
-#| 
+#|
 #|         CadoNFS("sieve/makefb",
 #|                 "-poly", 'POLY',
 #|                 "-out", 'FB',
@@ -10889,27 +11079,27 @@ if __name__ == "__main__":
 #|                     'FB': mod_fbfile,
 #|                     }
 #|                 )
-#| 
+#|
 #|     if True:
-#| 
+#|
 #|         lim1 = params.parameters.get('desc.botq.lim1', 2**20)
 #|         lim1 = min(2**31, lim1, 2**int(params.parameters['LPB1']))
-#| 
+#|
 #|         lim0 = params.parameters.get('desc.botq.lim0', 2**20)
 #|         lim0 = min(2**31, lim0, 2**int(params.parameters['LPB0']))
-#| 
+#|
 #|         bkthresh_t = int(round(min(lim0, lim1) / 2))
 #|         bkthresh = params.parameters.get('desc.botq.bkthresh1', bkthresh_t)
 #|         bkmult = params.parameters.get('desc.botq.bkmult', '1.365')
-#| 
+#|
 #|         A_used = params.parameters.get('desc.botq.A_sieving', 32)
 #|         if int(A_used) > 32 and 'las.bigA.hwloc_job_binding_policy' in params.parameters:
 #|             t_used = params.parameters['las.bigA.hwloc_job_binding_policy']
 #|         else:
 #|             t_used = params.las_job_binding_policy
-#| 
+#|
 #|         t_used = params.parameters['desc.comp.thr']
-#| 
+#|
 #|         if hintinfo is not None:
 #|             this_lpb0, this_mfb0, this_lpb1, this_mfb1 = hintinfo
 #|         else:
@@ -10917,12 +11107,12 @@ if __name__ == "__main__":
 #|             this_lpb1 = params.parameters['LPB1']
 #|             this_mfb0 = params.parameters.get(f'desc.botq.mfb0.{side}', 80)
 #|             this_mfb1 = params.parameters.get(f'desc.botq.mfb1.{side}', 300)
-#| 
+#|
 #|         if overwrite_LPB0 is not None:
 #|             this_lpb0 = int(overwrite_LPB0)
 #|         if overwrite_LPB1 is not None:
 #|             this_lpb1 = int(overwrite_LPB1)
-#| 
+#|
 #|         CadoNFS("sieve/las",
 #|             "-poly", 'POLY',
 #|             "-fb1", 'FB1',
@@ -10955,7 +11145,7 @@ if __name__ == "__main__":
 #|                 'POLY': mod_polyfile,
 #|             }
 #|             )
-#| 
+#|
 #|     winner = ''
 #|     with open(las_output, "r") as f:
 #|         for line in f.readlines():
@@ -10964,7 +11154,7 @@ if __name__ == "__main__":
 #|             else:
 #|                 winner = line
 #|                 break
-#| 
+#|
 #|     print("winning relation", str(winner))
 #|     ijf = winner.strip().split(':')
 #|     i = ijf[0].split(',')[0]
@@ -10973,10 +11163,10 @@ if __name__ == "__main__":
 #|     j = int(j, 10)
 #|     fac0 = [ int(x, 16) for x in ijf[1].split(',') ]
 #|     fac1 = [ int(x, 16) for x in ijf[2].split(',') ]
-#| 
+#|
 #|     print("fac0", str(fac0))
 #|     print("fac1", str(fac1))
-#| 
+#|
 #|     a0 = coeff[0][0]
 #|     b0 = coeff[0][1]
 #|     a1 = coeff[1][0]
@@ -10986,79 +11176,79 @@ if __name__ == "__main__":
 #|     if b < 0:
 #|         a = -a
 #|         b = -b
-#| 
+#|
 #|     return a, b, fac0, fac1, winner, newg, newf, rr, new_shared_root
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def handle_bottom_special_q_composites(
 #|     params, q, side, working_pfx, rho=None, strategy='C', overwrite_LPB0=None, overwrite_LPB1=None, overwrite_mfb=None):
 #|     # Here the q is very close to LPB{0,1}.
-#| 
+#|
 #|     assert strategy in ['C','C1','C2']
-#| 
+#|
 #|     if side == 0:
 #|         q_nickname = 'side' + str(side) + '-' + str(q)
 #|     elif side == 1:
 #|         q_nickname = 'side' + str(side) + '-' + str(q) + '-' + str(rho)
-#| 
+#|
 #|     las_output = working_pfx + "compq." + q_nickname + ".rels.out"
 #|     todofile = working_pfx + "compq." + q_nickname + ".todo"
-#| 
+#|
 #|     og_poly = CadoPolyFile(params.files['POLYFILE']); og_poly.read()
 #|     f = og_poly.f[1]
 #|     g = og_poly.f[0]
-#| 
+#|
 #|     starting_q = q
-#| 
+#|
 #|     if strategy in ['C','C1']:
 #|         # Just one prime multiplier
 #|         nprimes = params.parameters.get(f'desc.compq.{side}.nprimes', 150)
 #|         if strategy == 'C':
 #|             primeset = primes_first_n(nprimes)
-#| 
+#|
 #|         elif strategy == 'C1':
 #|             # Allow composite multipliers (yes, the naming is confusing)
 #|             # side 0 will remain the same, but side 1 will have some new logic
-#| 
+#|
 #|             primeset = []
 #|             cand_primes = primes_first_n(50)[10:]
 #|             multipliers = primes_first_n(50)[10:]
-#| 
+#|
 #|             for cc in cand_primes:
 #|                 for mm in multipliers:
 #|                     primeset.append( cc*mm )
-#| 
+#|
 #|         if side == 0:
 #|             with open(todofile, "w") as f:
 #|                 # Always include 1*q
 #|                 root1 = g.roots(Integers(q), multiplicities=False)
 #|                 if len(root1) == 1 and root1[0] > 0:
 #|                     f.write(f"0 {q} {root1[0]}\n")
-#| 
+#|
 #|                 for qq in primeset:
-#| 
+#|
 #|                     skip_this = False
 #|                     if strategy == 'C1':
 #|                         facs = list(factor(qq))
 #|                         for fac in facs:
 #|                             if fac[1] > 1:
 #|                                 skip_this = True
-#| 
+#|
 #|                     if skip_this:
 #|                         continue
-#| 
+#|
 #|                     Zqqq = Integers(qq*q)
 #|                     roots = g.roots(Zqqq, multiplicities=False)
 #|                     if len(roots) == 1 and roots[0] > 0:
 #|                         f.write(f"0 {qq*q} {roots[0]}\n")
-#| 
+#|
 #|         if side == 1 and strategy == 'C':
 #|             rho = Integer(rho)
 #|             with open(todofile, "w") as ff:
 #|                 # Always include 1*q
 #|                 ff.write(f"1 {q} {rho}\n")
-#| 
+#|
 #|                 for qq in primeset:
 #|                     roots = f.roots(GF(qq))
 #|                     if len(roots) > 0:
@@ -11070,13 +11260,13 @@ if __name__ == "__main__":
 #|                             ff.write(f"1 {qq*q} {rho_qqq}\n")
 #|                         except ValueError:
 #|                             continue    # sometimes crt can't work
-#| 
+#|
 #|         if side == 1 and strategy == 'C1':
 #|             rho = Integer(rho)
 #|             with open(todofile, "w") as ff:
 #|                 # Always include 1*q
 #|                 ff.write(f"1 {q} {rho}\n")
-#| 
+#|
 #|                 for possibly_composite in primeset:
 #|                     try:
 #|                         facs = list(factor(possibly_composite))
@@ -11095,32 +11285,32 @@ if __name__ == "__main__":
 #|                             else:
 #|                                 skip_this = True
 #|                                 raise ValueError
-#| 
+#|
 #|                         if not skip_this:
 #|                             assert Integer(possibly_composite*q) == prod(mods)
 #|                             rho_total = CRT_list(rhos, mods)
 #|                             for ii in range(len(rhos)):
 #|                                 assert rho_total % mods[ii] == rhos[ii]
-#| 
+#|
 #|                             ff.write(f"1 {possibly_composite*q} {rho_total}\n")
 #|                     except ValueError:
 #|                         continue
-#| 
+#|
 #|     if strategy == 'C2':
 #|         nprimes = params.parameters.get(f'desc.compq.{side}.nprimes', 150)
 #|         primesize = int(params.parameters.get(f'desc.compq.{side}.randsize', 15))
 #|         wsize = floor(primesize/2)
 #|         zsize = primesize - wsize
-#| 
+#|
 #|         primeset = []
 #|         cand_primes = primes_first_n(300)[240:]
 #|         multipliers = primes_first_n(30)
-#| 
+#|
 #|         for mm in multipliers:
 #|             for cc in cand_primes:
 #|                 if mm != cc:
 #|                     primeset.append((mm,cc))
-#| 
+#|
 #|         if False:
 #|             for _ in range(nprimes):
 #|                 #primeset.append( (random_prime(2**wsize), random_prime(2**zsize)) )
@@ -11128,7 +11318,7 @@ if __name__ == "__main__":
 #|                 z = random_prime(2**zsize)
 #|                 if (w,z) not in primeset and (z,w) not in primeset and w != z:
 #|                     primeset.append((w,z))
-#| 
+#|
 #|         if side == 0:
 #|             with open(todofile, "w") as f:
 #|                 for (w,z) in primeset:
@@ -11138,7 +11328,7 @@ if __name__ == "__main__":
 #|                     roots = g.roots(Zqwz, multiplicities=False)
 #|                     if len(roots) == 1 and roots[0] > 0:
 #|                         f.write(f"0 {q*w*z} {roots[0]}\n")
-#| 
+#|
 #|         if side == 1:
 #|             rho = Integer(rho)
 #|             with open(todofile, "w") as ff:
@@ -11160,7 +11350,7 @@ if __name__ == "__main__":
 #|                             ff.write(f"1 {q*w*z} {rho_qwz}\n")
 #|                         except ValueError:
 #|                             continue    # sometimes crt can't work
-#| 
+#|
 #|     lim0 = params.parameters.get(f'desc.compq.{side}.lim0', 2**20)
 #|     lim1 = params.parameters.get(f'desc.compq.{side}.lim1', 2**20)
 #|     mfb0 = params.parameters.get(f'desc.compq.{side}.mfb0', 120)
@@ -11168,33 +11358,33 @@ if __name__ == "__main__":
 #|     ncurves0 = params.parameters.get(f'desc.compq.{side}.ncurves0', 100)
 #|     ncurves1 = params.parameters.get(f'desc.compq.{side}.ncurves1', 100)
 #|     A_s = params.parameters.get(f'desc.compq.{side}.A', 33)
-#| 
+#|
 #|     lim0 = min(lim0, 2**int(params.parameters['LPB0']))
 #|     lim1 = min(lim1, 2**int(params.parameters['LPB1']))
 #|     bkthresh1 = int(round(min(lim0, lim1) / 2))
-#| 
+#|
 #|     bkthresh1 = params.parameters.get(f'desc.compq.{side}.bkthresh1', bkthresh1)
-#| 
+#|
 #|     if overwrite_LPB0 is not None:
 #|         used_lpb0 = int(overwrite_LPB0)
 #|     else:
 #|         used_lpb0 = params.parameters['LPB0']
-#| 
+#|
 #|     if overwrite_LPB1 is not None:
 #|         used_lpb1 = int(overwrite_LPB1)
 #|     else:
 #|         used_lpb1 = params.parameters['LPB1']
-#| 
+#|
 #|     if overwrite_mfb is not None:
 #|         used_mfb0 = int(overwrite_mfb[0])
 #|         used_mfb1 = int(overwrite_mfb[1])
 #|     else:
 #|         used_mfb0 = mfb0
 #|         used_mfb1 = mfb1
-#| 
+#|
 #|     memm = str(params.parameters.get(f'desc.compq.{side}.memory_margin', 100))
 #|     bkmult = params.parameters.get(f'desc.compq.{side}.bkmult', 1.3)
-#| 
+#|
 #|     #if not os.path.exists(las_output):
 #|     # Note: Often requires SUPPORT_LARGE_Q flag
 #|     CadoNFS("sieve/las",
@@ -11229,7 +11419,7 @@ if __name__ == "__main__":
 #|             'TODOFILE': todofile,
 #|         }
 #|         )
-#| 
+#|
 #|     # TEMPORARY EDIT (along with exit-early change)
 #|     ext_unlinked_ideals = set()
 #|     ext_unlinked_files = [
@@ -11243,7 +11433,7 @@ if __name__ == "__main__":
 #|                 p = Integer(lineinfo[1])
 #|                 r = Integer(lineinfo[2])
 #|                 ext_unlinked_ideals.add( (1,p,r) )
-#| 
+#|
 #|     #with open(params.files['EXT_UNLINKED_TODOS'], "r") as extfile:
 #|     #    for line in extfile.readlines():
 #|     #        # it's a todo file
@@ -11252,17 +11442,17 @@ if __name__ == "__main__":
 #|     #        q = Integer(lineinfo[1])
 #|     #        r = Integer(lineinfo[2])
 #|     #        ext_unlinked_ideals.add((1,q,r))
-#| 
+#|
 #|     latest_rel_line = ''
 #|     all_rel_lines = []
-#| 
+#|
 #|     with open(las_output, "r") as f:
 #|         for line in f.readlines():
 #|             if not line.startswith("#"):
 #|                 latest_rel_line = line
 #|                 #break
 #|                 all_rel_lines.append(line)
-#| 
+#|
 #|     if latest_rel_line != '':
 #|         for rel_line in all_rel_lines:
 #|             line = rel_line.strip().split(":")
@@ -11271,25 +11461,25 @@ if __name__ == "__main__":
 #|             b = int(ab[1])
 #|             fac0_hex = line[1].split(",")
 #|             fac1_hex = line[2].split(",")
-#| 
+#|
 #|             a = Integer(a)
 #|             b = Integer(b)
-#| 
+#|
 #|             fac0_int = [ Integer(y,16) for y in fac0_hex ]
 #|             fac1_int = [ Integer(y,16) for y in fac1_hex ]
-#| 
+#|
 #|             good_rel = True
-#| 
+#|
 #|             for alg_fac in fac1_int:
-#| 
+#|
 #|                 if int(alg_fac) == int(starting_q):
 #|                     continue
-#| 
+#|
 #|                 if gcd(b,alg_fac) != 1:
 #|                     r = alg_fac
 #|                 else:
 #|                     r = (a * inverse_mod(b,alg_fac)) % alg_fac
-#| 
+#|
 #|                 if (1,alg_fac,r) in ext_unlinked_ideals:
 #|                     # We have an unlinked ideal in our factorization
 #|                     good_rel = False
@@ -11298,12 +11488,12 @@ if __name__ == "__main__":
 #|                 if alg_fac > 2**used_lpb1:
 #|                     # shouldn't happen, really
 #|                     good_rel = False
-#| 
+#|
 #|             if good_rel:
 #|                 return a, b, fac0_hex, fac1_hex
 #|             else:
 #|                 continue
-#| 
+#|
 #|     else:
 #|         return -1, -1, [], []
 
@@ -11317,7 +11507,7 @@ if __name__ == "__main__":
 #| from run import parse_config
 #| from candy import print_command_line, major_message
 #| from sage.all import *
-#| 
+#|
 #| if __name__=='__main__':
 #|     parser = argparse.ArgumentParser(prog='hintfile_estimate.py', description='help write good hintfiles')
 #|     parser.add_argument('--side', dest='side', default="1", required=False)
@@ -11332,7 +11522,7 @@ if __name__ == "__main__":
 #|     parser.add_argument('--polyfile', dest='polyfile', required=False)
 #|     parser.add_argument('--fbfile', dest='fbfile', required=False)
 #|     args = parser.parse_args()
-#| 
+#|
 #|     with open(args.locations, "r") as locations:
 #|         for l in locations.readlines():
 #|             if re.search(r"^#", l):
@@ -11344,40 +11534,40 @@ if __name__ == "__main__":
 #|                 else:
 #|                     print(f"Using {var} from config file {args.locations}")
 #|                     os.environ[var] = value
-#| 
+#|
 #|     CADO_BUILD_DIR=os.environ['CADO_BUILD_DIR']
 #|     TEMP_OUTPUT_DIR=os.environ['TEMP_OUTPUT_DIR'] + f"n{args.nbits}/"
-#| 
+#|
 #|     las_descent_cmd = CADO_BUILD_DIR + "sieve/las_descent"
-#| 
+#|
 #|     if args.polyfile:
 #|         poly_file = args.polyfile
 #|     else:
 #|         poly_file = TEMP_OUTPUT_DIR + "f.poly"
-#| 
+#|
 #|     if args.fbfile:
 #|         fb_file = args.fbfile
 #|     else:
 #|         fb_file = TEMP_OUTPUT_DIR + "capped.fb.gz"
-#| 
+#|
 #|     current_hintfile = args.hintfile
 #|     seed = randint(0, 65535)
-#| 
+#|
 #|     parameters = parse_config(args.config)
-#| 
+#|
 #|     lim0 = min(2**31, 2**parameters['LPB0'], parameters['desc.lim'])
 #|     lim1 = min(2**31, 2**parameters['LPB1'], parameters['desc.lim'])
-#| 
+#|
 #|     if int(args.lpb0_custom) > 1:
 #|         lpb0 = int(args.lpb0_custom)
 #|     else:
 #|         lpb0 = parameters.get('LAS_DESCENT_UNTIL_LPB0', 'LPB0')
-#| 
+#|
 #|     if int(args.lpb1_custom) > 1:
 #|         lpb1 = int(args.lpb1_custom)
 #|     else:
 #|         lpb1 = parameters.get('LAS_DESCENT_UNTIL_LPB1', 'LPB1')
-#| 
+#|
 #|     descent_middle_cmd = [
 #|         las_descent_cmd,
 #|         "--recursive-descent",
@@ -11408,7 +11598,7 @@ if __name__ == "__main__":
 #|         '--bkthresh1', str(parameters.get('desc.bkthresh1', min(2**31, 2**lpb0, 2**lpb1))),
 #|         "-bkmult", parameters.get('desc.bkmult', "1s:1.1")
 #|     ]
-#| 
+#|
 #|     print_command_line(*descent_middle_cmd)
 #|     start = time.time()
 #|     print("launching subprocess...")
@@ -12513,8 +12703,8 @@ if __name__ == "__main__":
 #| 94@1 1.00 1.00 I=16 536870912,53,108 536870912,51,153
 #| 95@0 1.00 1.00 I=16 536870912,52,108 536870912,53,153
 #| 95@1 1.00 1.00 I=16 536870912,53,108 536870912,51,153
-#| 
-#| 
+#|
+#|
 #| 96@0 3.3888 1.0000 I=16 536870912,50,100 536870912,51,153
 #| 96@1 3.3888 1.0000 I=16 536870912,50,100 536870912,51,153
 #| 97@0 3.3888 1.0000 I=16 536870912,50,100 536870912,51,153
@@ -12845,7 +13035,7 @@ if __name__ == "__main__":
 
 #@ FILE code/how_to_make_a_hintfile.md 644 4230 bc10d9ac0c9aea5d4cdec7b4ea52fbaa14c5880ae3d860321164cdbe08437f24 text
 #| ### How to make a hintfile
-#| 
+#|
 #| Lines in a hintfile look like:
 #| ```
 #| 31@0 1.27 1.0000 I=16 536870912,29,62 536870912,29,85
@@ -12858,9 +13048,9 @@ if __name__ == "__main__":
 #| - I=16 is the sieving area
 #| - The first `536870912,29,62` is a tuple of (lim0,lpb0,mfb0) for side 0
 #| - The second `536870912,29,85` is a tuple of (lim1,lpb1,mfb1) for side 1
-#| 
+#|
 #| #### Evaluating a pre-existing hintfile
-#| 
+#|
 #| The script `hintfile_estimate.py` takes a given hintfile and special-q size, and times how long it takes
 #| to complete one run of descent starting from a random special-q of that size.
 #| Here's an example invocation:
@@ -12869,42 +13059,42 @@ if __name__ == "__main__":
 #| ```
 #| In the above, `bitsize` is the size of the special-q and `nbits` is the size of the modulus (the latter is needed
 #| to refer to file prefixes). `numtries` is the number of descents/random special-qs it will attempt.
-#| 
+#|
 #| For moduli of size 666+ bits, running descent takes a long time. There is a little template in `hintfile.slurm`
 #| for launching a job on slurm. Then it's easy to run several jobs, with one descent on each machine, using
 #| different input hintfiles. Different overall config files could be used as well.
-#| 
+#|
 #| Note that it's important to start optimizing a hintfile from the smallest special-q's, getting good parameters
 #| for those, then moving up to the larger ones. The smallest special-q size should be just around the minimum
 #| of the global LPB0, LPB1. The largest special-q varies, but around 100-120 is a reasonable guess, depending on
 #| things including the skewness of the polynomial. There will be a point around there where all descents start to fail
 #| due to errors about q being too large, or the lattice being too skewed. That point should be the largest
 #| special-q in the hintfile.
-#| 
+#|
 #| #### Writing an initial hintfile
-#| 
+#|
 #| 1. There should be a line for each special-q between the smallest and largest (which were just discussed above).
 #| There does not necessarily need to be an @0 and @1 for the entire range, but it's easy to just include all of them.
-#| 
+#|
 #| 2. The I parameter cannot exceed the `I_sieving` parameter in our config files. However it can, and probably should,
 #| be less than `I_sieving` for the smaller special-qs. A smaller sieving area means the job will allocate less memory.
 #| A starting point is simply to make the biggest one-third the maximum I value (I_sieving), the middle third one less,
 #| and the bottom third another one less.
-#| 
+#|
 #| 3. For a particular n, n@0 and n@1 don't need to have the same values, and an optimal hintfile probably has different
 #| values for them. For now I have kept them pretty similar but this could be investigated.
-#| 
+#|
 #| 4. The time and probability can be filled out arbitrarily (1 and 1, say).
-#| 
+#|
 #| 5. All of the lim0 values can be the same: `2**LPB0` for the global LPB0 in the config file.
 #| Similarly all of the lim1 values can be `2**LPB1` for the global LPB1.
-#| 
+#|
 #| 6. The lpb values are for the lower prime bound. This is the smoothness you try to achieve during an iteration
 #| at a particular special-q. Certainly it should be between the current q and the eventual lpb0/lpb1.
-#| 
+#|
 #| 7. The mfb values are for the cofactor sizes. mfb should be a multiple of lpb (no, this is not yet reflected
 #| in most of our parameters). A fine starting point is 2 times the corresponding lpb.
-#| 
+#|
 #| There are a few comments in `sieve/README.descent` including:
 #| ```
 #| Here are a few hints about the influential parameters. Increasing I will
@@ -12923,15 +13113,15 @@ if __name__ == "__main__":
 #| import multiprocessing as mp
 #| from os import makedirs, urandom, listdir
 #| import time
-#| 
+#|
 #| timeprint = lambda *args : print(f"{time.strftime("%Y-%M-%D")}:", *args)
-#| 
+#|
 #| take_first_n = lambda iterator, n : list(zip(*zip(iterator, range(n))))[0]
-#| 
+#|
 #| CRT_DIR = "/tmp/crt_demo"
 #| PRECOMP_DIR = f"{CRT_DIR}/precomp"
 #| RECONSTRUCT_DIR = f"{CRT_DIR}/reconstruct"
-#| 
+#|
 #| def lift(a, ainv, n):
 #|     """
 #|     Given a and its inverse ainv mod n,
@@ -12940,26 +13130,26 @@ if __name__ == "__main__":
 #|     y = 3 - 2*a*ainv
 #|     n2 = n**2
 #|     return (a**2, (y*ainv**2)%n2, n2)
-#| 
+#|
 #| def write_bigint(bigint, file):
 #|     with open(file, "wb") as f:
 #|         f.write(bigint.to_bytes(bigint.nbits() // 8 + 1, byteorder="little"))
-#| 
+#|
 #| def read_bigint(file):
 #|     with open(file, "rb") as f:
 #|         return Integer(int.from_bytes(f.read(), byteorder="little"))
-#| 
+#|
 #| def write_precomp(p, basiselt, jobdir):
 #|     makedirs(jobdir, exist_ok=True)
 #|     with open(f"{jobdir}/p", "w") as f:
 #|         print(p, file=f)
 #|     write_bigint(basiselt, f"{jobdir}/basiselt")
-#| 
+#|
 #| def read_precomp(jobdir):
 #|     with open(f"{jobdir}/p", "r") as f:
 #|         p = int(f.read().strip())
 #|     return (p, read_bigint(f"{jobdir}/basiselt"))
-#| 
+#|
 #| def precomputation_job(p, lg_ell, m, jobnum, datadir=PRECOMP_DIR):
 #|     """
 #|     Compute the CRT basis coefficient Q * (q^{-ell} mod p^ell),
@@ -12983,7 +13173,7 @@ if __name__ == "__main__":
 #|     del Q, ainv
 #|     # TODO: might be better for basiselts to be in [-M/2, M/2) instead of [0,M).
 #|     write_precomp(p, basiselt, f"{datadir}/{jobnum}")
-#| 
+#|
 #| def precomputation_M_job(m, ell, datadir=PRECOMP_DIR):
 #|     """
 #|     Precomputes the modulus M = m^ell, where m is the product of all the primes.
@@ -12993,16 +13183,16 @@ if __name__ == "__main__":
 #|     M = Integer(m)**ell
 #|     with open(f"{datadir}/M", "wb") as f:
 #|         f.write(M.to_bytes(M.nbits()//8+1, byteorder="little"))
-#| 
+#|
 #| def reconstruction_mult_job(jobnum, value=None, workdir=RECONSTRUCT_DIR, precompdir=PRECOMP_DIR, suffix="residue"):
 #|     makedirs(f"{workdir}/{jobnum}", exist_ok=True)
 #|     p, basiselt = read_precomp(f"{precompdir}/{jobnum}")
 #|     if value is None:
 #|         value = read_bigint(f"{precompdir}/{jobnum}/{suffix}")
 #|     write_bigint(basiselt * value, f"{workdir}/{jobnum}/basiselt_times_{suffix}")
-#| 
+#|
 #| #####
-#| 
+#|
 #| def precomp(ps, lg_ell, datadir):
 #|     ell = 2**lg_ell
 #|     m = prod(ps)
@@ -13015,8 +13205,8 @@ if __name__ == "__main__":
 #|     finally:
 #|         pool.close()
 #|         pool.join()
-#| 
-#| 
+#|
+#|
 #| def reconstruct(num_ps, datadir, suffix=""):
 #|     pool = mp.Pool()
 #|     try:
@@ -13037,9 +13227,9 @@ if __name__ == "__main__":
 #|     with open(f"{datadir}/result{suffix}.txt","w") as f:
 #|         print(out, file=f)
 #|     return out
-#| 
+#|
 #| #####
-#| 
+#|
 #| def demo_precomputation(n=50_000, k=50, lg_ell=8, primebits=10):
 #|     """
 #|     n: bitsize of value to reconstruct
@@ -13052,7 +13242,7 @@ if __name__ == "__main__":
 #|     m = prod(ps)
 #|     assert prod(ps).nbits() * ell >= n, f"CRT will reconstruct {prod(ps).nbits() * ell} bits but need {n}"
 #|     precomp(ps, lg_ell, PRECOMP_DIR)
-#| 
+#|
 #| def demo_make_residues(n=50_000, k=50, lg_ell=8):
 #|     digits = ceil(n / log(10,2)) - 2
 #|     value = Integer("7" * digits)
@@ -13062,7 +13252,7 @@ if __name__ == "__main__":
 #|         pn = p**(2**lg_ell)
 #|         residue = value % pn
 #|         write_bigint(residue, f"{PRECOMP_DIR}/{i}/residue")
-#| 
+#|
 #| def demo_reconstruction():
 #|     """
 #|     For now we're using the filesystem to communicate between jobs,
@@ -13088,8 +13278,8 @@ if __name__ == "__main__":
 #|     print("Result:", out)
 #|     write_bigint(out, f"{RECONSTRUCT_DIR}/result")
 #|     return out
-#|     
-#| 
+#$     $
+#|
 #| if __name__ == "__main__":
 #|     from sys import argv
 #|     if len(argv) >= 2 and argv[1] == "precomp":
@@ -13104,12 +13294,12 @@ if __name__ == "__main__":
 
 #@ FILE code/hybrid_root_find_primes.py 644 2280 ceb71b754181b5451c6faeb6412c6eb63a4d5911dcc725c1995e1a6bc296ba36 text
 #| from sage.all import *
-#| 
+#|
 #| from helpers import LinalgOutput
 #| from cado_sage import CadoPolyFile
 #| from misc_tools import fast_persistent_save, fast_persistent_load
 #| from timing import timeprint
-#| 
+#|
 #| def find_inert_primes(f, TTplus=[], TTminus=[], avoid=set()):
 #|     # Let's find 100 inert primes, then filter out any that fail the TTplus and TTminus checks
 #|     timeprint("Finding candidate inert primes")
@@ -13131,7 +13321,7 @@ if __name__ == "__main__":
 #|         if len(candidates) >= 100:
 #|             break
 #|     timeprint("Candidate inert primes:", candidates)
-#| 
+#|
 #|     out = []
 #|     for p in candidates:
 #|         timeprint(f"Checking {p}...")
@@ -13144,7 +13334,7 @@ if __name__ == "__main__":
 #|         out.append(p)
 #|     timeprint("Primes to use:", out)
 #|     return out
-#| 
+#|
 #| if __name__ == "__main__":
 #|     from sys import argv
 #|     if len(argv) < 5:
@@ -13170,16 +13360,16 @@ if __name__ == "__main__":
 #@ FILE code/hybrid_root_padic_job.py 644 4528 d388313faf32f76202c98045b74d185b8ac9a36d8dbb0d7587870d64e208e1c3 text
 #| from sage.all import *
 #| from timing import timeprint as timeprint_
-#| 
+#|
 #| timeprint = lambda *args, **kwargs : timeprint_(*args, flush=True, **kwargs)
-#| 
+#|
 #| def load_TTplusorminus(TTplusorminus_txt):
 #|     """ Returns an iterator that yields ((a,b),k) tuples"""
 #|     with open(TTplusorminus_txt,"r") as f:
 #|         for line in f:
 #|             a,b,k = [Integer(x) for x in line.strip().split()]
 #|             yield ((a,b),k)
-#| 
+#|
 #| def padic_root_job(TTplus, TTminus, f, p, e, gamma_fac, lg_ell):
 #|     timeprint("padic_root_job start")
 #|     # will be run as its own process, with its own workdir
@@ -13189,9 +13379,9 @@ if __name__ == "__main__":
 #|     #   p, lg_ell
 #|     # output:
 #|     #  list of the coefficients mod p^(2^lg_ell) of the eth root of (prod(TTplus)/prod(TTminus))/prod(gamma_fac)**e mod f(x)
-#|     
+#$     $
 #|     ZP = ZZ['x']
-#| 
+#|
 #|     d = f.degree()
 #|     # Ri is (Z/p^(2^i))[x]/f(x)
 #|     R0 = GF(p**(f.degree()), 'alpha_p', modulus=f)
@@ -13212,12 +13402,12 @@ if __name__ == "__main__":
 #|             exp = fac[1]
 #|             poly_alpha0 = nf_elt.polynomial().change_ring(R0)(alpha0)
 #|             rf0 *= (1/(poly_alpha0**exp))       # whole product is 1/gamma
-#| 
+#|
 #|     r0 = (z0 / y0 / rf0**e).nth_root(e)
 #|     # r0 = gamma * (z / y)^(1/e)
-#| 
+#|
 #|     y,z,u,r,R,pk,i,rf = y0,z0,u0,r0,R0,p,0,rf0
-#|     
+#$     $
 #|     while i < lg_ell:
 #|         # invariants:
 #|         assert pk == p**(2**i)
@@ -13228,60 +13418,60 @@ if __name__ == "__main__":
 #|         assert r in R
 #|         assert u * z == 1
 #|         assert r**e * y * rf**e * u == 1
-#| 
+#|
 #|         i += 1
 #|         pk = pk * pk
 #|         R = Integers(pk).extension(f)
-#| 
+#|
 #|         timeprint(f"Lifting to {p}^(2^{i})")
-#| 
+#|
 #|         r = ZP(r.list())(R.gen())
 #|         # lift the preinverse of z, too.
 #|         u = ZP(u.list())(R.gen())
-#| 
+#|
 #|         # Newton step
 #|         y = R(yl.list())
 #|         z = R(zl.list())
-#| 
+#|
 #|         # if u*z = 1+pb, then the higher order inverse of z is u*(1-pb)
 #|         # IOW, a Newton step on u: u becomes u*(1-(u*z-1))
 #|         u = u * (1 - (u * z - 1))
-#| 
+#|
 #|         rf = 1
-#| 
+#|
 #|         if gamma_fac is not None:
 #|             for fac in gamma_fac:
 #|                 nf_elt = fac[0]
 #|                 exp = fac[1]
 #|                 poly_R_gen = nf_elt.polynomial().change_ring(R)(R.gen())
 #|                 rf *= (1/(poly_R_gen**exp))     # whole product is 1/gamma
-#| 
+#|
 #|         # This is the Newton iteration on the function f(x) = y/z - x^-e
 #|         r += r * (1 - r**e * rf**e * y * u) / e
-#| 
+#|
 #|     # remember that we have computed the _inverse_ of the e-th
 #|     # root.
 #|     root = 1/r
-#| 
+#|
 #|     # there are d coefficients, we'll separately crt-reconstruct each one
 #|     out = root.list()
 #|     return out
-#| 
-#| 
+#|
+#|
 #| if __name__ == "__main__":
 #|     from sys import argv
 #|     if len(argv) < 8:
 #|         print(f"Usage: {argv[0]} p lg_ell workdir params.json TTplus.txt TTminus.txt gamma_fac.sobj")
 #|         exit(1)
-#| 
+#|
 #|     import json
 #|     from cado_sage import CadoPolyFile
 #|     from misc_tools import fast_persistent_load
 #|     from hybrid_root_crt import write_bigint
 #|     from os import makedirs
-#| 
+#|
 #|     timeprint("START!")
-#| 
+#|
 #|     p = Integer(argv[1])
 #|     assert p.is_prime()
 #|     lg_ell = Integer(argv[2])
@@ -13290,19 +13480,19 @@ if __name__ == "__main__":
 #|     TTplus_file = argv[5]
 #|     TTminus_file = argv[6]
 #|     gammafac_file = argv[7]
-#|     
+#$     $
 #|     makedirs(workdir, exist_ok=True)
-#|         
+#$         $
 #|     with open(params_file, 'r') as f:
 #|         params = json.load(f)
 #|     e = params['parameters']['e']
 #|     polyfile = params['files']['POLYFILE']
-#| 
+#|
 #|     timeprint("Loading f.poly...")
 #|     poly = CadoPolyFile(polyfile)
 #|     poly.read()
 #|     f = poly.f[1]
-#| 
+#|
 #|     timeprint("Opening TTplus...")
 #|     TTplus = load_TTplusorminus(TTplus_file)
 #|     timeprint("Opening TTminus...")
@@ -13310,39 +13500,39 @@ if __name__ == "__main__":
 #|     timeprint("Loading gamma_fac...")
 #|     gamma_fac = fast_persistent_load(gammafac_file)
 #|     timeprint("Everything is loaded!")
-#| 
+#|
 #|     out = padic_root_job(TTplus, TTminus, f, p, e, gamma_fac, lg_ell)
-#| 
+#|
 #|     timeprint("Finished padic_root_job!")
-#| 
+#|
 #|     for (i, residue) in enumerate(out):
 #|         write_bigint(residue.lift(), f"{workdir}/residue_{i}")
-#| 
+#|
 #|     timeprint("FINISHED!")
 
 #@ FILE code/hybrid_root_step.py 644 5720 c0c25de3c52976635bc6fa9f31830aba084690e89e62ae8b4ea65eaf11a8d0c1 text
 #| from sage.all import *
-#| 
+#|
 #| from os.path import exists
 #| from os import makedirs, mkdir
 #| from subprocess import run
 #| import json
-#| 
+#|
 #| from multiprocessing import Pool
-#| 
+#|
 #| from cado_sage import CadoPolyFile
 #| import hybrid_root_crt as crt
 #| from hybrid_root_find_primes import find_inert_primes
-#| 
+#|
 #| from misc_tools import fast_persistent_load
 #| from timing import timeprint
-#| 
+#|
 #| SAGE="/usr/local/sagemath/10.7/bin/sage"
-#| 
+#|
 #| # Assumes the following files already exist:
 #| # TTplus.sobj and TTminus.sobj (created by "sage run.py ... serialize_ttplus_ttminus")
 #| # gamma-fac.sobj
-#| 
+#|
 #| # STEPS
 #| # 1) Create crt_primes if it doesn't exist by calling hybrid_root_find_primes.py
 #| # 2) Create one workdir per prime, in {datadir}/padic_jobs/{jobno}
@@ -13353,7 +13543,7 @@ if __name__ == "__main__":
 #| # 6) Run CRT reconstruction on each coefficient separately, giving a polynomial mod M (and mod f(x))
 #| # 7) Do rational reconstruction on the polynomial as follows:
 #| # Return a(x)/b(x)
-#| 
+#|
 #| def run_hybrid_root_step(bits_to_reconstruct, datadir, limit_jobs=0):
 #|     with open(f"{datadir}/params.json","r") as f:
 #|         params = json.load(f)
@@ -13361,11 +13551,11 @@ if __name__ == "__main__":
 #|     poly = CadoPolyFile(polyfile)
 #|     poly.read()
 #|     f = poly.f[1]
-#| 
+#|
 #|     ps = create_crt_primes(datadir, f, params['parameters']['e'])
-#| 
+#|
 #|     create_workdirs(datadir, ps)
-#| 
+#|
 #|     ell = Integer(ceil(bits_to_reconstruct / prod(ps).nbits()))
 #|     lg_ell = Integer(ceil(log(ell,2)))
 #|     ell = 2**lg_ell
@@ -13373,7 +13563,7 @@ if __name__ == "__main__":
 #|     timeprint(f"Will run p-adic steps up to p^(2^{lg_ell}),"
 #|           f" with {len(ps)} primes in parallel,"
 #|           f" for a total of {sum(ell*log(p,2) for p in ps).n():.1f} bits")
-#|     
+#$     $
 #|     if exists(f"{datadir}/padic_jobs/M"):
 #|         timeprint("M file exists, assuming CRT precomp has already been done")
 #|     else:
@@ -13381,7 +13571,7 @@ if __name__ == "__main__":
 #|         crt.precomp(ps, lg_ell, datadir=f"{datadir}/padic_jobs")
 #|         timeprint("Done with CRT precomp")
 #|     M = crt.read_bigint(f"{datadir}/padic_jobs/M")
-#|     
+#$     $
 #|     timeprint("Launching parallel p-adic jobs")
 #|     num_processes = limit_jobs if limit_jobs > 0 else None
 #|     with Pool(num_processes) as pool:
@@ -13396,18 +13586,18 @@ if __name__ == "__main__":
 #|         pool.close()
 #|         pool.join()
 #|     timeprint("All parallel p-adic jobs done")
-#| 
+#|
 #|     timeprint("Start CRT reconstruction")
 #|     cx = [None] * f.degree()
 #|     for i in range(f.degree()):
 #|         timeprint(f"Reconstructing x^{i} coefficient")
 #|         cx[i] = crt.reconstruct(len(ps), datadir=f"{datadir}/padic_jobs", suffix=f"_{i}")
 #|         timeprint(f"Done reconstructing x^{i} coefficient")
-#| 
+#|
 #|     timeprint("Finished CRT reconstruction")
 #|     timeprint("Starting rational reconstruction")
 #|     return rational_reconstruction(cx, f, M)
-#| 
+#|
 #| def rational_reconstruction(cx, f, M):
 #|     """
 #|     cx: list of coefficients of a polynomial mod M, f(x)
@@ -13436,7 +13626,7 @@ if __name__ == "__main__":
 #|     rd = ZP(coeffs[n:])
 #|     assert rn(alpha) - cx * rd(alpha) == 0
 #|     return rn / rd
-#| 
+#|
 #| def create_crt_primes(datadir, f, e):
 #|     if not exists(f"{datadir}/crt_primes"):
 #|         ps = find_inert_primes(f,
@@ -13451,15 +13641,15 @@ if __name__ == "__main__":
 #|         timeprint("using existing crt_primes")
 #|         with open(f"{datadir}/crt_primes","r") as fd:
 #|             return [Integer(x) for x in fd.read().strip().lstrip("[").rstrip("]").split(", ")]
-#| 
+#|
 #| def create_workdirs(datadir, ps):
 #|     makedirs(f"{datadir}/padic_jobs", exist_ok=True)
 #|     for (i, p) in enumerate(ps):
 #|         makedirs(f"{datadir}/padic_jobs/{i}", exist_ok=True)
 #|         with open(f"{datadir}/padic_jobs/{i}/p","w") as f:
 #|             print(p, file=f)
-#|     
-#| 
+#$     $
+#|
 #| def run_padic_job(i, p, lg_ell, datadir):
 #|     with open(f"{datadir}/padic_jobs/{i}/padic.stdout",'a') as stdout:
 #|         with open(f"{datadir}/padic_jobs/{i}/padic.stderr",'a') as stderr:
@@ -13475,19 +13665,19 @@ if __name__ == "__main__":
 #|                 f"{datadir}/gamma-fac.sobj"],
 #|                 stdout=stdout, stderr=stderr
 #|             )
-#| 
+#|
 
 #@ FILE code/json_custom.py 644 2809 330971b43dd23d3ccda3adb840bd7b7470485b9ba7eacc35f0b83d10b53f9969 text
 #| import json
 #| import abc
-#| 
-#| 
+#|
+#|
 #| class json_custom_serializable(abc.ABC):
 #|     """
 #|     Inherit from this class, and define the member functions as_dict()
 #|     and to_dict(), in order to get json serialization.
 #|     """
-#| 
+#|
 #|     # the sage.rings.integer.Integer thing is only a convenient special
 #|     # case so that sage doesn't pester me with long ints not being
 #|     # serializable to json
@@ -13498,12 +13688,12 @@ if __name__ == "__main__":
 #|             'sage.rings.real_double_element_gsl.RealDoubleElement_gsl': float
 #|             }
 #|     decoders = {}
-#| 
+#|
 #|     def __init_subclass__(cls):
 #|         key = f"{cls.__module__}.{cls.__name__}"
 #|         cls.encoders[key] = cls.as_dict
 #|         cls.decoders[key] = cls.from_dict
-#| 
+#|
 #|     @abc.abstractmethod
 #|     def as_dict(self):
 #|         """
@@ -13513,7 +13703,7 @@ if __name__ == "__main__":
 #|         out, in most cases we don't need the full memory.
 #|         """
 #|         pass
-#| 
+#|
 #|     @classmethod
 #|     @abc.abstractmethod
 #|     def from_dict(cls):
@@ -13522,10 +13712,10 @@ if __name__ == "__main__":
 #|         current class
 #|         """
 #|         pass
-#| 
-#| 
+#|
+#|
 #| # idea from https://mathspp.com/blog/custom-json-encoder-and-decoder
-#| 
+#|
 #| class MyEncoder(json.JSONEncoder):
 #|     def default(self, obj):
 #|         module = type(obj).__module__
@@ -13541,33 +13731,33 @@ if __name__ == "__main__":
 #|             return d
 #|         else:
 #|             super().default(obj)
-#| 
-#| 
+#|
+#|
 #| class MyDecoder(json.JSONDecoder):
 #|     def __init__(self, **kwargs):
 #|         kwargs["object_hook"] = self.object_hook
 #|         super().__init__(**kwargs)
-#| 
+#|
 #|     def object_hook(self, obj):
 #|         try:
 #|             name = obj["__extended_json_type__"]
 #|             return json_custom_serializable.decoders[name](obj)
 #|         except (KeyError, AttributeError):
 #|             return obj
-#| 
-#| 
+#|
+#|
 #| def dumps(*args, **kwargs):
 #|     return json.dumps(*args, cls=MyEncoder, **kwargs)
-#| 
-#| 
+#|
+#|
 #| def loads(*args, **kwargs):
 #|     return json.loads(*args, cls=MyDecoder, **kwargs)
-#| 
-#| 
+#|
+#|
 #| def dump(*args, **kwargs):
 #|     return json.dump(*args, cls=MyEncoder, **kwargs)
-#| 
-#| 
+#|
+#|
 #| def load(*args, **kwargs):
 #|     return json.load(*args, cls=MyDecoder, **kwargs)
 
@@ -13580,9 +13770,9 @@ if __name__ == "__main__":
 #| BWC_SLURM_JOB_PARTITION=ultraprio-88-cores
 
 #@ FILE code/makefile.binaries 644 2575 06f4d139f11e6d999b69e61df53806f242e10969775ddce9b311b6d50c8b1e43 text
-#| 
+#|
 #| MPI?=0
-#| 
+#|
 #| cado_targets:=
 #| cado_targets+=polyselect
 #| cado_targets+=las las_descent makefb
@@ -13595,24 +13785,24 @@ if __name__ == "__main__":
 #| cado_targets+=numbertheory_tool
 #| cado_targets+=mf_scan2 bwc_full_gfp lingen_p1
 #| cado_targets+=polyselect polyselect_ropt
-#| 
+#|
 #| ncpus:=$(shell nproc)
-#| 
+#|
 #| all::
-#| 
+#|
 #| clean:
 #| 	rm -rf build
 #| 	find . -type d -name "__pycache__" -exec rm -rf {} \; || true
-#| 
+#|
 #| cado-target-%:
 #| 	mkdir -p build || :
 #| 	MPI=${MPI} force_build_tree=$$PWD/build make -C ./cado -j$(ncpus) $*
-#| 
+#|
 #| all:: clean $(patsubst %,cado-target-%,$(cado_targets)) lib-deps elf-hack
-#| 
-#| 
+#|
+#|
 #| SHELL:=bash
-#| 
+#|
 #| patchelf:=$(shell type -p patchelf)
 #| ifneq ($(findstring sage,$(patchelf)),)
 #| $(info Not using patchelf from sage)
@@ -13620,10 +13810,10 @@ if __name__ == "__main__":
 #| else
 #| $(info patchelf is $(patchelf))
 #| endif
-#| 
-#| 
+#|
+#|
 #| ifneq ($(patchelf),)
-#| 
+#|
 #| lib-deps:
 #| 	mkdir -p libs || :
 #| 	cp -f /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 libs/
@@ -13640,63 +13830,63 @@ if __name__ == "__main__":
 #| 	cp -f /lib/x86_64-linux-gnu/libm.so* libs/
 #| 	cp -f /lib/x86_64-linux-gnu/libudev.so* libs/
 #| 	cp -f /lib/x86_64-linux-gnu/libdl.so* libs/
-#| 
-#| 
+#|
+#|
 #| elf-hack:
 #| 	find build/ \( -name CMakeFiles -o -name gf2x \) -a -prune -o -type f -a -perm -001 -a \! \( -name \*.a -o -name \*.pl -o -name \*.py \) -a -print | while read f ; do echo $$f ; patchelf --add-rpath $$PWD/libs $$f ; done
 #| 	find libs/ \( -name CMakeFiles -o -name gf2x \) -a -prune -o -type f -a \! \( -name \*.a -o -name \*.pl -o -name \*.py \) -a \! -size -1024c -a \! -name ld-linux\* -a -print | while read f ; do echo $$f ; patchelf --add-rpath $$PWD/libs $$f ; done
 #| 	find build/ \( -name CMakeFiles -o -name gf2x \) -a -prune -o -type f -a -perm -001 -a \! \( -name \*.a -o -name \*.pl -o -name \*.py -o -name \*.so \) -a -print | while read f ; do echo $$f ; patchelf --set-interpreter $$PWD/libs/ld-linux-x86-64.so.2 $$f ; done
 #| else
 #| lib-deps::
-#| 
+#|
 #| elf-hack::
 #| 	@echo NOTE: "patchelf not found, the binaries in $$PWD/build may not be transportable to other machines"
 #| 	@echo NOTE: "(but if you use them on this host only, it should be ok!)"
-#| 
+#|
 #| endif
 
 #@ FILE code/matrix_helpers.py 644 1001 8764a4a803448420a944a7e577099dee3d16cc03b40b4811d71222bc98529a20 text
 #| from sage.all import *
-#| 
+#|
 #| from sparse_dot_mkl import dot_product_mkl
 #| import numpy as np
 #| from scipy.sparse import csr_array, bmat
-#| 
-#| 
+#|
+#|
 #| class M_wrapper_2(object):
 #|     # Wrapper around the expected M sage matrix.
 #|     # We call nrows() and ncols() frequently.
 #|     # Otherwise it's a scipy 64-bit-integer matrix.
-#| 
+#|
 #|     def __init__(self, scipy_matrix):
-#| 
+#|
 #|         self._nrows = scipy_matrix.dimensions()[0]
 #|         self._ncols = scipy_matrix.dimensions()[1]
 #|         self._scipy_M = scipy_matrix
-#| 
+#|
 #|     def nrows(self):
 #|         return self._nrows
-#| 
+#|
 #|     def ncols(self):
 #|         return self._ncols
-#| 
+#|
 #|     def scipy_M(self):
 #|         return self._scipy_M
-#| 
-#| 
+#|
+#|
 #| class MC_wrapper(object):
 #|     # Wrapper around the expected MC sage matrix.
 #|     # We call nrows() and ncols() frequently.
 #|     # Otherwise we can get MC from M and S_block.
-#| 
+#|
 #|     def __init__(self, nrows, ncols):
-#| 
+#|
 #|         self._nrows = nrows
 #|         self._ncols = ncols
-#| 
+#|
 #|     def nrows(self):
 #|         return self._nrows
-#| 
+#|
 #|     def ncols(self):
 #|         return self._ncols
 
@@ -13706,27 +13896,27 @@ if __name__ == "__main__":
 #| import subprocess
 #| import logging
 #| import json
-#| 
+#|
 #| from math import sqrt, floor, ceil
-#| 
+#|
 #| ncpus = os.cpu_count() // 2
-#| 
+#|
 #| def cat_or_zcat(filename):
 #|     """
 #|     Inspired by `tests/sagemath/cado_sage/tools.py` but faster!
-#| 
+#|
 #|     return an iterable over the file contents, which might
 #|     involve decrypting it.
-#| 
+#|
 #|     Preference order (depending on availability): xopen, zcat.
 #|     """
-#| 
+#|
 #|     try:
 #|         from xopen import xopen
 #|         return xopen(filename, mode="r", threads=ncpus)
 #|     except ModuleNotFoundError:
 #|         logging.warning("Install xopen for faster decompression.")
-#| 
+#|
 #|     if re.search(r"\.gz$", filename):
 #|         # Use pigz binary if available.
 #|         if os.path.isfile("/usr/bin/pigz"):
@@ -13743,11 +13933,11 @@ if __name__ == "__main__":
 #|                                     stderr=subprocess.PIPE).stdout
 #|     else:
 #|         return open(filename)
-#| 
+#|
 #| def try_xopen_write(filename: str, content):
 #|     if type(content) == str:
 #|         content = content.encode()
-#| 
+#|
 #|     try:
 #|         from xopen import xopen
 #|         with xopen(filename, mode="wb", format="zst", threads=ncpus) as fp:
@@ -13755,9 +13945,9 @@ if __name__ == "__main__":
 #|         return True
 #|     except ModuleNotFoundError:
 #|         logging.warning("Install xopen for faster compression.")
-#| 
+#|
 #|     return False
-#| 
+#|
 #| def try_xopen_load(filename: str):
 #|     try:
 #|         from xopen import xopen
@@ -13765,22 +13955,22 @@ if __name__ == "__main__":
 #|             return fp.read()
 #|     except ModuleNotFoundError:
 #|         logging.warning("Install xopen for faster decompression.")
-#| 
+#|
 #|     return None
-#| 
+#|
 #| def fast_persistent_save(obj, filename, compress=True):
 #|     """
 #|     Save a sage object `obj` persistently and compressed in file `filename`
 #|     using faster, parallelized compression (if available) than the sage function
 #|     sage.misc.persist.save.
-#| 
+#|
 #|     If compress = True tries first xopen (fastest) then sage.misc.persist.save.
-#| 
+#|
 #|     Else (compress = False), use sage.misc.persist.save with disabled compression.
 #|     """
-#| 
+#|
 #|     import sage.misc.persist
-#|     
+#$     $
 #|     if compress:
 #|         obj_bytes = sage.misc.persist.dumps(obj, compress=False)
 #|         if try_xopen_write(filename, obj_bytes):
@@ -13788,29 +13978,29 @@ if __name__ == "__main__":
 #|         sage.misc.persist.save(obj, filename, protocol=-1)
 #|     else:
 #|         sage.misc.persist.save(obj, filename, protocol=-1, compress=False)
-#| 
+#|
 #| def fast_persistent_load(filename):
 #|     """
 #|     Load the object stored in file `filename` using faster, parallelized
 #|     decompression (if needed) than the sage function sage.misc.persist.load.
-#| 
+#|
 #|     Tries first xopen (fastest), then sage.misc.persist.load.
 #|     """
-#| 
+#|
 #|     import sage.misc.persist
 #|     obj = try_xopen_load(filename)
-#| 
+#|
 #|     if obj == None:
 #|         return sage.misc.persist.load(filename)
-#| 
+#|
 #|     return sage.misc.persist.loads(obj)
-#| 
+#|
 #| def fast_json_dumps(d, *args, decode=True, **kwargs):
 #|     """
 #|     Export dictionary `d` as JSON string, using a faster json package
 #|     than json.dumps (if available).
 #|     """
-#| 
+#|
 #|     try:
 #|         import orjson
 #|         j = orjson.dumps(d, *args, **kwargs)
@@ -13823,57 +14013,57 @@ if __name__ == "__main__":
 #|         if not decode:
 #|             j = j.encode()
 #|         return j
-#| 
+#|
 #| def fast_json_dump(d, filename, *args, compress="auto", **kwargs):
 #|     """
 #|     Save the dictionary `d` to file `filename`, using a faster json package
 #|     than json.dump (if available) and compression (if the disctionary is large
 #|     or compress = True).
 #|     """
-#| 
+#|
 #|     d_json = fast_json_dumps(d, *args, decode=False, **kwargs)
-#| 
+#|
 #|     if compress == "auto":
 #|         # heuristic boundary.
 #|         compress = len(d) > 5000000
-#| 
+#|
 #|     if compress:
 #|         if try_xopen_write(filename, d_json):
 #|             return
 #|         logging.warning("Falling back to uncompressed storage")
-#| 
+#|
 #|     with open(filename, "w") as fp:
 #|         fp.write(d_json.decode())
-#| 
+#|
 #| def fast_json_loads(d_str, *args, **kwargs):
 #|     """
 #|     Convert JSON string `d_str` to dictionary, using a faster json package
 #|     than json.load (if available).
 #|     """
-#| 
+#|
 #|     try:
 #|         import orjson
 #|         return orjson.loads(d_str, *args, **kwargs)
 #|     except ModuleNotFoundError:
 #|         logging.warning("Install orjson for faster JSON loading. Falling back to json.load.")
-#| 
+#|
 #|     return json.loads(d_str, *args, **kwargs)
-#| 
+#|
 #| def fast_json_load(filename, *args, **kwargs):
 #|     """
 #|     Load a dictionary in json format from file `filename`, using a faster json package
 #|     than json.load (if available) and fast decompression (if necessary).
 #|     """
-#| 
+#|
 #|     d_str = try_xopen_load(filename)
-#| 
+#|
 #|     if d_str == None:
 #|         logging.warning("Falling back to json.load")
 #|         with open(filename, "r") as fp:
 #|             return json.load(fp, *args, **kwargs)
-#| 
+#|
 #|     return fast_json_loads(d_str, *args, **kwargs)
-#| 
+#|
 #| def read_until(in_fp, expected_char, buf):
 #|     """
 #|     Read from in_fp until and including `expected_char`, returning characters read too much in buf.
@@ -13889,7 +14079,7 @@ if __name__ == "__main__":
 #|             return None, new_data
 #|         new_data += new_chunk
 #|     return new_data[:char_pos+1], new_data[char_pos+1:]
-#| 
+#|
 #| def fast_json_query_load(filename):
 #|     """
 #|     Read queries (key, value) format (int, int), streaming the file manually,
@@ -13897,11 +14087,11 @@ if __name__ == "__main__":
 #|     """
 #|     logging.info(f"Starting to parse json from file {filename} using custom parser")
 #|     json_format = re.compile(rb'\s*"(-?\d+)"\s*:\s*"(-?\d+)"[,}]\s*')
-#| 
+#|
 #|     with open(filename, "rb") as fp:
 #|         data, buf = read_until(fp, b'{', b"")
 #|         assert data == b'{'
-#| 
+#|
 #|         while data != None:
 #|             data, buf = read_until(fp, b',', buf)
 #|             to_parse = data if data != None else buf
@@ -13911,13 +14101,13 @@ if __name__ == "__main__":
 #|                 break
 #|             k, v = map(int, m.groups())
 #|             yield (k, v)
-#| 
+#|
 #|         closing_bracket_pos = buf.find(b"}")
 #|         if closing_bracket_pos >= 0:
 #|             buf = buf[closing_bracket_pos+1:]
 #|         if buf.strip() != b"":
 #|             logging.error(f"Unexpected trailing data {buf}")
-#| 
+#|
 #| def find_factors_close_to_square_root(i):
 #|     """
 #|     Given i, find a * b < i such that a, b are close to sqrt(i).
@@ -13927,7 +14117,7 @@ if __name__ == "__main__":
 #|     a = floor(isqrt)
 #|     b = ceil(isqrt)
 #|     suboptimal_sol = None
-#| 
+#|
 #|     while a * b != i:
 #|         if a * b > i:
 #|             a -= 1
@@ -13935,12 +14125,12 @@ if __name__ == "__main__":
 #|             if not suboptimal_sol:
 #|                 suboptimal_sol = (a, b)
 #|             b += 1
-#| 
+#|
 #|         # Accept suboptimal solution before it factors diverge too much
 #|         if b - a > isqrt // 2 and suboptimal_sol:
 #|             a, b = suboptimal_sol
 #|             break
-#| 
+#|
 #|     return f"{a}x{b}"
 
 #@ FILE code/montgomery_ethroot.py 644 27490 db45239583c892f6f4f41f70819ecdf18168702e0170e5a2150e9d5f254c3108 text
@@ -13950,27 +14140,27 @@ if __name__ == "__main__":
 #| from timing import *
 #| from collections import defaultdict
 #| from sage.misc.persist import SagePickler, SageUnpickler
-#| 
+#|
 #| from functools import partial
-#| 
+#|
 #| from cado_sage import CadoPolyFile
 #| from cado_sage import CadoIndexFile
 #| from cado_sage import CadoNumberTheory
-#| 
+#|
 #| from candy import major_message, warning_message, error_message
 #| import montgomery_reduction_new
 #| from montgomery_reduction_new import CadoMontgomeryReductionProcess, AccumulateLog
-#| 
+#|
 #| from misc_tools import fast_persistent_save, fast_persistent_load
-#| 
+#|
 #| from tocfile import RandomAccessIndexedRelations
 #| from random_access_renumber import RandomAccessRenumberTable
-#| 
+#|
 #| import padic_eth_root
 #| import concurrent.futures
 #| import glob
-#| 
-#| 
+#|
+#|
 #| def sanity_check_eth_root_input(params, linalg_output):
 #|     N = params.poly.N
 #|     target = params.target
@@ -13981,17 +14171,17 @@ if __name__ == "__main__":
 #|     v = target_info['v']
 #|     e = params.parameters['e']
 #|     assert params.target  * mask**e == ZN(u/v)
-#| 
+#|
 #|     drels = target_info['DRELS_FILE']
-#| 
+#|
 #|     fac_uv = u.factor() / v.factor()
-#| 
+#|
 #|     epsilon = fac_uv.unit()
-#| 
+#|
 #|     rat_primes_queried = [(p,k) for p,k in fac_uv if p < params.BOUNDR]
 #|     rat_primes_descended = [(p,k) for p,k in fac_uv if p >= params.BOUNDR]
-#| 
-#| 
+#|
+#|
 #| def column_to_sage_ideal_parallelizable_new(col_index, explain_renumber_filename, polyfile):
 #|     global my_cadopoly
 #|     # Reading a CadoPolyFile takes around a tenth of a second, so we only want to make a new CadoPolyFile once per worker process instead of once per function call
@@ -14004,14 +14194,14 @@ if __name__ == "__main__":
 #|     # This way it gets done in parallel instead of singlethreaded
 #|     hash(ideal)
 #|     return SagePickler.dumps(ideal)
-#| 
+#|
 #| def column_to_sage_ideal_parallelizable(col_index, ideal, has_merged_J, poly, side_hint=None):
 #|     """
 #|     Parallelization-friendly version of CadoExplainRenumberFile.column_to_sage_ideal
 #|     from helpers.py
 #|     """
 #|     parser, side, Idata, _col_index = ideal
-#| 
+#|
 #|     if parser == 'J' and has_merged_J:
 #|         # This case is special, really.
 #|         assert side_hint is not None    # what can we do?
@@ -14019,17 +14209,17 @@ if __name__ == "__main__":
 #|         assert _col_index == (_col_index[0],)*len(side)
 #|         side = side[side_hint]
 #|         _col_index = _col_index[side_hint]
-#| 
+#|
 #|     assert _col_index == col_index
-#| 
+#|
 #|     # XXX this assert is a bit excessive in full generality.
 #|     # Perhaps we'd like to assert side == side_hint, at most.
 #|     assert side == 1
-#| 
+#|
 #|     K = poly.K
 #|     J = poly.nt.J()
 #|     OK = poly.nt.maximal_orders()
-#| 
+#|
 #|     if parser == 'J':
 #|         I = J[side]
 #|     elif parser == 'rat':
@@ -14047,8 +14237,8 @@ if __name__ == "__main__":
 #|     else:
 #|         raise AssertionError("Unknown parser:", parser)
 #|     return SagePickler.dumps(I)
-#| 
-#| 
+#|
+#|
 #| def compute_logmap_parallelizable(abm, *, alpha, real_roots, complex_roots, prec):
 #|     """
 #|     Parallelizable version of LogMap.
@@ -14061,10 +14251,10 @@ if __name__ == "__main__":
 #|     R = RealIntervalField(prec)
 #|     return vector([R(abs(g(root))).log() for root in real_roots] +
 #|                   [2 * R(abs(g(root))).log() for root in complex_roots]) * m
-#| 
+#|
 #| # Create this object so that I don't have to copy-paste the complete
 #| # boilerplate all the time
-#| 
+#|
 #| class eth_root_montgomery_object(object):
 #|     def __init__(self, params, linalg_output):
 #|         self.params = params
@@ -14081,7 +14271,7 @@ if __name__ == "__main__":
 #|         self.S_rat_vector  = linalg_output.S_rat_vector
 #|         # self.idx_rel_file  = linalg_output.indexed_relations_file
 #|         self.idx_rel_file  = params.files['AQRELS_FILE'] + ".indexed"
-#| 
+#|
 #|         self.e = params.parameters['e']
 #|         self.poly = params.poly
 #|         self.N = params.poly.N
@@ -14095,24 +14285,24 @@ if __name__ == "__main__":
 #|         self.d = self.K.degree()
 #|         if not params.montgomery_new_renumber:
 #|             self.R = params.R
-#| 
+#|
 #|         self.extra_checks = False
-#| 
+#|
 #|         self.OK = self.K.ring_of_integers()
-#| 
+#|
 #|         # these are computed by functions below
 #|         self.U_list = None
 #|         self.sol_M = None
 #|         self.ideals = None
 #|         self.valuations = None
 #|         self.big_power_valuations = None
-#| 
+#|
 #|         # self.big_power is only computed when self.extra_checks == True,
 #|         # which is just for debugging (and most of what it does is
 #|         # horribly expensive anyway)
 #|         self.big_power = None
 #|         timeprint("eth_root_montgomery_object init done")
-#| 
+#|
 #|     # Here we compute sol * M, not reducing mod e
 #|     # This code is basically just run_sol_sanity_checks from helpers.py, but not reducing mod e
 #|     @timing
@@ -14144,7 +14334,7 @@ if __name__ == "__main__":
 #|         timeprint("sol*M assert")
 #|         assert (self.sol_M + self.ST_alg_vector).change_ring(Integers(e)).is_zero()
 #|         return self.sol_M
-#| 
+#|
 #|     def compute_target_ideals_and_valuations(self):
 #|         """
 #|         based on ST_alg_vector and sol_M, compute the target ideals and
@@ -14158,7 +14348,7 @@ if __name__ == "__main__":
 #|         # We actually want the valuations of the eth root, not the eth
 #|         # power, so divide the vector by e
 #|         W = (W / self.e).change_ring(ZZ)
-#| 
+#|
 #|         # We now need the ideals that correspond to the entries of the target_valuations vector (i.e., that correspond to the columns of our matrix)
 #|         # Look up the ideals corresponding to each nonzero column
 #|         timeprint("Looking up relevant sage ideals...")
@@ -14166,7 +14356,7 @@ if __name__ == "__main__":
 #|         # always include J
 #|         nz.add(0)
 #|         nz = sorted(list(nz))
-#| 
+#|
 #|         # TODO: MPI deactivated because it runs into the following error when ran across machines:
 #|         # PMIX ERROR: PMIX_ERROR in file ../../../../3rd-party/prrte/src/prted/pmix/pmix_server_dyn.c at line 1112
 #|         if False: #self.params.mpi:
@@ -14176,9 +14366,9 @@ if __name__ == "__main__":
 #|         else:
 #|             max_workers = self.params.nthreads
 #|             ProcessPool = concurrent.futures.ProcessPoolExecutor
-#| 
+#|
 #|         max_workers = 11
-#| 
+#|
 #|         if self.params.montgomery_new_renumber:
 #|             timeprint(f"Starting parallel column-to-sage-ideal ({max_workers} max workers) WITH random access renumber table")
 #|             explain_renumber_filename = self.params.files['EXPLAIN_RENUMBER_FILE']
@@ -14216,18 +14406,18 @@ if __name__ == "__main__":
 #|             self.ideals = [SageUnpickler.loads(future.result()) for future in futures]
 #|             timeprint("Finished loading self.ideals")
 #|             timeprint(f"Finished parallel column-to-sage-ideal")
-#| 
+#|
 #|         self.valuations = vector([W[i] for i in nz])
 #|         self.big_power_valuations = self.e * self.valuations
-#| 
+#|
 #|         timeprint(f"len(ideals) = len(valuations) = {len(nz)} (ideals that never appear are not counted)."
 #|               f" (len(target vector) was {len(W)})")
-#| 
-#| 
+#|
+#|
 #|     def column_to_ideal(self, col):
 #|         return self.params.R.column_to_sage_ideal(col,
 #|                                                   side_hint=self.side)
-#| 
+#|
 #|     def compute_U_list(self):
 #|         """
 #|         return the list of (a,b) pairs, together with their exponent,
@@ -14236,7 +14426,7 @@ if __name__ == "__main__":
 #|         self.U_list = [(self.row_to_aquery[i], self.sol[i]) for i in
 #|                        self.sol.nonzero_positions()]
 #|         return self.U_list
-#| 
+#|
 #|     def compute_big_power(self):
 #|         timeprint("Doing a bunch of really incredibly slow debugging checks")
 #|         # print(ST_list)
@@ -14245,7 +14435,7 @@ if __name__ == "__main__":
 #|         ST_ideal_from_vector = prod(
 #|                 self.column_to_ideal(col)**self.ST_alg_vector[col]
 #|                 for col in self.ST_alg_vector.nonzero_positions())
-#| 
+#|
 #|         ideals_dict = {self.column_to_ideal(col):col
 #|                        for col in range(self.params.R.number_of_algebraic_columns())}
 #|         # print(ST_ideal_from_vector)
@@ -14258,7 +14448,7 @@ if __name__ == "__main__":
 #|         else:
 #|             I_ST = ST_ideal_from_list / ST_ideal_from_vector
 #|             timeprint([(ideals_dict[aa],k) for aa,k in I_ST.factor()])
-#| 
+#|
 #|         # print(U_list)
 #|         # print(len(sol_M))
 #|         # print(sol_M)
@@ -14276,9 +14466,9 @@ if __name__ == "__main__":
 #|         else:
 #|             I_U = U_ideal_from_list / U_ideal_from_vector
 #|             timeprint([(ideals_dict[aa],k) for aa,k in I_U.factor()])
-#| 
+#|
 #|         self.big_power = big_ST * big_U
-#| 
+#|
 #|     def check_power(self):
 #|         q = ZZ(1)
 #|         while True:
@@ -14301,7 +14491,7 @@ if __name__ == "__main__":
 #|                 return z **((q-1)//self.e)
 #|             except ZeroDivisionError:
 #|                 q += self.e
-#| 
+#|
 #|     def check_invariant(self, MM):
 #|         timeprint("Doing consistency check on MM (LONG!)")
 #|         for i,I in enumerate(self.ideals):
@@ -14318,21 +14508,21 @@ if __name__ == "__main__":
 #|                     timeprint(f"Weird valuation at ideal {i} [[{I}]]: {vb/e},{vm}")
 #|                     assert False
 #|         timeprint("Doing consistency check on MM: OK")
-#| 
+#|
 #| @timing
 #| def eth_root_montgomery(params, linalg_output):
 #|     """
 #|     Here are all the relevant algebraic numbers and vectors and whatnot:
-#| 
+#|
 #|     ST: an algebraic number that comes from descent. Smooth over our factor base. We get it in two forms:
 #|     ST_alg_vector: vector giving the valuation of ST at each ideal (as an integer vector, not mod e). Output by truncate_S. This is the target vector for linalg (except for character columns and reduction mod e).
 #|     ST_list: list of (a,b,m) pairs where prod (a - b x)^m = ST.
-#| 
+#|
 #|     sol: vector over Zmod(e) that is the output of linalg. sol * M = -ST mod e.
 #|     sol * M  corresponds to  U(alpha) = prod_i (x_i - y_i alpha)^m_i.  These (x - y alpha) are all in our query base (and correspond to rows of M). The (x,y,m) here are NOT ST_list!
-#| 
+#|
 #|     The value we want to take the eth root of is ST(alpha) U(alpha), which is guaranteed to be an eth power in the number field.
-#| 
+#|
 #|     To compute the eth root, we call CadoMontgomeryReductionProcess(poly, side, ideals, valuations, log_embeddings)
 #|     Here ideals and valuations are lists or vectors such that zip(ideals, valuations) gives the ideal factorization of **the eth root** of STU.
 #|     i.e., at each ideal:
@@ -14340,59 +14530,59 @@ if __name__ == "__main__":
 #|         add the valuation of U at that ideal (i.e., add sol * M where we **don't** reduce mod e and don't include character columns)
 #|         the result is divisible by e; **divide the result by e**
 #|         then give this to CadoMontgomeryReductionProcess
-#| 
+#|
 #|     log_embeddings: floating-point vector that is the log of the complex embeddings of the eth root we're taking.
 #|         We compute it as follows: we have some product expression for our target
 #|             STU(alpha) = prod_i (c_i - d_i alpha)^m_i
 #|         that we get by combining ST_list and the (x,y,m) from sol*M.
 #|         Then we just take the sum of the log-embedding map (using CadoNumberTheory) of each term.
-#| 
+#|
 #|     Once we have ideals, valuations, and log_embeddings, the rest is just copied from montgomery.sage.
-#| 
+#|
 #|     Eventually we get an algebraic number R such that R(alpha)**e = STU(alpha)
 #|     """
-#| 
+#|
 #|     MTY = eth_root_montgomery_object(params, linalg_output)
 #|     sol_M = MTY.sol_times_M()
 #|     MTY.compute_target_ideals_and_valuations()
-#| 
+#|
 #|     # Finally, we will need to compute the log-embeddings. We might need
 #|     # to do so several times if we need to restart with increased
 #|     # precision.  To prepare for this computation, we need a product
 #|     # expression for STU.  We already have a product expression for ST
 #|     # (namely, ST_list).  For U (which corresponds to sol*M), we look up
 #|     # the (a,b) pair for each row of M and use the exponent in sol
-#| 
+#|
 #|     U_list = MTY.compute_U_list()
-#| 
+#|
 #|     # We now have all the parameters we need, the rest just follows
 #|     # cado/sqrt/montgomery.sage
-#| 
+#|
 #|     if MTY.extra_checks:
 #|         MTY.compute_big_power()
-#| 
+#|
 #|     assert MTY.check_power() == 1
-#| 
+#|
 #|     f = MTY.f
 #|     nt = MTY.nt
 #|     alpha = MTY.alpha
 #|     e = MTY.e
-#| 
+#|
 #|     # FIXME J_valuation_inconsistency
 #|     # to be DE-activated someday!
 #|     if not f.is_monic():
 #|         J = MTY.ideals[0]
 #|         assert MTY.ideals[0].norm() == f.leading_coefficient().abs()
 #|         MTY.valuations[0] *= -1
-#| 
+#|
 #|     major_message("Starting montgomery reduction process")
-#| 
+#|
 #|     prec = params.parameters['MONTGOMERY_ROOT_PRECISION']
 #|     mnb = int(params.parameters.get('montgomery.max_norm_bits', 1000))
 #|     loop_until_nbits = int(params.parameters.get('montgomery.loop_until_nbits', 10))
 #|     final_nbits = int(params.parameters.get('montgomery.final_nbits', 8))
 #|     parallel_until_nbits = int(params.parameters.get('montgomery.parallel_until_nbits', 200000))
-#| 
+#|
 #|     # If cmd arguments were given we overwrite the above
 #|     if int(params.given_prec) > 0:
 #|         prec = int(params.given_prec)
@@ -14409,7 +14599,7 @@ if __name__ == "__main__":
 #|     if int(params.given_pub) > 0:
 #|         parallel_until_nbits = int(params.given_pub)
 #|         major_message(f"Using parallel_until_nbits={parallel_until_nbits}")
-#| 
+#|
 #|     while True:
 #|         try:
 #|             timeprint("Computing log-embeddings...")
@@ -14454,45 +14644,45 @@ if __name__ == "__main__":
 #|             # the eth-power, so divide by e
 #|             log_embeddings /= e
 #|             timeprint("Done computing log-embeddings of ST and U.")
-#| 
+#|
 #|             DO_LOGGING = False
 #|             if DO_LOGGING:
 #|                 accumulate_logfile = params.dirs['TEMP_OUTPUT_DIR'] + "/mont2/accumulate"
 #|             else:
 #|                 accumulate_logfile = None
-#| 
+#|
 #|             MM = CadoMontgomeryReductionProcess(MTY.poly, MTY.side,
 #|                                                 MTY.ideals, MTY.valuations,
 #|                                                 LogMap, log_embeddings, accumulate_logfile, params=params)
 #|             MM.status()
-#| 
+#|
 #|             MTY.check_invariant(MM)
-#| 
+#|
 #|             nideals_history = defaultdict(int)
 #|             b = infinity
-#| 
+#|
 #|             RECOVER_FROM_LOGS = False
 #|             if RECOVER_FROM_LOGS:
 #|                 accumulate_logfile = params.dirs['TEMP_OUTPUT_DIR'] + "/mont/accumulate"
 #|                 logfiles = glob.glob(f"{accumulate_logfile}.*.sobj")
 #|                 major_message("Recovering progress from existing logfiles, of which we found {len(logfiles}}")
-#| 
+#|
 #|                 for lf in logfiles:
 #|                     AL = fast_persistent_load(lf)
 #|                     MM.accumulate(AL.g, AL.num_or_den, hint=AL.hint, dolog=False)
 #|                     MM.status()
-#| 
+#|
 #|                 major_message("Done recovering from logs. Continuing on with the usual program.")
-#| 
+#|
 #|             if params.montgomery_parallel:
 #|                 # First do a parallel loop, if applicable
-#| 
+#|
 #|                 cpucount = int(params.parameters.get('montgomery.cpucount', 2))
-#| 
+#|
 #|                 if int(params.given_t) > 0:
 #|                     major_message(f"Using cpucount={params.given_t}")
 #|                     cpucount = int(params.given_t)
-#| 
+#|
 #|                 while MM.nplus[1] + MM.nminus[1] > parallel_until_nbits:
 #|                     b = min(round(0.8 * max(MM.nplus[1], MM.nminus[1])), mnb, b)
 #|                     MM.one_internally_parallel_reduction_step(b, cpucount)
@@ -14501,8 +14691,8 @@ if __name__ == "__main__":
 #|                     if nideals_history[MM.nplus[0]+MM.nminus[0]] > 5:
 #|                         major_message("We seem to be stuck in a loop")
 #|                         break
-#| 
-#| 
+#|
+#|
 #|             # The default (sequential) loop
 #|             while MM.nplus[1] + MM.nminus[1] > loop_until_nbits:
 #|                 b = min(round(0.8 * max(MM.nplus[1], MM.nminus[1])), mnb, b)
@@ -14512,24 +14702,24 @@ if __name__ == "__main__":
 #|                 if nideals_history[MM.nplus[0]+MM.nminus[0]] > 5:
 #|                     major_message("We seem to be stuck in a loop")
 #|                     timeprint("Adding some randomness to try to get out...")
-#| 
+#|
 #|                     # reset the counter
 #|                     nideals_history[MM.nplus[0]+MM.nminus[0]] = 0
 #|                     b = min(round(0.8 * max(MM.nplus[1], MM.nminus[1])), mnb, b)
 #|                     MM.one_reduction_step(b, skip_asserts=True,
 #|                                             skip_embeddings_reduction=True, escape_loop=True)
 #|                     MM.status()
-#| 
+#|
 #|             if MM.done():
 #|                 break
-#| 
+#|
 #|             # one last round.
 #|             MM.one_reduction_step(final_nbits, skip_asserts=True, skip_embeddings_reduction=True)
 #|             MM.status()
-#| 
+#|
 #|             if MM.done():
 #|                 break
-#| 
+#|
 #|             while MM.nminus[0] != 0:
 #|                 MM.one_reduction_step(0,
 #|                                       all_ideals_at_once=True,
@@ -14543,15 +14733,15 @@ if __name__ == "__main__":
 #|                 error_message(f"Bailing out, precision={prec} seems too large")
 #|                 raise
 #|             warning_message(f"Starting over with precision={prec}")
-#| 
+#|
 #|     fast_persistent_save(MM.accumulated, params.dirs['TEMP_OUTPUT_DIR']+"gamma-fac.sobj")
 #|     gamma = MM.accumulated.prod()
 #|     fast_persistent_save(gamma, params.dirs['TEMP_OUTPUT_DIR']+"gamma.sobj")
-#| 
+#|
 #|     if not MM.current and max(MM.bound_on_coefficients_of_remaining_part()) == 1:
 #|         timeprint("We're almost certainly done!")
 #|         timeprint("Trying a p-adic root lift just to clear improbable leftovers")
-#| 
+#|
 #|     # Do a round of p-adic root computation with what we have computed so
 #|     # far. This should be really quick. If everything went well, we're
 #|     # actually just computing a root of 1 here, no big deal (so delta=1).
@@ -14564,11 +14754,11 @@ if __name__ == "__main__":
 #|     delta = delta(alpha)
 #|     timeprint(f"delta = {delta}")
 #|     fast_persistent_save(delta, params.dirs['TEMP_OUTPUT_DIR']+"delta.sobj")
-#| 
+#|
 #|     # then (gamma * delta) is an e-th root of big_power
 #|     if MTY.extra_checks:
 #|         timeprint("Final check: ", MTY.big_power / (gamma*delta)**MTY.e, " (both +1 and -1 are fine)")
-#| 
+#|
 #|     ########## above lines are from cado/sqrt/montgomery.sage ##########
 #|     return gamma*delta
 
@@ -14577,7 +14767,7 @@ if __name__ == "__main__":
 #| This file is copied from cado_sage/montgomery_reduction_process.py,
 #| but fixing the bug that happens when our defining polynomial f has any complex roots.
 #| """
-#| 
+#|
 #| from sage.modules.free_module_element import vector
 #| from sage.functions.generalized import sign
 #| from sage.functions.other import ceil
@@ -14599,43 +14789,43 @@ if __name__ == "__main__":
 #| from sage.rings.integer_ring import ZZ
 #| from sage.misc.prandom import randrange
 #| from sage.interfaces.ecm import ecm
-#| 
+#|
 #| from misc_tools import fast_persistent_save, fast_persistent_load
 #| from collections import namedtuple
-#| 
+#|
 #| from helpers import timeprint
 #| from helpers import major_message
-#| 
+#|
 #| from unsortedfactorization import UnsortedFactorization
-#| 
+#|
 #| import math
 #| import copy
-#| 
+#|
 #| from collections import defaultdict
 #| import concurrent.futures
 #| from concurrent.futures import ProcessPoolExecutor as ProcessPool
 #| import multiprocessing
 #| from time import time
-#| 
+#|
 #| from timing import timing
-#| 
+#|
 #| from sage.misc.persist import SagePickler, SageUnpickler
-#| 
+#|
 #| from os import getpid
-#| 
+#|
 #| AccumulateLog = namedtuple('AccumulateLog', ['g', 'num_or_den', 'hint'])
-#| 
+#|
 #| def log_of_big_rational(x):
 #|     xn = x.numerator().ndigits(2)
 #|     xd = x.denominator().ndigits(2)
 #|     return RDF(x.norm().abs() * 2**(xd-xn)).log() + (xn - xd)*RDF(2).log()
-#| 
+#|
 #| def lognorm_cached(I, R):
 #|         """memoized computation of R(I.norm()).log(2)"""
 #|         if not hasattr(I, "_lognorm"):
 #|             I._lognorm = R(I.norm()).log(2)
 #|         return I._lognorm
-#| 
+#|
 #| def lazy_factor(I, trialdiv_limit=10000, pickle=False):
 #|     """
 #|     given an ideal I, lazily factor I in such a way that:
@@ -14644,25 +14834,25 @@ if __name__ == "__main__":
 #|      - ecm is tried for some time, in such a way that factors below 50
 #|        digits or so should all be found fairly easily.
 #|     """
-#| 
+#|
 #|     timeprint(f"lazy_factor start (pid {getpid()})") #XXX
 #|     if pickle:
 #|         I = SageUnpickler.loads(I)
 #|         timeprint(f"lazy_factor done unpickling (pid {getpid()})") #XXX
-#| 
+#|
 #|     if not I.is_integral():
 #|         timeprint(f"lazy_factor splitting N/D (pid {getpid()})") #XXX
 #|         return lazy_factor(I.numerator(), trialdiv_limit) / lazy_factor(I.denominator(), trialdiv_limit)
-#| 
+#|
 #|     timeprint(f"lazy_factor about to call norm (pid {getpid()})") #XXX
 #|     N = ZZ(I.norm())
-#| 
+#|
 #|     prime_factors = []
-#| 
+#|
 #|     factors = []
-#| 
+#|
 #|     timeprint(f"Factoring ideal of {N.abs().ndigits(2)}-bit norm")
-#| 
+#|
 #|     for u in [N]:
 #|         while True:
 #|             p = u.trial_division(trialdiv_limit)
@@ -14672,13 +14862,13 @@ if __name__ == "__main__":
 #|             prime_factors.append(p)
 #|         if u > 1:
 #|             factors.append(u)
-#| 
+#|
 #|     prime_bits = sum([p.abs().ndigits(2) for p in prime_factors])
 #|     cofactor_bits = [c.abs().ndigits(2) for c in factors]
 #|     timeprint("After trial division, found"
 #|           f" prime factors of total size {prime_bits} bits,"
 #|           f" and cofactor of {cofactor_bits} bits.")
-#| 
+#|
 #|     timeprint(f"starting ECM (pid {getpid()})")
 #|     for i in range(100):
 #|         if not factors:
@@ -14698,10 +14888,10 @@ if __name__ == "__main__":
 #|         prime_factors += new_prime_factors
 #|         factors = new_factors
 #|     timeprint(f"done with ECM (pid {getpid()})")
-#| 
+#|
 #|     # Now factor by taking the gcd with all the integers we found in the
 #|     # lazy factorization.
-#| 
+#|
 #|     F = UnsortedFactorization([])
 #|     D = defaultdict(int)
 #|     for p in prime_factors + factors:
@@ -14714,17 +14904,17 @@ if __name__ == "__main__":
 #|         assert e == 1
 #|         F *= (I + p)
 #|     assert F.prod() == I
-#| 
+#|
 #|     if pickle:
 #|         return SagePickler.dumps(F)
-#| 
+#|
 #|     return F
-#| 
-#| 
+#|
+#|
 #| class InsufficientPrecision(Exception):
 #|     pass
-#| 
-#| 
+#|
+#|
 #| class CadoMontgomeryReductionProcess(object):
 #|     def __init__(self, poly, side,
 #|                  ideals, valuations, L, log_embeddings, logfile_path=None, params=None):
@@ -14732,9 +14922,9 @@ if __name__ == "__main__":
 #|         with respect to the given side, and the corresponding matrices
 #|         that give the valuations and log embeddings for that field,
 #|         return an algebraic number that matches these as best as we can.
-#| 
+#|
 #|         L is the logmap with which log_embeddings were computed
-#| 
+#|
 #|         params is a Params object, unneeded except to be able to print aggregate timing information at the end
 #|         """
 #|         timeprint("start initializing self.current")
@@ -14756,22 +14946,22 @@ if __name__ == "__main__":
 #|         self.L = L
 #|         self.poly = poly
 #|         self.step_number = 0
-#| 
+#|
 #|         self.params = params
-#| 
+#|
 #|         self.accumulate_ctr = 0
 #|         self.logfile_path = logfile_path
-#| 
+#|
 #|         # Ri and Ci _might_ be interval fields. But they don't have to.
 #|         self.Ri = log_embeddings.parent().base_ring()
 #|         self.Ci = self.Ri.complex_field()
-#| 
+#|
 #|         timeprint(log_embeddings.parent())
 #|         timeprint(L.codomain())
-#| 
+#|
 #|         assert log_embeddings.parent() is L.codomain()
 #|         precision = self.Ri.precision()
-#| 
+#|
 #|         self.C = ComplexField(precision)
 #|         self.R = RealField(precision)
 #|         self.precision = precision
@@ -14780,34 +14970,34 @@ if __name__ == "__main__":
 #|         timeprint(f"  self.R is {self.R}")
 #|         timeprint(f"  self.Ci is {self.Ci}")
 #|         timeprint(f"  self.Ri is {self.Ri}")
-#| 
+#|
 #|         f = self.K.defining_polynomial()
 #|         self.V = vandermonde(f.roots(self.Ci, multiplicities=False)).transpose()
-#| 
+#|
 #|         # Computing the discriminant of OK bypasses a sage bug, see https://github.com/sagemath/sage/issues/40770
 #|         timeprint("Compute discbound")
 #|         self.discbound = sqrt(f.discriminant() / self.OK._K.discriminant(self.OK.basis()))
-#| 
+#|
 #|         timeprint("Initialized CadoMontgomeryReductionProcess")
-#| 
+#|
 #|     def divergence_of_embeddings(self, c):
 #|         """
 #|         Given a vector of log embeddings for some element g, write it as
 #|         log(abs(norm(g)))*(1,1,...,1)+delta, with the sum of the
 #|         coordinates of delta equal to zero, and then return delta.
-#| 
+#|
 #|         A priori, we'd like to have delta as small as we can. Or so I
 #|         think. I'm just not too sure about whether the direction
 #|         (1,1,...,1) can indeed be regarded as a privileged one. Sure,
 #|         it's normal to the hyperplane sum(embeddings)==0, but what does
 #|         that give us? Maybe there's sense in choosing another direction?
-#| 
+#|
 #|         Two reasonable contenders:
-#| 
+#|
 #|          - (log(theta_i) for i in range(d)), because an element with
 #|            all-ones coefficients in polynomial representation will
 #|            typically have log embeddings along that direction.
-#| 
+#|
 #|          - (log(theta_i)/skewness for i in range(d)), because if the
 #|            definition polynomial has some skewness, we're not that much
 #|            interested in all-ones coefficients in polynomial
@@ -14818,22 +15008,22 @@ if __name__ == "__main__":
 #|         V = self.L.codomain()
 #|         r1, r2 = self.K.signature()
 #|         R = V.base_ring()
-#| 
+#|
 #|         all_ones = V([1]*r1+[2]*r2)
-#| 
+#|
 #|         # one of the three options above...
-#| 
+#|
 #|         privileged = all_ones
 #|         # privileged = self.L(alpha)
 #|         # privileged = self.L(alpha)-R(self.poly.skewness).log()*all_ones
-#| 
+#|
 #|         # contribution on the privileged direction
 #|         k = c.dot_product(all_ones) / privileged.dot_product(all_ones)
 #|         return c - k * privileged
-#| 
+#|
 #|     def done(self):
 #|         return not self.current
-#| 
+#|
 #|     def complex_to_real_matrix(self, M):
 #|         return column_matrix(self.R, sum([[col.apply_map(real), col.apply_map(imag)] for col in M.columns()], start=[]))
 #|         # TODO: For some reason, the below leads to worse results and causes bugs where embeddings overflow to infinity. The above seems to work fine, so maybe we'll just do LLL on a 10-dim matrix instead of 5-dim.
@@ -14851,17 +15041,17 @@ if __name__ == "__main__":
 #|         )
 #|         assert out.ncols() == M.ncols(), "bug in constructing matrix: out.ncols != M.ncols"
 #|         return out
-#| 
+#|
 #|     def skewed_LLL(self, M, skew):
 #|         """
 #|         returns an LLL basis where the coefficients of each vector are
 #|         skewed according to the skewness of the number field polynomial
-#| 
+#|
 #|         TODO: what if the skew matrix is a complex matrix? I guess that
 #|         we would have to use the conjugate_transpose, right? I'm slightly
 #|         puzzled that this implies losing the nice structure of a Hankel
 #|         matrix with the Newton sums when we skew by a Vandermonde matrix.
-#| 
+#|
 #|         TODO: we should be accepting an inner product matrix of the
 #|         ambient space, not just a vector of weights. In order to make it
 #|         work with fplll, this requires the computation of the Cholesky
@@ -14889,7 +15079,7 @@ if __name__ == "__main__":
 #|         # sage used to have a bug where you couldn't call LLL with transformation=True on a rational matrix, but this bug has been fixed: https://github.com/sagemath/sage/pull/38841
 #|         _, U = (M * Dr).LLL(transformation=True)
 #|         return U * M
-#| 
+#|
 #|     def describe_picked_ideal(self, hint, num_or_den):
 #|         """
 #|         hint is an ideal factorization object
@@ -14906,7 +15096,7 @@ if __name__ == "__main__":
 #|                                 for x,v in norm_desc])
 #|         timeprint(f"Picked ideal (sign {num_or_den})"
 #|               + f" has {cumulative_norm_bits:.2f}-bit norm ({norm_desc})")
-#| 
+#|
 #|     def pick_an_ideal_product_to_kill(self, num_or_den=1, norm_max_bits=64):
 #|         """
 #|         return an ideal (in factored form) that we will attempt to kill,
@@ -14928,7 +15118,7 @@ if __name__ == "__main__":
 #|             # V[i] += e
 #|             cumulative_norm_bits += e * nn
 #|         return UnsortedFactorization(pool)
-#| 
+#|
 #|     def pick_a_few_ideal_products_to_kill(self, count, num_or_den=1, norm_max_bits=64):
 #|         """
 #|         return a few ideals (in factored form) that we will attempt to kill,
@@ -14956,7 +15146,7 @@ if __name__ == "__main__":
 #|         if pool:
 #|             out.append(UnsortedFactorization(pool))
 #|         return out
-#| 
+#|
 #|     @classmethod
 #|     def F(self, x, digits=2):
 #|         """
@@ -14971,8 +15161,8 @@ if __name__ == "__main__":
 #|             return f"{x:.{digits}f}"
 #|         else:
 #|             return f"{x}"
-#| 
-#| 
+#|
+#|
 #|     def abort_if_infinity(self, v=None):
 #|         """
 #|         if the base field is an interval field, check if we have one of
@@ -14987,36 +15177,36 @@ if __name__ == "__main__":
 #|             if c.is_infinity():
 #|                 timeprint(f"log-embeddings are {self.log_embeddings}")
 #|                 raise InsufficientPrecision()
-#| 
+#|
 #|     def adjust_log_embeddings(self, adjust):
 #|         nl = self.log_embeddings - adjust
 #|         self.abort_if_infinity(nl)
 #|         self.log_embeddings = nl
-#| 
+#|
 #|     def pvec(self, v):
 #|         F = self.F
-#| 
+#|
 #|         return "({})".format(", ".join([F(x) for x in v.change_ring(RDF)]))
-#| 
+#|
 #|     def printable_log_embeddings(self, ll):
 #|         F = self.F
-#| 
+#|
 #|         lld = self.divergence_of_embeddings(ll)
 #|         return f"{self.pvec(ll)}; divergence: {self.pvec(lld)}"
-#| 
+#|
 #|     @timing
 #|     def status(self):
 #|         """
 #|         Some stats. Note that this incidentally updates nplus and nminus
 #|         """
-#| 
+#|
 #|         timeprint("start status")
-#| 
+#|
 #|         self.abort_if_infinity()
-#| 
+#|
 #|         self.nplus = (0, 0)
 #|         self.nminus = (0, 0)
-#| 
+#|
 #|         timeprint(f"begin loop through self.current ({len(self.current)} items)...")
 #|         for I, v in self.current.items():
 #|             if v > 0:
@@ -15024,15 +15214,15 @@ if __name__ == "__main__":
 #|             else:
 #|                 self.nminus = (self.nminus[0]+1, self.nminus[1] - v * lognorm_cached(I, self.R))
 #|         timeprint(f"end loop")
-#| 
+#|
 #|         F = self.F
-#| 
+#|
 #|         major_message(f"num bits {F(self.nplus[1])}, {F(self.nminus[1])}")
-#| 
+#|
 #|         timeprint(f"num bits {F(self.nplus[1])} ({round(self.nplus[0])} ideals)",
 #|               f"denom bits {F(self.nminus[1])} ({round(self.nminus[0])} ideals)")
 #|         r1, r2 = self.K.signature()
-#| 
+#|
 #|         #avg_lognorm = sum([log_of_big_rational(I.norm())*e for I,e in
 #|         #                  self.current.items()])/self.K.degree()
 #|         # XXX Above line is slow (1-2 seconds on n666, out of 5-6 seconds per reduction step),
@@ -15043,40 +15233,40 @@ if __name__ == "__main__":
 #|         # Regardless, avg_lognorm is only used for the following print statement, so it doesn't matter too much
 #|         timeprint("expected average of log-embeddings (typical):",
 #|               self.pvec(avg_lognorm * vector([1]*r1+[2]*r2)))
-#| 
+#|
 #|         timeprint("Our log embeddings:")
 #|         timeprint("  ", self.printable_log_embeddings(self.log_embeddings))
-#| 
+#|
 #|         if self.nminus[1] < 10:
 #|             denom = prod([I.norm()**-v for I,v in self.current.items() if v < 0])
 #|             timeprint("denominator:", denom)
 #|             timeprint("numerator bounds: ", denom * vector(self.bound_on_coefficients_of_remaining_part()))
-#| 
+#|
 #|     @timing
 #|     def accumulate(self, g, num_or_den, hint=UnsortedFactorization([]), glist=None, hintlist=None, cpucount=-1, dolog=True):
 #|         """
 #|         Take action, and register a new term for the product, updating
 #|         the current state accordingly
 #|         """
-#| 
+#|
 #|         self.accumulate_ctr += 1
 #|         if self.logfile_path is not None and dolog:
 #|             thisfile = f"{self.logfile_path}.{self.accumulate_ctr}.sobj"
 #|             thislog = AccumulateLog(g=g, num_or_den=num_or_den, hint=hint)
 #|             fast_persistent_save(thislog, thisfile)
-#| 
+#|
 #|         self.accumulated *= UnsortedFactorization([(g, num_or_den)])
 #|         F = self.F
-#| 
+#|
 #|         gen_norm = self.R(g.norm().abs()).log(2)
-#| 
+#|
 #|         timeprint(f"Picked gen has {gen_norm:.2f}-bit norm")
-#| 
+#|
 #|         adjust = num_or_den * self.L(g)
 #|         timeprint("Adjusting log embeddings by", self.printable_log_embeddings(adjust))
-#| 
+#|
 #|         self.adjust_log_embeddings(adjust)
-#| 
+#|
 #|         if glist is None:
 #|             timeprint("Dividing fractional_ideal(g) / hint.prod()")
 #|             discovered = (self.OK.fractional_ideal(g) / hint.prod())
@@ -15098,12 +15288,12 @@ if __name__ == "__main__":
 #|                 for future in concurrent.futures.as_completed(futures):
 #|                     discovered = discovered * SageUnpickler.loads(future.result())
 #|                 timeprint("All lazy_factor results arrived and combined")
-#| 
+#|
 #|         timeprint("ideal_factorization multiply start")
 #|         ideal_factorization = hint * discovered
 #|         assert isinstance(ideal_factorization, UnsortedFactorization)
 #|         timeprint("ideal_factorization multiply end")
-#| 
+#|
 #|         timeprint("update self.current start")
 #|         for I, e in ideal_factorization:
 #|             # Ibits = round(self.R(I.norm()).log(2))
@@ -15115,7 +15305,7 @@ if __name__ == "__main__":
 #|                 # timeprint(f"Just got rid of a {Ibits:.2f}-bit ideal")
 #|                 del self.current[I]
 #|         timeprint("update self.current end")
-#| 
+#|
 #|     def l2norm_on_divergence_hyperplane(self, lld):
 #|         """
 #|         ll is such that the sum of the first r1 coordinates + twice the
@@ -15127,7 +15317,7 @@ if __name__ == "__main__":
 #|         sum1 = sum([lld[i]**2 for i in range(r1)])
 #|         sum2 = sum([lld[i]**2 for i in range(r1, r1+r2)])
 #|         return sum1 + sum2/2
-#| 
+#|
 #|     def analyze_generators(self, gens, num_or_den):
 #|         """
 #|         given a list of generators of the target ideal, print the log
@@ -15136,27 +15326,27 @@ if __name__ == "__main__":
 #|         when added or subtracted from the target log embeddings, brings
 #|         us closest to the all-ones line.
 #|         """
-#| 
+#|
 #|         timeprint("Our log embeddings:")
 #|         timeprint("  ", self.printable_log_embeddings(self.log_embeddings))
 #|         ll0d = self.divergence_of_embeddings(self.log_embeddings)
-#| 
+#|
 #|         timeprint("log embeddings of generators:")
 #|         scoreboard = []
 #|         for i,g in enumerate(gens):
 #|             ll = self.L(g)
 #|             lld = self.divergence_of_embeddings(ll)
 #|             reached = self.l2norm_on_divergence_hyperplane(lld-num_or_den*ll0d)
-#| 
+#|
 #|             timeprint("  ", self.printable_log_embeddings(self.L(g)),
 #|                   f"; reaches {RDF(reached):.2f}")
 #|             scoreboard.append((reached, (i, g)))
-#| 
+#|
 #|         best_reached, (i0, g0) = min(scoreboard)
 #|         timeprint(f"Based on divergence minimization, we would choose generator {i0}")
-#| 
+#|
 #|         return i0
-#| 
+#|
 #|     def bound_on_coefficients_of_remaining_part(self):
 #|         """
 #|         This returns absolute bounds on the coefficients of the algebraic
@@ -15165,7 +15355,7 @@ if __name__ == "__main__":
 #|         integer (denominator==1), then these can be used to bound
 #|         _integer_ coefficients (well, up to the denominators in the
 #|         maximal order, but this is the idea).
-#| 
+#|
 #|         FIXME (hmmm, it seems very very weird that this works. V would
 #|         need to be positive definite or something like this)
 #|         """
@@ -15173,7 +15363,7 @@ if __name__ == "__main__":
 #|         d = self.K.degree()
 #|         Amax = self.nt.modules_of_embeddings_from_log_embeddings(self.log_embeddings)
 #|         return [floor(sum([abs(Amax[i] * Vi[i,j]) for i in range(d)])) for j in range(d)]
-#| 
+#|
 #|     def one_reduction_step(self,
 #|                            bits=64,
 #|                            skip_asserts=True,
@@ -15186,15 +15376,15 @@ if __name__ == "__main__":
 #|             # if we have no outstanding ideals, do nothing
 #|             timeprint("cannot reduce further, no ideals left")
 #|             return
-#| 
+#|
 #|         d = self.K.degree()
 #|         s = self.poly.skewness
 #|         f = self.K.defining_polynomial()
 #|         x = f.parent().gen()
-#| 
+#|
 #|         timeprint(f"------------ reduction step {self.step_number} ------------")
 #|         self.step_number += 1
-#| 
+#|
 #|         try:
 #|             if single_ideal_at_random:
 #|                 I = list(self.current.keys())[randrange(len(self.current))]
@@ -15217,34 +15407,34 @@ if __name__ == "__main__":
 #|                 hint = self.pick_an_ideal_product_to_kill(num_or_den, bits)
 #|         except OverflowError:
 #|             raise InsufficientPrecision()
-#| 
+#|
 #|         self.describe_picked_ideal(hint, num_or_den)
-#| 
+#|
 #|         timeprint("start computing I = hint.prod()")
 #|         I = hint.prod()
 #|         timeprint("done computing I = hint.prod()")
-#| 
+#|
 #|         # in fact we don't really care if it's integral or not...
 #|         # assert I.is_integral()
-#| 
+#|
 #|         # by doing LLL here, we tolerate the norm of each generator to
 #|         # grow by as much as a constant C_K, which we can compute.
 #|         timeprint("start computing basis for I")
 #|         gens0 = I.basis()
 #|         timeprint("done computing basis for I")
 #|         M0 = matrix([list(c) for c in gens0])
-#| 
+#|
 #|         # There does seem to be a computational advantage in doing the
 #|         # reduction in two steps.
 #|         L2s_norm_of_f = self.R(vector(list(f(s*x) / s**(d / 2))).norm())
-#| 
+#|
 #|         skew0 = diagonal_matrix([(self.Ri(s) ** (i - (d - 1)/2)) for i in range(d)])
 #|         timeprint("starting skewed LLL")
 #|         M1 = self.skewed_LLL(M0, skew0)
 #|         timeprint("done with skewed LLL")
-#| 
+#|
 #|         gens1 = [self.K(list(g)) for g in M1]
-#| 
+#|
 #|         if not skip_asserts:
 #|             # The theory is that the skewed norm of the vector M1[0] is
 #|             # bounded as follows
@@ -15252,13 +15442,13 @@ if __name__ == "__main__":
 #|                     2**((d - 1) / 4) * abs(M0.determinant())**(1 / d)
 #|                     ))
 #|             L2s_norm_of_v = abs(self.R((M1[0]*skew0).norm()))
-#| 
+#|
 #|             L2s_approximation_ratio = L2s_norm_of_v / bound_on_L2s_norm_of_v
-#| 
+#|
 #|             timeprint("L2s approximation ratio for 1st reduction (expected <= 1):",
 #|                   L2s_approximation_ratio)
 #|             assert L2s_approximation_ratio <= 1
-#| 
+#|
 #|             # we can just ignore the discriminant quotient. It just makes the
 #|             # bound sharper if we happen to know it, that's it.
 #|             alg_norm_quotient = abs(gens1[0].norm() / I.norm())
@@ -15266,14 +15456,14 @@ if __name__ == "__main__":
 #|                 2**(d * (d - 1) / 4),
 #|                 L2s_norm_of_f**(d - 1),
 #|                 self.discbound]))
-#| 
+#|
 #|             # This norm is obtained by Hadamard + Cauchy-Schwarz, and is
 #|             # expected to be very loose.
 #|             alg_norm_approximation_ratio = alg_norm_quotient / bound_on_alg_norm_quotient
 #|             timeprint("alg norm approximation ratio for 1st reduction (expected <= 1):",
 #|                   alg_norm_approximation_ratio)
 #|             assert alg_norm_approximation_ratio <= 1
-#| 
+#|
 #|         new_gens1 = []
 #|         for g in gens1:
 #|             ll = self.L(g)
@@ -15282,65 +15472,65 @@ if __name__ == "__main__":
 #|             else:
 #|                 new_gens1.append(g)
 #|                 #raise InsufficientPrecision()
-#| 
+#|
 #|         if len(new_gens1) == 0:
 #|             timeprint("Oh no. No generators passed the is_infinity check.")
 #|             raise InsufficientPrecision()
-#| 
+#|
 #|         timeprint("Analyzing generators in M1")
 #|         i0 = self.analyze_generators(new_gens1, num_or_den)
-#| 
+#|
 #|         if not skip_embeddings_reduction:
 #|             # We now have alternative, somewhat smaller generators of our
 #|             # ideal. They're finely skewed, which contributes to making the
 #|             # norm a bit smaller than if we had neglected that aspect.
-#| 
+#|
 #|             # Next we want the log embeddings to be small, which we translate
 #|             # into the requirement that the vector that we end up with is as
 #|             # close as we can to the same skewed hypersphere as the one the
 #|             # current embeddings of the target lie on.
-#| 
+#|
 #|             modules = self.nt.modules_of_embeddings_from_log_embeddings(self.log_embeddings)
 #|             V = self.V
-#| 
+#|
 #|             # note that V * V.transpose() is the Hankel matrix whose
 #|             # coefficients are the Newton sums, which we can compute fairly
 #|             # easily via the expansion of (xf'/f) in powers of 1/x
-#| 
+#|
 #|             # alas, we're rather interested by the comparison with the
 #|             # hypersphere, and this kills the nice properties of these
 #|             # expression. The polynomial that gives the target embeddings is
 #|             # unknown anyways. We have to consider a skewed V:
-#| 
+#|
 #|             # if we take:
 #|             # W = V * diagonal_matrix(self.nt.real_representation_of_embeddings(g))**-1
 #|             # then W is so that vector(g.list()) * W is the all-ones vector
-#| 
+#|
 #|             if diagonal_matrix(modules).is_singular():
 #|                 raise InsufficientPrecision()
-#| 
+#|
 #|             # but of course, the W that we want is the one that compares to
 #|             # the target number!
 #|             W = V * diagonal_matrix(modules)**-num_or_den
 #|             assert W.base_ring().prec() >= self.precision, f"W.base_ring is {W.base_ring()}, lower precision than {self.precision}"
-#| 
-#| 
+#|
+#|
 #|             # So. At this point, what we have to do is to give a skewed LLL
 #|             # reduction with respect to this matrix W
 #|             M2 = self.skewed_LLL(M1, skew=W)
 #|             gens2 = [self.K(list(g)) for g in M2]
-#| 
+#|
 #|             for g in gens2:
 #|                 ll = self.L(g)
 #|                 if any([x.absolute_diameter().is_infinity() for x in ll]):
 #|                     raise InsufficientPrecision()
-#| 
+#|
 #|             timeprint("Analyzing generators in M2")
 #|             i0 = self.analyze_generators(gens2, num_or_den)
-#| 
+#|
 #|             timeprint(f"Choosing generator {i0}")
 #|             g = gens2[i0]
-#| 
+#|
 #|             # I don't know how to make sense of this debug print, let's
 #|             # drop it.
 #|             # drift_bits = (vector(g.list()) * W).norm().log(2)
@@ -15350,26 +15540,26 @@ if __name__ == "__main__":
 #|             timeprint(f"Choosing generator {i0}")
 #|             g = new_gens1[i0]
 #|             gens2 = []
-#| 
+#|
 #|         if escape_loop:
 #|             # Just pick a random generator
 #|             all_gens = gens1 + gens2
 #|             jj = randrange(0, len(all_gens))
 #|             g = all_gens[jj]
-#| 
+#|
 #|         self.accumulate(g, num_or_den, hint=hint)
-#| 
-#| 
+#|
+#|
 #|     def one_internally_parallel_reduction_step(self, bits=64, cpucount=-1):
-#| 
+#|
 #|         if not self.current:
 #|             # if we have no outstanding ideals, do nothing
 #|             timeprint("cannot reduce further, no ideals left")
 #|             return
-#| 
+#|
 #|         timeprint(f"------------ reduction step {self.step_number} ------------")
 #|         self.step_number += 1
-#| 
+#|
 #|         try:
 #|             num_or_den = 1 if self.nplus[1] > self.nminus[1] else -1
 #|             timeprint("start picking a few ideal products to kill")
@@ -15377,9 +15567,9 @@ if __name__ == "__main__":
 #|             timeprint("done picking a few ideal products to kill")
 #|         except OverflowError:
 #|             raise InsufficientPrecision()
-#| 
+#|
 #|         candidate_gens = dict()
-#| 
+#|
 #|         ctx = multiprocessing.get_context('fork')
 #|         timeprint(f"setting up ProcessPool with maxworkers={cpucount}")
 #|         with ProcessPool(mp_context=ctx, max_workers=cpucount) as executor:
@@ -15405,23 +15595,23 @@ if __name__ == "__main__":
 #|                 ll = self.L(g)
 #|                 if any([x.absolute_diameter().is_infinity() for x in ll]):
 #|                     raise InsufficientPrecision()
-#| 
+#|
 #|         timeprint("Analyzing generators over all hints...")
-#| 
+#|
 #|         # Pick one generator from each hint,
 #|         # and combine into a single generator for the whole reduction step,
 #|         # which is passed to accumulate.
-#| 
+#|
 #|         timeprint("start multiplying UnsortedFactorization objects")
 #|         total_hint = prod(hintlist)     # product of UnsortedFactorization objects
 #|         timeprint("done multiplying UnsortedFactorization objects")
 #|         glist = []
-#| 
+#|
 #|         # TODO: actually do something here.
 #|         # Just testing for now.
-#| 
+#|
 #|         total_g = self.K(1)
-#| 
+#|
 #|         for i in range(len(hintlist)):
 #|             #cands = [total_g * x for x in candidate_gens[i]]
 #|             #chosen_idx = self.analyze_generators(cands, num_or_den)
@@ -15430,33 +15620,33 @@ if __name__ == "__main__":
 #|             total_g = total_g * candidate_gens[i][chosen_idx]
 #|             #total_g = cands[chosen_idx]
 #|             #timeprint(f"Chose generator {chosen_idx} for hint number {i}")
-#| 
+#|
 #|         self.accumulate(total_g, num_or_den, total_hint, glist, hintlist, cpucount)
-#| 
-#| 
+#|
+#|
 #|     def do_many_reduction_steps_in_parallel(self, bits=64, cpucount=2):
 #|         d = self.K.degree()
 #|         s = self.poly.skewness
 #|         f = self.K.defining_polynomial()
 #|         x = f.parent().gen()
-#| 
+#|
 #|         if not self.current:
 #|             # if we have no outstanding ideals, do nothing
 #|             timeprint("cannot reduce further, no ideals left")
 #|             return
-#| 
+#|
 #|         num_or_den = 1 if self.nplus[1] > self.nminus[1] else -1
-#| 
+#|
 #|         timeprint(f"-------- reduction steps {self.step_number} to {self.step_number+cpucount-1} --------")
 #|         self.step_number += cpucount
-#| 
+#|
 #|         ts = time()
 #|         #cpucount = multiprocessing.cpu_count()
 #|         jobs = self.pick_a_few_ideal_products_to_kill(cpucount, num_or_den, bits)
 #|         #timeprint(type(jobs[0]))
 #|         modules = self.nt.modules_of_embeddings_from_log_embeddings(self.log_embeddings)
 #|         ctx = multiprocessing.get_context('fork')
-#| 
+#|
 #|         # Note that find_short_generator does read-only operations on the object
 #|         #cmrp_copy = copy.copy(self)
 #|         #import sage.libs.pari.convert_sage as convert_sage
@@ -15464,44 +15654,44 @@ if __name__ == "__main__":
 #|             #futures = [executor.submit(find_short_generator,
 #|             #    hint.prod(), num_or_den, self.K, self.precision, modules, self.V, self.poly.skewness, idx, self) for (idx,hint) in enumerate(jobs)]
 #|             futures = [executor.submit(self.bound_on_coefficients_of_remaining_part, self) for i in range(len(jobs))]
-#| 
-#| 
+#|
+#|
 #|             timeprint("at least submitted futures")
 #|             for future in concurrent.futures.as_completed(futures):
 #|                 g, idx = future.result()
 #|                 self.accumulate(g, num_or_den, hint=jobs[idx])
 #|                 self.status()
 #|         timeprint(" took",time()-ts)
-#| 
-#| 
+#|
+#|
 #| def outer_handling_of_hint(idx, hint, num_or_den, K, precision, skewness):
 #|     timeprint("outer_handling_of_hint")
-#| 
+#|
 #|     hint = SageUnpickler.loads(hint)
 #|     K = SageUnpickler.loads(K)
-#| 
+#|
 #|     d = K.degree()
 #|     Ri = RealIntervalField(precision)
-#| 
+#|
 #|     outer_describe_picked_ideal(hint, num_or_den, precision)
 #|     I = hint.prod()
-#| 
+#|
 #|     gens0 = I.basis()
 #|     M0 = matrix([list(c) for c in gens0])
-#| 
+#|
 #|     skew0 = diagonal_matrix([(Ri(skewness) ** (i - (d - 1)/2)) for i in range(d)])
 #|     M1 = outer_skewed_LLL(M0, skew0, precision)
-#| 
+#|
 #|     gens1 = [K(list(g)) for g in M1]
-#| 
+#|
 #|     #return idx, SagePickler.dumps(gens1)
 #|     return idx, SagePickler.dumps(gens1), SagePickler.dumps(I)
 #|     # Passing I back in addition to gens1 allows cacheing hint.prod() in the main process.
 #|     # A different tradeoff we could make would be to have the main thread do I = OK.ideal(gens1)
 #|     # Less pickling, but a little more compute.
 #|     # For n448 passing I back is slightly faster, but this might be worth revisiting if pickling gets slow.
-#| 
-#| 
+#|
+#|
 #| def outer_describe_picked_ideal(hint, num_or_den, precision):
 #|     """
 #|     hint is an ideal factorization object
@@ -15519,8 +15709,8 @@ if __name__ == "__main__":
 #|                             for x,v in norm_desc])
 #|     timeprint(f"Picked ideal (sign {num_or_den})"
 #|           + f" has {cumulative_norm_bits:.2f}-bit norm ({norm_desc})")
-#| 
-#| 
+#|
+#|
 #| def outer_skewed_LLL(M, skew, precision):
 #|     D = skew
 #|     Ri = RealIntervalField(precision)
@@ -15536,13 +15726,13 @@ if __name__ == "__main__":
 #|     # sage used to have a bug where you couldn't call LLL with transformation=True on a rational matrix, but this bug has been fixed: https://github.com/sagemath/sage/pull/38841
 #|     _, U = (M * Dr).LLL(transformation=True)
 #|     return U * M
-#| 
-#| 
+#|
+#|
 #| def outer_complex_to_real_matrix(M, precision):
 #|     R = RealField(precision)
 #|     return column_matrix(R, sum([[col.apply_map(real), col.apply_map(imag)] for col in M.columns()], start=[]))
-#| 
-#| 
+#|
+#|
 #| def find_short_generator(I, num_or_den, K, precision, modules, V, skewness, idx, CMRP):
 #|     ## Non-obvious parameters:
 #|     # modules = self.nt.modules_of_embeddings_from_log_embeddings(self.log_embeddings)
@@ -15550,86 +15740,86 @@ if __name__ == "__main__":
 #|     # skewness = self.poly.skewness
 #|     # CMRP = CadoMontgomeryReductionProcess (should do read-only operations)
 #|     timeprint("made it to find_short_generator")
-#| 
+#|
 #|     d = K.degree()
 #|     s = skewness
 #|     f = K.defining_polynomial()
 #|     x = f.parent().gen()
-#| 
+#|
 #|     Ri = RealIntervalField(precision)
 #|     R = RealField(precision)
-#| 
+#|
 #|     # match the one_reduction_step above
 #|     gens0 = I.basis()
 #|     M0 = matrix([list(c) for c in gens0])
-#| 
+#|
 #|     L2s_norm_of_f = self.R(vector(list(f(s*x) / s**(d / 2))).norm())
-#| 
+#|
 #|     skew0 = diagonal_matrix([(Ri(s) ** (i - (d - 1)/2)) for i in range(d)])
 #|     M1 = CMRP.skewed_LLL(M0, skew0, R)
-#| 
+#|
 #|     gens1 = [K(list(g)) for g in M1]
-#| 
+#|
 #|     for g in gens1:
 #|         ll = CMRP.L(g)
 #|         if any([x.absolute_diameter().is_infinity() for x in ll]):
 #|             raise InsufficientPrecision()
-#| 
+#|
 #|     # timeprint("Analyzing generators in M1")
 #|     i0 = CMRP.analyze_generators(gens1, num_or_den)
-#| 
+#|
 #|     if True:
 #|         # We now have alternative, somewhat smaller generators of our
 #|         # ideal. They're finely skewed, which contributes to making the
 #|         # norm a bit smaller than if we had neglected that aspect.
-#| 
+#|
 #|         # Next we want the log embeddings to be small, which we translate
 #|         # into the requirement that the vector that we end up with is as
 #|         # close as we can to the same skewed hypersphere as the one the
 #|         # current embeddings of the target lie on.
-#| 
+#|
 #|         #modules = CMRP.nt.modules_of_embeddings_from_log_embeddings(CMRP.log_embeddings)
 #|         V = CMRP.V
-#| 
+#|
 #|         # note that V * V.transpose() is the Hankel matrix whose
 #|         # coefficients are the Newton sums, which we can compute fairly
 #|         # easily via the expansion of (xf'/f) in powers of 1/x
-#| 
+#|
 #|         # alas, we're rather interested by the comparison with the
 #|         # hypersphere, and this kills the nice properties of these
 #|         # expression. The polynomial that gives the target embeddings is
 #|         # unknown anyways. We have to consider a skewed V:
-#| 
+#|
 #|         # if we take:
 #|         # W = V * diagonal_matrix(self.nt.real_representation_of_embeddings(g))**-1
 #|         # then W is so that vector(g.list()) * W is the all-ones vector
-#| 
+#|
 #|         if diagonal_matrix(modules).is_singular():
 #|             raise InsufficientPrecision()
-#| 
+#|
 #|         # but of course, the W that we want is the one that compares to
 #|         # the target number!
 #|         W = V * diagonal_matrix(modules)**-num_or_den
 #|         assert W.base_ring().prec() >= CMRP.precision, f"W.base_ring is {W.base_ring()}, lower precision than {CMRP.precision}"
-#| 
-#| 
+#|
+#|
 #|         # So. At this point, what we have to do is to give a skewed LLL
 #|         # reduction with respect to this matrix W
 #|         M2 = CMRP.skewed_LLL(M1, W, R)
 #|         gens2 = [K(list(g)) for g in M2]
-#| 
+#|
 #|         for g in gens2:
 #|             ll = CMRP.L(g)
 #|             if any([x.absolute_diameter().is_infinity() for x in ll]):
 #|                 raise InsufficientPrecision()
-#| 
+#|
 #|         #timeprint("Analyzing generators in M2")
 #|         i0 = CMRP.analyze_generators(gens2, num_or_den)
-#| 
+#|
 #|         #timeprint(f"Choosing generator {i0}")
 #|         g = gens2[i0]
 #|         return g, i0
-#| 
+#|
 #|         # I don't know how to make sense of this debug print, let's
 #|         # drop it.
 #|         # drift_bits = (vector(g.list()) * W).norm().log(2)
@@ -15647,30 +15837,30 @@ if __name__ == "__main__":
 
 #@ FILE code/oracles/README.md 644 5930 ae6cd8da94c92e48fea29b92fc1451f5b0e36739f77b0f4a147d860ced266394 text
 #| # Oracles
-#| 
+#|
 #| This folder contains different oracle implementations.
-#| 
+#|
 #| The oracles that use hardware use the client-server model.
 #| The server code needs to be run on the server that has the respective hardware installed and configured.
-#| 
+#|
 #| ## Sage Oracle
-#| 
+#|
 #| File: [sage_oracle.py](sage_oracle.py)
-#| 
+#|
 #| This script simply computes the RSA signature locally using sage.
-#| 
+#|
 #| ## 3-Party Remote Setup
-#| 
+#|
 #| This is the way we ran queries on both the Luna K6 HSM and the Luna S750. The oracle has three parts (local query handler, webserver, remote query handler) described in detail [here](/code/oracles/remote_queries/remote_query_handler/README.md).
-#| 
+#|
 #| ## 2-Party Local Setup (Older Luna K6 HSM Oracle)
-#| 
+#|
 #| :warning: Older, local query mode that is a simpler 2-party setup for a local network that has less overhead than the 3-party setup that also works with a remote HSM. However, since we implemented this earlier, the HSM side is not optimizied (no threads and thus more than an order of magnitude slower), and the entire protocol has less robustness since it wasn't run for n1024. This works perfectly fine for a smaller number of queries.
-#| 
+#|
 #| ### Client
-#| 
+#|
 #| [luna_k6_hsm_oracle_client.py](luna_k6_hsm_oracle_client.py)
-#| 
+#|
 #| ```bash
 #| $ python3 luna_k6_hsm_oracle_client.py --help                                                          │
 #| usage: luna_k6_hsm_oracle_client.py [-h] [--reuse_paths] [--logs_dir LOGS_DIR] [--verbose] [--stderr] [--host HOST] [--port PORT] [--label LABEL] [--keygen]   │
@@ -15694,24 +15884,24 @@ if __name__ == "__main__":
 #|   --in INFILE           File with raw RSA integers "a" -- one per line -- to sign                                                                              │
 #|   --out OUTFILE         File to output signatures (i.e., a^d mod N) to.
 #| ```
-#| 
+#|
 #| Example call:
 #| ```bash
 #| python3 luna_k6_hsm_oracle_client.py --keygen --bits 1024 --in rqueries.todo --out rqueries.json
 #| ```
-#| 
+#|
 #| ### Server
-#| 
+#|
 #| This script needs to run on the server that has the physical HSM installation and pycryptoki.
-#| 
+#|
 #| Server: [luna_k6_hsm_oracle_server.py](luna_k6_hsm_oracle_server.py)
 #| ```bash
 #| $ python3 luna_k6_hsm_oracle_server.py --help
 #| usage: luna_k6_hsm_oracle_server.py [-h] [--reuse_paths] [--logs_dir LOGS_DIR] [--verbose] [--host HOST] [--port PORT] [--exec_threads EXEC_THREADS]
 #|                                     [--userpin USERPIN]
-#| 
+#|
 #| Luna K6 HSM signature oracle server
-#| 
+#|
 #| optional arguments:
 #|   -h, --help            show this help message and exit
 #|   --reuse_paths         Append to existing log files instead of creating a new subdir in <logs_dir>
@@ -15723,7 +15913,7 @@ if __name__ == "__main__":
 #|                         Number of processes working on the queue of values to sign concurrently.
 #|   --userpin USERPIN     Secret value generated on the Luna K6 HSM to allow user authentication without physically plugging in the PED.
 #| ```
-#| 
+#|
 #| Example call:
 #| ```bash
 #| python3.8 luna_k6_hsm_oracle_server.py --logs_dir /var/log/luna-oracle --exec_threads 1 --userpin "XXXX-XXXX-XXXX-XXXX"
@@ -15739,23 +15929,23 @@ if __name__ == "__main__":
 #| from pycryptoki.encryption import *
 #| from pycryptoki.mechanism import *
 #| from pycryptoki.conversions import *
-#| 
+#|
 #| RAW_RSA_MECHANISM   = Mechanism(mech_type=CKM_RSA_X_509)
-#| 
+#|
 #| def pad(data, modulus_bits):
 #|     nbytes = modulus_bits // 8
 #|     return data.rjust(nbytes, b"\x00")
-#| 
+#|
 #| ## Wrapper functions for HSM operations
 #| def find_existing_rsa_key(h_session, label):
 #|     template = {CKA_LABEL: label}
 #|     return c_find_objects_ex(h_session, template, 1)
-#| 
+#|
 #| def gen_rsa_keys(h_session, pk_label, sk_label, public_exp, modulus_bits):
 #|     """
 #|     Generate a new RSA key pair on the HSM partition
 #|     """
-#| 
+#|
 #|     pub_template = {
 #|         CKA_TOKEN: True,
 #|         CKA_PRIVATE: True,
@@ -15767,7 +15957,7 @@ if __name__ == "__main__":
 #|         CKA_PUBLIC_EXPONENT: public_exp,
 #|         CKA_LABEL: pk_label
 #|     }
-#| 
+#|
 #|     priv_template = {
 #|         CKA_TOKEN: True,
 #|         CKA_PRIVATE: True,
@@ -15779,19 +15969,19 @@ if __name__ == "__main__":
 #|         CKA_UNWRAP: True,
 #|         CKA_LABEL: sk_label
 #|     }
-#| 
+#|
 #|     pub_key, priv_key = c_generate_key_pair_ex(
 #|                             h_session,
 #|                             mechanism=CKM_RSA_X9_31_KEY_PAIR_GEN, # That's what the pycryptoki test cases do too
 #|                             pbkey_template=pub_template,
 #|                             prkey_template=priv_template)
-#| 
+#|
 #|     return pub_key, priv_key
-#| 
+#|
 #| def get_rsa_key(h_session, pk_label, sk_label, public_exp, modulus_bits):
 #|     h_rsa_sks = find_existing_rsa_key(h_session, sk_label)
 #|     h_rsa_pks = find_existing_rsa_key(h_session, pk_label)
-#| 
+#|
 #|     if len(h_rsa_sks) == 0 and len(h_rsa_pks) == 0:
 #|         print("Generate new RSA key pair")
 #|         h_rsa_pk, h_rsa_sk = gen_rsa_keys(h_session, pk_label, sk_label, public_exp, modulus_bits)
@@ -15800,87 +15990,87 @@ if __name__ == "__main__":
 #|         h_rsa_pk, h_rsa_sk = h_rsa_pks[0], h_rsa_sks[0]
 #|     else:
 #|         raise Exception("Invalid state, only one key from the specified RSA key pair exists.")
-#| 
+#|
 #|     return h_rsa_pk, h_rsa_sk
-#| 
+#|
 #| def enc(h_session, h_rsa_pk, ptxt):
 #|     return c_encrypt_ex(h_session, h_rsa_pk, ptxt, mechanism=RAW_RSA_MECHANISM)
-#| 
+#|
 #| def dec(h_session, h_rsa_sk, ctxt):
 #|     return c_decrypt_ex(h_session, h_rsa_sk, ctxt, mechanism=RAW_RSA_MECHANISM)
-#| 
+#|
 #| def sign(h_session, h_rsa_sk, data):
 #|     return dec(h_session, h_rsa_sk, data)
-#| 
+#|
 #| def verify(h_session, h_rsa_pk, data, sig):
 #|     return data == enc(h_session, h_rsa_pk, sig)
-#| 
+#|
 #| def get_pub_key_info(h_session, h_rsa_pk):
 #|     pub_key_info_template = {
 #|         CKA_MODULUS: None,
 #|         LUNA_ATTR_PUBLIC_EXPONENT: None
 #|     }
-#| 
+#|
 #|     infos = c_get_attribute_value_ex(h_session, h_rsa_pk, pub_key_info_template)
-#| 
+#|
 #|     N = int.from_bytes(bytes.fromhex(infos[LUNA_ATTR_MODULUS].decode()), byteorder="big")
 #|     e = int.from_bytes(bytes.fromhex(infos[LUNA_ATTR_PUBLIC_EXPONENT].decode()), byteorder="big")
-#| 
+#|
 #|     return N, e
-#| 
+#|
 #| def wrap_key(h_session, h_wrapped_key, h_wrapping_key, mechanism=Mechanism(mech_type=CKM_RSA_PKCS)):
 #|     return c_wrap_key_ex(h_session, h_wrapping_key, h_wrapped_key, mechanism)
-#| 
+#|
 #| def test_enc_dec(h_session, h_rsa_pk, h_rsa_sk):
 #|     data = b"deadbeef" + b"\x00"*120
 #|     assert(len(data) == 128)
-#| 
+#|
 #|     ctxt = enc(h_session, h_rsa_pk, data)
 #|     ptxt = dec(h_session, h_rsa_sk, ctxt)
-#| 
+#|
 #|     print("data", data)
 #|     print("ctxt", ctxt)
 #|     print("ptxt", ptxt)
-#| 
+#|
 #|     assert(ptxt == data)
-#| 
+#|
 #| def test_sign_verify(h_session, h_rsa_pk, h_rsa_sk):
 #|     data = b"deadbeef" + b"\x00"*120
 #|     assert(len(data) == 128)
-#| 
+#|
 #|     sig = sign(h_session, h_rsa_sk, data)
 #|     check = verify(h_session, h_rsa_pk, data, sig)
-#| 
+#|
 #|     print("sig", sig)
 #|     print("data", data)
 #|     print("check", check)
-#| 
+#|
 #|     assert check
 
 #@ FILE code/oracles/luna_k6_hsm_oracle_client.py 644 9031 2ee227733851345705f3b43e2dbb75b0b6683043cb84dbc53b240ac3d1ec6570 text
 #| #!/usr/bin/env python3
-#| 
+#|
 #| import argparse
 #| import logging
 #| import time
 #| import json
-#| 
+#|
 #| from os import mkdir
 #| from tqdm import tqdm
-#| 
+#|
 #| from oracle_client import OracleClient
 #| from oracle_helpers import *
-#| 
+#|
 #| from misc_tools import fast_json_dump, fast_json_load
-#| 
+#|
 #| class LunaK6HSMOracleClient(OracleClient):
 #|     def __init__(self, host, port, logging) -> None:
 #|         return super().__init__(host, port, logging)
-#| 
+#|
 #| if __name__ == "__main__":
 #|     ## Command-line arguments
 #|     parser = argparse.ArgumentParser(description='Luna K6 HSM signature oracle client')
-#| 
+#|
 #|     parser.add_argument('--reuse_paths', action='store_true',
 #|                         help='Append to existing log files instead of creating a new subdir in <logs_dir>')
 #|     parser.add_argument('--logs_dir', type=str, default='logs',
@@ -15917,9 +16107,9 @@ if __name__ == "__main__":
 #|                         help='Path to the RSA secret key of the wrapping key; to decrypt the key exported with --export-key.')
 #|     parser.add_argument('--export-key-out', type=str,
 #|                         help='Path to write the exported and decrypted key to.')
-#| 
+#|
 #|     args = parser.parse_args()
-#| 
+#|
 #|     do_reuse_paths  = args.reuse_paths
 #|     logs_dir        = args.logs_dir
 #|     host            = args.host
@@ -15932,29 +16122,29 @@ if __name__ == "__main__":
 #|     infile          = args.infile
 #|     outfile         = args.outfile
 #|     do_continue     = args.cont
-#| 
+#|
 #|     do_export           = args.export_key
 #|     wrapping_key_label  = args.wrapping_key_label
 #|     wrapping_key_path   = args.wrapping_key_path
 #|     export_key_out      = args.export_key_out
-#| 
+#|
 #|     if not do_reuse_paths:
 #|         subdir_name = 'run_' + time.strftime('%Y%m%d-%H%M%S')
 #|         logs_dir += f'/{subdir_name}'
 #|         mkdir(logs_dir)
-#| 
+#|
 #|     log_fpath = f"{logs_dir}/luna_k6_hsm_oracle_client.log"
 #|     log_level = logging.DEBUG if args.verbose else logging.WARNING
-#| 
+#|
 #|     logging.basicConfig(filename=log_fpath, level=log_level)
 #|     print(f"Luna K6 HSM oracle client logging to {log_fpath}")
-#| 
+#|
 #|     if args.stderr:
 #|         logging.getLogger().addHandler(logging.StreamHandler())
-#| 
+#|
 #|     if do_export and wrapping_key_label == None:
 #|         logging.error("Must specify --wrapping-key-label for --export-key.")
-#| 
+#|
 #|     if not label:
 #|         label = f"id_oracle_rsa_{modulus_bits}_exp_{pub_exp}"
 #|         sk_label = f"{label}_secret_key"
@@ -15963,9 +16153,9 @@ if __name__ == "__main__":
 #|         logging.info(f"Using existing key '{label}', cannot generate new one.")
 #|         sk_label = label
 #|         do_keygen = False
-#| 
+#|
 #|     client = LunaK6HSMOracleClient(host, port, logging)
-#| 
+#|
 #|     if do_keygen:
 #|         query = client.build_keygen_query(pub_exp, modulus_bits, label)
 #|         N = client.query_single(OP_KEYGEN, query)
@@ -15975,49 +16165,49 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             logging.error(f"Received unexpected response to key generation, expected int(modulus), error:\n{e}")
 #|             raise e
-#| 
+#|
 #|     if infile != None and outfile != None:
 #|         file_mode = "r+" if do_continue else "w"
-#| 
+#|
 #|         with open(outfile, file_mode) as out_fp:
 #|             answers: frozenset = frozenset()
-#| 
+#|
 #|             if do_continue:
 #|                 previous_answers_json = out_fp.read()
-#| 
+#|
 #|                 if previous_answers_json[-1] == "}":
 #|                     logging.error("Run seems to have already terminated, cannot continue it.")
 #|                     exit(1)
-#| 
+#|
 #|                 answers = frozenset(map(int, json.loads(previous_answers_json[:-2] + "\n}").keys()))
 #|             else:
 #|                 # Manual json dump so that we can write answers as they come in to avoid
 #|                 # losing data in case the application crashes at some time long into the
 #|                 # computation.
 #|                 out_fp.write("{\n")
-#| 
+#|
 #|             def do_queries(queries, quotients, N, first_line, fp):
 #|                 for query, sig in client.query_all(OP_SIGN, queries):
 #|                     a, _ = query.split(":")
-#| 
+#|
 #|                     if not first_line:
 #|                         fp.write(f",\n")
 #|                     else:
 #|                         first_line = False
-#| 
+#|
 #|                     i = int(a, 16)
 #|                     if i in quotients:
 #|                         i += quotients[i] * N
 #|                     fp.write(f"  \"{i}\": \"{sig}\"")
-#| 
+#|
 #|                 return first_line
-#| 
+#|
 #|             cnt = 1
 #|             skipped = 0
 #|             first_line = True
 #|             queries: list[str] = []
 #|             quotients: dict = dict()
-#| 
+#|
 #|             with open(infile, "r") as in_fp:
 #|                 for line in tqdm(in_fp):
 #|                     # Send query in badges to avoid giant 'queries' data structure.
@@ -16025,7 +16215,7 @@ if __name__ == "__main__":
 #|                         first_line = do_queries(queries, quotients, modulus, first_line, out_fp)
 #|                         queries = []
 #|                         quotients = dict()
-#| 
+#|
 #|                     i = int(line)
 #|                     if i < 0:
 #|                         if modulus == None:
@@ -16039,34 +16229,34 @@ if __name__ == "__main__":
 #|                         logging.info(f"Already queried {i}, skipping")
 #|                         skipped += 1
 #|                         continue
-#| 
+#|
 #|                     queries.append(client.build_sign_query(i, sk_label))
 #|                     cnt += 1
-#| 
+#|
 #|             do_queries(queries, quotients, modulus, first_line, out_fp)
 #|             out_fp.write("\n}")
 #|             logging.info(f"Skipped in total {skipped} queries.")
-#| 
+#|
 #|         # make sure to store queries in compressed form at the end.
 #|         logging.info(f"Storing queries in compressed form.")
 #|         queries = fast_json_load(outfile)
 #|         fast_json_dump(queries, outfile)
-#| 
+#|
 #|     if do_export:
 #|         query = client.build_wrap_query(wrapping_key_label, sk_label)
 #|         wrapped_key_ctxt = client.query_single(OP_WRAP, query)
-#| 
+#|
 #|         if wrapping_key_path != None:
 #|             from Crypto.PublicKey import RSA
 #|             from Crypto.Cipher import PKCS1_v1_5
-#| 
+#|
 #|             with open(wrapping_key_path, "rb") as fp:
 #|                 # Assume no PW protection of key
 #|                 wrapping_key = RSA.import_key(fp.read())
-#| 
+#|
 #|             cipher = PKCS1_v1_5.new(wrapping_key)
 #|             wrapped_key_ptxt = cipher.decrypt(wrapped_key_ctxt)
-#| 
+#|
 #|             if export_key_out:
 #|                 with open(export_key_out, "wb") as fp:
 #|                     fp.write(wrapped_key_ptxt)
@@ -16077,150 +16267,150 @@ if __name__ == "__main__":
 
 #@ FILE code/oracles/luna_k6_hsm_oracle_server.py 644 7524 c92bb664970bf48e7aa89848f82d4f37a601afa8ed26308c54a502469c3597c5 text
 #| #!/usr/bin/env python3
-#| 
+#|
 #| #
 #| # This script must be run on XXXX (where the physical Luna K6 HSM is installed).
 #| # Run as user sysadmin on XXXX (this requires a lot of custom setup and building pycryptoki from source to work, see /physical_hsms/luna_hsm/README.md):
 #| # $ python3.8 luna_k6_hsm_oracle_server.py --verbose --exec_threads 1
-#| 
+#|
 #| import os
 #| import time
 #| import argparse
 #| import logging
 #| import tempfile
 #| import subprocess
-#| 
+#|
 #| from oracle_server import OracleServer
 #| from luna_k6_hsm_crypto_helpers import *
-#| 
+#|
 #| class LunaK6HSMOracleServer(OracleServer):
 #|     def __init__(self, logs_dir, logging, userpin, *args) -> None:
 #|         self.logs_dir           = logs_dir
 #|         self.logging            = logging
 #|         self.key_info_cache     = dict()
 #|         self.sk_handel_cache    = dict()
-#| 
+#|
 #|         self.logging.info("Starting Luna K6 HSM session...")
 #|         self.session = start_session(userpin=userpin)
 #|         self.logging.info("Luna K6 HSM session started successfully")
-#| 
+#|
 #|         return super().__init__(logging, *args)
-#| 
+#|
 #|     def _get_pk_label(self, label: str):
 #|         return f"{label}_public_key"
-#| 
+#|
 #|     def _get_sk_label(self, label: str):
 #|         return f"{label}_secret_key"
-#| 
+#|
 #|     def _get_key_info(self, label, handel=None):
 #|         if label not in self.key_info_cache:
 #|             if handel == None:
 #|                 handels = find_existing_rsa_key(self.session, label)
 #|                 if len(handels) != 1:
 #|                     self.logging.error(f"Couldn't find key with label {label}")
-#| 
+#|
 #|                 handel = handels[0]
-#| 
+#|
 #|             N, e = get_pub_key_info(self.session, handel)
 #|             modulus_bits = ((N.bit_length() + 7) // 8) * 8
-#| 
+#|
 #|             self.key_info_cache[label] = (N, e, modulus_bits)
-#| 
+#|
 #|         N, e, modulus_bits = self.key_info_cache[label]
 #|         self.logging.info(f"[_get_key_info] Retrieved following info for public key with label {label}: N={N}, e={e}, modulus_bits={modulus_bits}")
 #|         return N, e, modulus_bits
-#| 
+#|
 #|     def _get_rsa_sk_handel(self, rsa_sk_label, rsa_sk_handel=None):
 #|         log_tag = f"[_get_rsa_sk_handel] "
 #|         self.logging.info(f"{log_tag}Retrieve secret key handel for label {rsa_sk_label}")
-#| 
+#|
 #|         if rsa_sk_label not in self.sk_handel_cache:
 #|             if rsa_sk_handel == None:
 #|                 rsa_sk_handels = find_existing_rsa_key(self.session, rsa_sk_label)
-#| 
+#|
 #|                 if len(rsa_sk_handels) != 1:
 #|                     if len(rsa_sk_handels) == 0:
 #|                         error_msg = f"{log_tag}Secret key with label {rsa_sk_label} does not exist, did you use 'keygen' first?"
 #|                     else:
 #|                         error_msg = f"{log_tag}Invalid HSM state"
-#| 
+#|
 #|                     self.logging.error(error_msg)
 #|                     return None
-#| 
+#|
 #|                 rsa_sk_handel = rsa_sk_handels[0]
-#| 
+#|
 #|             self.sk_handel_cache[rsa_sk_label] = rsa_sk_handel
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Retrieved handel {rsa_sk_handel}")
 #|         return self.sk_handel_cache[rsa_sk_label]
-#| 
+#|
 #|     def keygen(self, pub_exp: int, modulus_bits: int, label: str):
 #|         """Generate a new RSA key pair on the Luna K6 HSM"""
-#| 
+#|
 #|         log_tag = f"[{label}, keygen]: "
-#| 
+#|
 #|         if not label:
 #|             label = f"RSA_{modulus_bits}_exp_{pub_exp}"
-#| 
+#|
 #|         rsa_sk_label = self._get_sk_label(label)
 #|         rsa_pk_label = self._get_pk_label(label)
-#| 
+#|
 #|         rsa_sk_handels = find_existing_rsa_key(self.session, rsa_sk_label)
-#| 
+#|
 #|         if len(rsa_sk_handels) == 0:
 #|             self.logging.info(f"{log_tag}Generating RSA key pair with sk/pk labels exp={pub_exp} and bits={modulus_bits} ...")
 #|             rsa_pk_handel, rsa_sk_handel = gen_rsa_keys(self.session, rsa_pk_label, rsa_sk_label, pub_exp, modulus_bits)
 #|         else:
 #|             self.logging.warning(f"{log_tag}RSA key pair for label {label} already exists, not generating new one.")
 #|             rsa_pk_handel = rsa_sk_handels[0]
-#| 
+#|
 #|         N, e, _ = self._get_key_info(rsa_pk_label, handel=rsa_pk_handel)
-#| 
+#|
 #|         self.logging.info(f"{log_tag}The RSA key pair is using the following modulus and exponent:\n\tN = {N}\n\te = {e}")
-#| 
+#|
 #|         return N
-#| 
+#|
 #|     def sign(self, data: bytes, label: str):
 #|         """Sign 'data' using the RSA key specified by 'label'"""
-#| 
+#|
 #|         log_tag = f"[{label}, sign]: "
-#| 
+#|
 #|         N, e, modulus_bits = self._get_key_info(label)
 #|         data_pad = pad(data, modulus_bits)
-#| 
+#|
 #|         rsa_sk_handel = self._get_rsa_sk_handel(label)
-#| 
+#|
 #|         self.logging.info(f"{log_tag}sign the following data with key with label {label}: {data_pad.hex()}")
 #|         sig = sign(self.session, rsa_sk_handel, data_pad)
 #|         self.logging.info(f"{log_tag}Produced signature {sig.hex()}")
-#| 
+#|
 #|         return sig
-#| 
+#|
 #|     def wrap(self, wrapping_key_label: str, wrapped_key_label: str):
 #|         """Export the key with label 'wrapped_key_label' encrypted under key 'wrapping_key_label'"""
-#| 
+#|
 #|         log_tag = f"[{wrapped_key_label}, wrap]: "
-#| 
+#|
 #|         rsa_sk_handel = self._get_rsa_sk_handel(wrapped_key_label)
-#| 
+#|
 #|         wrapping_key_handels = find_existing_rsa_key(self.session, wrapping_key_label)
 #|         if len(wrapping_key_handels) == 0:
 #|             self.logging.error(f"{log_tag}Cannot find wrapping key with label '{wrapping_key_label}'")
 #|         elif len(wrapping_key_handels) > 1:
 #|             self.logging.warning(f"{log_tag}Multiple keys with wrapping key label '{wrapping_key_label}' exist, using first one.")
-#| 
+#|
 #|         wrapping_key_handel = wrapping_key_handels[0]
-#| 
+#|
 #|         self.logging.info(f"{log_tag}wrap key with label {wrapped_key_label} using wrapping key with label {wrapping_key_label}")
 #|         wrapped_key = wrap_key(self.session, rsa_sk_handel, wrapping_key_handel)
 #|         self.logging.info(f"{log_tag}Wrapped key {wrapped_key.hex()}")
-#| 
+#|
 #|         return wrapped_key
-#| 
+#|
 #| if __name__ == "__main__":
 #|     ## Command-line arguments
 #|     parser = argparse.ArgumentParser(description='Luna K6 HSM signature oracle server')
-#| 
+#|
 #|     parser.add_argument('--reuse_paths', action='store_true',
 #|         help='Append to existing log files instead of creating a new subdir in <logs_dir>')
 #|     parser.add_argument('--logs_dir', type=str, default='logs',
@@ -16233,290 +16423,49 @@ if __name__ == "__main__":
 #|         help='Port that the socket should listen on')
 #|     parser.add_argument('--userpin', type=str,
 #|         help='Secret value generated on the Luna K6 HSM to allow user authentication without physically plugging in the PED.')
-#| 
+#|
 #|     args = parser.parse_args()
-#| 
+#|
 #|     do_reuse_paths      = args.reuse_paths
 #|     logs_dir            = args.logs_dir
 #|     host                = args.host
 #|     port                = args.port
 #|     userpin             = args.userpin
-#| 
+#|
 #|     # The HSM can only handle requests from one thread at a time
 #|     exec_threads = 1
-#| 
+#|
 #|     try:
 #|         os.mkdir(logs_dir)
 #|     except:
 #|         pass
-#| 
+#|
 #|     if not do_reuse_paths:
 #|         subdir_name = 'run_' + time.strftime('%Y%m%d-%H%M%S')
 #|         logs_dir += f'/{subdir_name}'
 #|         os.mkdir(logs_dir)
-#| 
+#|
 #|     log_fpath = f"{logs_dir}/luna_k6_hsm_oracle_server.log"
 #|     log_level = logging.DEBUG if args.verbose else logging.WARNING
-#| 
+#|
 #|     logging.basicConfig(filename=log_fpath, level=log_level)
-#| 
+#|
 #|     print(f"Luna K6 HSM server logging to {log_fpath}")
 #|     oracle = LunaK6HSMOracleServer(logs_dir, logging, userpin, host, port, exec_threads)
 #|     oracle.run()
 
-#@ FILE code/oracles/misc_tools.py 644 7296 5d07ff0ec21931cba5861334160cf070e94e5efad60d401803f723eb7e316be4 text
-#| import re
-#| import os
-#| import subprocess
-#| import logging
-#| import json
-#| 
-#| from math import sqrt, floor, ceil
-#| 
-#| ncpus = os.cpu_count() // 2
-#| 
-#| def cat_or_zcat(filename):
-#|     """
-#|     Inspired by `tests/sagemath/cado_sage/tools.py` but faster!
-#| 
-#|     return an iterable over the file contents, which might
-#|     involve decrypting it.
-#| 
-#|     Preference order (depending on availability): xopen, zcat.
-#|     """
-#| 
-#|     try:
-#|         from xopen import xopen
-#|         return xopen(filename, mode="r", threads=ncpus)
-#|     except ModuleNotFoundError:
-#|         logging.warning("Install xopen for faster decompression.")
-#| 
-#|     if re.search(r"\.gz$", filename):
-#|         # Use pigz binary if available.
-#|         if os.path.isfile("/usr/bin/pigz"):
-#|             return subprocess.Popen([
-#|                     "pigz",
-#|                     "-cd",
-#|                     filename
-#|                 ],
-#|                 stdout=subprocess.PIPE,
-#|                 stderr=subprocess.PIPE).stdout
-#|         else:
-#|             return subprocess.Popen(["zcat", filename],
-#|                                     stdout=subprocess.PIPE,
-#|                                     stderr=subprocess.PIPE).stdout
-#|     else:
-#|         return open(filename)
-#| 
-#| def try_xopen_write(filename: str, content):
-#|     if type(content) == str:
-#|         content = content.encode()
-#| 
-#|     try:
-#|         from xopen import xopen
-#|         with xopen(filename, mode="wb", format="zst", threads=ncpus) as fp:
-#|             fp.write(content)
-#|         return True
-#|     except ModuleNotFoundError:
-#|         logging.warning("Install xopen for faster compression.")
-#| 
-#|     return False
-#| 
-#| def try_xopen_load(filename: str):
-#|     try:
-#|         from xopen import xopen
-#|         with xopen(filename, mode="rb", threads=ncpus) as fp:
-#|             return fp.read()
-#|     except ModuleNotFoundError:
-#|         logging.warning("Install xopen for faster decompression.")
-#| 
-#|     return None
-#| 
-#| def fast_persistent_save(obj, filename, compress=True):
-#|     """
-#|     Save a sage object `obj` persistently and compressed in file `filename`
-#|     using faster, parallelized compression (if available) than the sage function
-#|     sage.misc.persist.save.
-#| 
-#|     If compress = True tries first xopen (fastest) then sage.misc.persist.save.
-#| 
-#|     Else (compress = False), use sage.misc.persist.save with disabled compression.
-#|     """
-#| 
-#|     import sage.misc.persist
-#|     
-#|     if compress:
-#|         obj_bytes = sage.misc.persist.dumps(obj, compress=False)
-#|         if try_xopen_write(filename, obj_bytes):
-#|             return
-#|         sage.misc.persist.save(obj, filename, protocol=-1)
-#|     else:
-#|         sage.misc.persist.save(obj, filename, protocol=-1, compress=False)
-#| 
-#| def fast_persistent_load(filename):
-#|     """
-#|     Load the object stored in file `filename` using faster, parallelized
-#|     decompression (if needed) than the sage function sage.misc.persist.load.
-#| 
-#|     Tries first xopen (fastest), then sage.misc.persist.load.
-#|     """
-#| 
-#|     import sage.misc.persist
-#|     obj = try_xopen_load(filename)
-#| 
-#|     if obj == None:
-#|         return sage.misc.persist.load(filename)
-#| 
-#|     return sage.misc.persist.loads(obj)
-#| 
-#| def fast_json_dumps(d, *args, decode=True, **kwargs):
-#|     """
-#|     Export dictionary `d` as JSON string, using a faster json package
-#|     than json.dumps (if available).
-#|     """
-#| 
-#|     try:
-#|         import orjson
-#|         j = orjson.dumps(d, *args, **kwargs)
-#|         if decode:
-#|             j = j.decode()
-#|         return j
-#|     except ModuleNotFoundError:
-#|         logging.warning("Install orjson for faster dumping. Falling back to json.dumps")
-#|         j = json.dumps(d, *args, **kwargs)
-#|         if not decode:
-#|             j = j.encode()
-#|         return j
-#| 
-#| def fast_json_dump(d, filename, *args, compress="auto", **kwargs):
-#|     """
-#|     Save the dictionary `d` to file `filename`, using a faster json package
-#|     than json.dump (if available) and compression (if the disctionary is large
-#|     or compress = True).
-#|     """
-#| 
-#|     d_json = fast_json_dumps(d, *args, decode=False, **kwargs)
-#| 
-#|     if compress == "auto":
-#|         # heuristic boundary.
-#|         compress = len(d) > 5000000
-#| 
-#|     if compress:
-#|         if try_xopen_write(filename, d_json):
-#|             return
-#|         logging.warning("Falling back to uncompressed storage")
-#| 
-#|     with open(filename, "w") as fp:
-#|         fp.write(d_json.decode())
-#| 
-#| def fast_json_loads(d_str, *args, **kwargs):
-#|     """
-#|     Convert JSON string `d_str` to dictionary, using a faster json package
-#|     than json.load (if available).
-#|     """
-#| 
-#|     try:
-#|         import orjson
-#|         return orjson.loads(d_str, *args, **kwargs)
-#|     except ModuleNotFoundError:
-#|         logging.warning("Install orjson for faster JSON loading. Falling back to json.load.")
-#| 
-#|     return json.loads(d_str, *args, **kwargs)
-#| 
-#| def fast_json_load(filename, *args, **kwargs):
-#|     """
-#|     Load a dictionary in json format from file `filename`, using a faster json package
-#|     than json.load (if available) and fast decompression (if necessary).
-#|     """
-#| 
-#|     d_str = try_xopen_load(filename)
-#| 
-#|     if d_str == None:
-#|         logging.warning("Falling back to json.load")
-#|         with open(filename, "r") as fp:
-#|             return json.load(fp, *args, **kwargs)
-#| 
-#|     return fast_json_loads(d_str, *args, **kwargs)
-#| 
-#| def read_until(in_fp, expected_char, buf):
-#|     """
-#|     Read from in_fp until and including `expected_char`, returning characters read too much in buf.
-#|     """
-#|     buf_size = 1024
-#|     new_data = buf
-#|     while True:
-#|         char_pos = new_data.find(expected_char)
-#|         if char_pos >= 0:
-#|             break
-#|         new_chunk = in_fp.read(buf_size)
-#|         if new_chunk == b"":
-#|             return None, new_data
-#|         new_data += new_chunk
-#|     return new_data[:char_pos+1], new_data[char_pos+1:]
-#| 
-#| def fast_json_query_load(filename):
-#|     """
-#|     Read queries (key, value) format (int, int), streaming the file manually,
-#|     which is faster for very large files.
-#|     """
-#|     logging.info(f"Starting to parse json from file {filename} using custom parser")
-#|     json_format = re.compile(rb'\s*"(-?\d+)"\s*:\s*"(-?\d+)"[,}]\s*')
-#| 
-#|     with open(filename, "rb") as fp:
-#|         data, buf = read_until(fp, b'{', b"")
-#|         assert data == b'{'
-#| 
-#|         while data != None:
-#|             data, buf = read_until(fp, b',', buf)
-#|             to_parse = data if data != None else buf
-#|             m = json_format.search(to_parse)
-#|             if not m:
-#|                 logging.error(f"Reached unexpected end of json, ending with: {to_parse}")
-#|                 break
-#|             k, v = map(int, m.groups())
-#|             yield (k, v)
-#| 
-#|         closing_bracket_pos = buf.find(b"}")
-#|         if closing_bracket_pos >= 0:
-#|             buf = buf[closing_bracket_pos+1:]
-#|         if buf.strip() != b"":
-#|             logging.error(f"Unexpected trailing data {buf}")
-#| 
-#| def find_factors_close_to_square_root(i):
-#|     """
-#|     Given i, find a * b < i such that a, b are close to sqrt(i).
-#|     Returns string "{a}x{b}".
-#|     """
-#|     isqrt = sqrt(i)
-#|     a = floor(isqrt)
-#|     b = ceil(isqrt)
-#|     suboptimal_sol = None
-#| 
-#|     while a * b != i:
-#|         if a * b > i:
-#|             a -= 1
-#|         elif a * b < i:
-#|             if not suboptimal_sol:
-#|                 suboptimal_sol = (a, b)
-#|             b += 1
-#| 
-#|         # Accept suboptimal solution before it factors diverge too much
-#|         if b - a > isqrt // 2 and suboptimal_sol:
-#|             a, b = suboptimal_sol
-#|             break
-#| 
-#|     return f"{a}x{b}"
+#@ FILE code/oracles/misc_tools.py 644 7296 5d07ff0ec21931cba5861334160cf070e94e5efad60d401803f723eb7e316be4 dup:code/misc_tools.py
 
 #@ FILE code/oracles/oracle_client.py 644 6856 7c90854b3c1313c559b4b840ef24f2f6a6f2728344a6661ca2104f91f8b5650a text
 #| #/usr/bin/env python3
-#| 
+#|
 #| import socket
 #| import secrets
-#| 
+#|
 #| from queue import Queue
 #| from threading import Thread
 #| from oracle_helpers import *
-#| 
+#|
 #| class OracleClient():
 #|     def __init__(self, host, port, logging):
 #|         self.port           = port
@@ -16524,125 +16473,125 @@ if __name__ == "__main__":
 #|         self.logging        = logging
 #|         self.bufsize        = BUF_SIZE
 #|         self.answer_queue   = Queue()
-#| 
+#|
 #|         self.ans_parsers = {
 #|             OP_ANS_KEYGEN: self._keygen_ansparse,
 #|             OP_ANS_SIGN: self._sign_ansparse,
 #|             OP_ANS_VERIFY: self._verify_ansparse,
 #|             OP_ANS_WRAP: self._wrap_ansparse
 #|         }
-#| 
+#|
 #|     def _receive(self, expected_answers=-1):
 #|         log_tag = f"[OracleClient._receive] "
 #|         self.logging.info(f"{log_tag}Start running client receiver thread")
-#| 
+#|
 #|         data = b""
 #|         while expected_answers != 0:
 #|             try:
 #|                 while b"\n" not in data:
 #|                     data += self.socket.recv(self.bufsize)
-#|                 
+#$                 $
 #|                 idx = data.index(b"\n")
 #|                 curr_data = data[:idx]
 #|                 data = data[idx+1:]
-#| 
+#|
 #|                 if not curr_data or len(curr_data) <= 0:
 #|                     break
-#| 
+#|
 #|                 parsed = parse_query(curr_data)
-#| 
+#|
 #|                 if parsed == None:
 #|                     self.logging.warning(f"Couldn't parse query '{curr_data}', ignoring...")
 #|                     continue
-#|                     
+#$                     $
 #|                 op, ident, ans_data = parsed
-#| 
+#|
 #|                 if ident == OP_CLOSE_CONN:
 #|                     self._close()
 #|                     break
-#| 
+#|
 #|                 if op not in self.ans_parsers:
 #|                     self.logging.warning(f"{log_tag}Received unexpected op code {op} in query {curr_data}, when expecting answer, ignoring...")
 #|                     continue
-#| 
+#|
 #|                 answer = self.ans_parsers[op](ans_data)
 #|                 self.answer_queue.put((ident, answer))
 #|                 self.logging.info(f"{log_tag}Received following answer for identifier {ident}: {answer}")
 #|             except Exception as e:
 #|                 self.logging.error(f"{log_tag}Caught the following exception, stopping oracle client receiver.\n{e}")
 #|                 break
-#| 
+#|
 #|             expected_answers -= 1
-#| 
+#|
 #|         self.logging.info(f"Stopped oracle client receiver")
-#| 
+#|
 #|     def _send_query(self, op, ident, query):
 #|         self.logging.info(f"sending query for operation '{op}', ID '{ident}', and query '{query}'")
 #|         query_enc = build_query(op, ident, query)
 #|         self.socket.sendall(query_enc + b"\n")
-#| 
+#|
 #|     def _connect(self):
 #|         self.logging.info(f"Connect oracle client to {self.host}:{self.port}")
 #|         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 #|         self.socket.connect((self.host, self.port))
-#| 
+#|
 #|     def _close(self):
 #|         self.socket.close()
-#| 
+#|
 #|     def _send_fin(self):
 #|         self._send_query(OP_CLOSE_CONN, 0, 0)
-#| 
+#|
 #|     def query_all(self, op, queries):
 #|         self.logging.info("Oracle client starting")
 #|         sent_queries = dict()
-#| 
+#|
 #|         try:
 #|             self._connect()
-#| 
+#|
 #|             nqueries = len(queries)
 #|             receiver = Thread(target=self._receive,
 #|                                 kwargs={"expected_answers": nqueries})
 #|             receiver.start()
-#| 
+#|
 #|             off = secrets.randbelow(2**32)
 #|             for idx, query in enumerate(queries):
 #|                 ident = (off + idx) % (2**32)
 #|                 sent_queries[ident] = query
 #|                 self._send_query(op, ident, query)
-#| 
+#|
 #|             answer_idents = []
 #|             while len(answer_idents) < nqueries:
 #|                 ident, answer = self.answer_queue.get()
 #|                 answer_idents.append(ident)
 #|                 yield (sent_queries[ident], answer)
-#| 
+#|
 #|             receiver.join()
 #|         except KeyboardInterrupt:
 #|             self.logging.warning("Caught user interrupt, terminating client...")
 #|         finally:
 #|             self._send_fin()
 #|             self._close()
-#| 
+#|
 #|         for ident in sent_queries.keys():
 #|             if ident not in answer_idents:
 #|                 self.logging.warning(f"Answer with identifier {ident} missing (for query {sent_queries[ident]}).")
 #|                 continue
-#| 
+#|
 #|     def query_single(self, op, query):
 #|         """
 #|         Get the oracle server response for a single query 'query' (must be bytes or int)
 #|         """
-#| 
+#|
 #|         answer = None
-#| 
+#|
 #|         try:
 #|             self._connect()
-#| 
+#|
 #|             ident = secrets.randbelow(2**32)
 #|             self._send_query(op, ident, query)
 #|             self._receive(expected_answers=1)
 #|             answered_ident, answer = self.answer_queue.get()
-#| 
+#|
 #|             if answered_ident != ident:
 #|                 self.logging.error(f"Did not receive answer for {ident} instead got answer to: {answered_ident}")
 #|                 return None
@@ -16651,9 +16600,9 @@ if __name__ == "__main__":
 #|         finally:
 #|             self._send_fin()
 #|             self._close()
-#| 
+#|
 #|         return answer
-#| 
+#|
 #|     def _keygen_ansparse(self, ans):
 #|         try:
 #|             N = int(ans, 16)
@@ -16661,16 +16610,16 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             self.logging.error(f"Failed to parse keygen answer {ans} with error:\n{e}")
 #|             exit(1)
-#| 
+#|
 #|         return N
-#| 
+#|
 #|     def build_keygen_query(self, pub_exp, modulus_bits, label):
 #|         """Query format: pub_exp:modulus_bits:label"""
 #|         return f"{pub_exp}:{modulus_bits}:{label}"
-#| 
+#|
 #|     def keygen(self, query):
 #|         raise NotImplementedError("Must be implemented by child class.")
-#| 
+#|
 #|     def _sign_ansparse(self, ans):
 #|         try:
 #|             sig = int(ans, 16)
@@ -16678,13 +16627,13 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             self.logging.error(f"Failed to parse signature {ans} with error:\n{e}")
 #|             exit(1)
-#| 
+#|
 #|         return sig
-#| 
+#|
 #|     def build_sign_query(self, data, label):
 #|         """Query format: hex(data):label"""
 #|         return f"{i2h(data)}:{label}"
-#| 
+#|
 #|     def _verify_ansparse(self, ans):
 #|         try:
 #|             decision = int(ans, 16)
@@ -16695,31 +16644,31 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             self.logging.error(f"Failed to parse signature {ans} with error:\n{e}")
 #|             exit(1)
-#| 
+#|
 #|         return decision_bool
-#| 
+#|
 #|     def build_verify_query(self, data, sig, label):
 #|         """Query format: hex(data):hex(sig):label"""
 #|         return f"{i2h(data)}:{i2h(sig)}:{label}"
-#| 
+#|
 #|     def _wrap_ansparse(self, ans):
 #|         return ans
-#| 
+#|
 #|     def build_wrap_query(self, wrapping_key_label, wrapped_key_label):
 #|         """Query format: wrapping_key_label:wrapped_key_label"""
 #|         return f"{wrapping_key_label}:{wrapped_key_label}"
 
 #@ FILE code/oracles/oracle_helpers.py 644 2126 bf30bf3975da9235968aab41c0cfa649224cbe39a09586de37a10fffd04998a7 text
 #| #/usr/bin/env python3
-#| 
+#|
 #| import logging
 #| import re
-#| 
+#|
 #| END_OF_QUEUE        = None
 #| MAX_MODULUS_SIZE    = 1024
 #| # Space for header (2 byte op, 8 byte ID, modulus in hex, and 2 bytes for separators
 #| BUF_SIZE            = 12 + (MAX_MODULUS_SIZE // 4)
-#| 
+#|
 #| OP_CLOSE_CONN   = 0
 #| OP_KEYGEN       = 1
 #| OP_SIGN         = 2
@@ -16729,13 +16678,13 @@ if __name__ == "__main__":
 #| OP_ANS_SIGN     = 102
 #| OP_ANS_VERIFY   = 103
 #| OP_ANS_WRAP     = 104
-#| 
+#|
 #| def i2h(i):
 #|     h = "{:x}".format(i)
 #|     if len(h) % 2 == 1:
 #|         h = "0" + h
 #|     return h
-#| 
+#|
 #| def parse_query(query):
 #|     """
 #|     Assumed query format is "op:id:hex", where
@@ -16743,29 +16692,29 @@ if __name__ == "__main__":
 #|         'id' is a 4-byte Integer (in hex) and
 #|         'hex' is the data that should be signed in hexadecimal.
 #|     """
-#| 
+#|
 #|     try:
 #|         query_str = query.decode()
 #|         m = re.match(r'([0-9a-f]+)\:([0-9a-f]+)\:(.*)', query_str)
 #|         groups = m.groups()
-#| 
+#|
 #|         if len(groups) != 3:
 #|             logging.error(f"Query has {len(groups)} groups, expected 3.")
 #|             return None
-#| 
+#|
 #|         op, ident, data = groups
-#| 
+#|
 #|         if len(op) > 2:
 #|             logging.error(f"Opcode '{op}' larger than 1 byte.")
-#| 
+#|
 #|         if len(ident) > 8:
 #|             logging.error(f"Opcode '{ident}' larger than 4 bytes.")
-#| 
+#|
 #|         return int(op, 16), int(ident, 16), data
 #|     except Exception as e:
 #|         logging.error(f"Failed to parse query '{query}' with the following error:\n{e}")
 #|         return None
-#| 
+#|
 #| def build_query(op: int, ident: int, data):
 #|     """
 #|     Build a query of the format "op:id:hex", where
@@ -16773,10 +16722,10 @@ if __name__ == "__main__":
 #|         'id' is a 4-byte Integer (in hex) and
 #|         'hex' is the conversion of integer data to hexadecimal.
 #|     """
-#| 
+#|
 #|     query = "{:02x}".format(op)
 #|     query += ":{:08x}".format(ident)
-#| 
+#|
 #|     if type(data) == int:
 #|         data = i2h(data)
 #|         if len(data) % 2 == 1:
@@ -16785,26 +16734,26 @@ if __name__ == "__main__":
 #|         data = data.hex()
 #|     elif type(data) != str:
 #|         logging.error(f"'data' argument of 'build_query' must be int, bytes, or str, got {type(data)}")
-#| 
+#|
 #|     return f"{query}:{data}".encode()
 
 #@ FILE code/oracles/oracle_server.py 644 8546 e2a30acc91cae584b5a87464ca70a8a5118f43b65cc5f99b6fea2543ed48472e text
 #| #/usr/bin/env python3
-#| 
+#|
 #| import socket
 #| import re
-#| 
+#|
 #| from queue import Queue
 #| from threading import Thread
 #| from multiprocessing.pool import ThreadPool
-#| 
+#|
 #| from oracle_helpers import *
-#| 
+#|
 #| MAX_UNACCEPTED_CONN = 5
-#| 
+#|
 #| class OracleServerException(Exception):
 #|     pass
-#| 
+#|
 #| class OracleServer:
 #|     def __init__(self, logging, host, port,
 #|                  exec_threads_nr = 1,
@@ -16812,46 +16761,46 @@ if __name__ == "__main__":
 #|         self.host       = host
 #|         self.port       = port
 #|         self.logging    = logging
-#| 
+#|
 #|         self.exec_threads_nr            = exec_threads_nr
 #|         self.max_unaccepted_connections = MAX_UNACCEPTED_CONN
-#| 
+#|
 #|         self.queue      = Queue()
 #|         self.buf_size   = BUF_SIZE
-#| 
+#|
 #|         self.ops = {
 #|             OP_KEYGEN: (self.keygen, self._keygen_argparse),
 #|             OP_SIGN: (self.sign, self._sign_argparse),
 #|             OP_VERIFY: (self.verify, self._verify_argparse),
 #|             OP_WRAP: (self.wrap, self._wrap_argparse)
 #|         }
-#| 
+#|
 #|     def _exec_thread(self, id):
 #|         log_tag = f"[_exec_thread] "
 #|         self.logging.info(f"{log_tag}Start executor thread #{id}.")
-#| 
+#|
 #|         while True:
 #|             self.logging.info(f"{log_tag}Waiting for next item in queue.")
 #|             item = self.queue.get()
 #|             self.logging.info(f"{log_tag}Retrieved following item from queue: {item}")
-#| 
+#|
 #|             if item == END_OF_QUEUE:
 #|                 self.logging.info(f"{log_tag}Queue was shut down, stopping executor.")
 #|                 if hasattr(self, "last_conn"):
 #|                     self.last_conn.sendall(build_query(OP_CLOSE_CONN, 0, 0) + b"\n")
 #|                 self.queue.put(END_OF_QUEUE)
 #|                 break
-#| 
+#|
 #|             try:
 #|                 data, conn = item
 #|                 self.last_conn = conn
 #|                 op, ident, query = parse_query(data)
 #|                 self.logging.info(f"{log_tag}Exec thread received operation {op}, id: {ident}, query: {query}")
-#| 
+#|
 #|                 if op not in self.ops:
 #|                     self.logging.error(f"{log_tag}Received query for unsupported operation {op} (id: {ident}, query: {query}, raw data: {data})")
 #|                     continue
-#| 
+#|
 #|                 op_fn, op_argparse = self.ops[op]
 #|                 success, args = op_argparse(query)
 #|                 if success:
@@ -16863,55 +16812,55 @@ if __name__ == "__main__":
 #|                     self.logging.warning(f"{log_tag}Failed to parse the query {query} for operation {op}")
 #|             except Exception as e:
 #|                 self.logging.error(f"{log_tag}Failed to execute operation {op} with error:\n{e}")
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Stopped executor thread #{id}.")
-#| 
+#|
 #|     def _receiver_thread(self, id, conn):
 #|         log_tag = f"[_receiver_thread] "
 #|         self.logging.info(f"{log_tag}Start receiver thread #{id}.")
-#| 
+#|
 #|         data = b""
 #|         while True:
 #|             try:
 #|                 while b"\n" not in data:
 #|                     data += conn.recv(self.buf_size)
-#| 
+#|
 #|                 idx = data.index(b"\n")
 #|                 curr_data = data[:idx]
 #|                 data = data[idx+1:]
-#| 
+#|
 #|                 self.logging.info(f"{log_tag}Oracle server received data {curr_data}")
-#| 
+#|
 #|                 if not curr_data or len(curr_data) <= 0:
 #|                     break
-#| 
+#|
 #|                 op, _, _ = parse_query(curr_data)
 #|                 if op == OP_CLOSE_CONN:
 #|                     break
-#| 
+#|
 #|                 self.queue.put((curr_data, conn))
 #|             except Exception as e:
 #|                 self.logging.info(f"{log_tag}Caught the following exception, stopping receiver thread.\n{e}")
 #|                 break
 #|         self.logging.info(f"{log_tag}Stopped receiver thread #{id}")
-#| 
+#|
 #|     def _run_listener(self):
 #|         log_tag = f"[_run_listener] "
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Start listener thread.")
 #|         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 #|         self.socket.bind((self.host, self.port))
 #|         self.socket.listen(self.max_unaccepted_connections)
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Oracle server listening on {self.host}:{self.port}")
-#| 
+#|
 #|         threads = []
 #|         while True:
 #|             try:
 #|                 self.logging.info(f"{log_tag}Waiting for connection")
 #|                 conn, addr = self.socket.accept()
 #|                 self.logging.info(f"{log_tag}Oracle server accepted connection from {addr}")
-#| 
+#|
 #|                 receiver_thread = Thread(target=self._receiver_thread, args=(len(threads), conn,))
 #|                 receiver_thread.start()
 #|                 threads.append(receiver_thread)
@@ -16922,19 +16871,19 @@ if __name__ == "__main__":
 #|                 for thread in threads:
 #|                     thread.join()
 #|         self.logging.info(f"{log_tag}Stopped listener thread")
-#| 
+#|
 #|     def run(self):
 #|         log_tag = f"[OracleServer.run] "
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Oracle server starting")
-#| 
+#|
 #|         p = ThreadPool(self.exec_threads_nr)
 #|         try:
 #|             p.map_async(self._exec_thread, list(range(self.exec_threads_nr)))
 #|             self._run_listener()
 #|         except KeyboardInterrupt:
 #|             self.logging.info(f"{log_tag}Caught user interrupt, terminating oracle...")
-#| 
+#|
 #|         finally:
 #|             try:
 #|                 self.logging.info(f"{log_tag}Waiting for {self.queue.unfinished_tasks} operations to be finished...\
@@ -16949,79 +16898,79 @@ if __name__ == "__main__":
 #|                 p.close()
 #|                 p.join()
 #|                 self.close()
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Oracle server stopped")
-#| 
+#|
 #|     def close(self):
 #|         self.logging.info("[OracleServer.close] Closing socket if available.")
 #|         if hasattr(self, "socket"):
 #|             self.socket.close()
-#| 
+#|
 #|     def _keygen_argparse(self, query):
 #|         m = re.match(r'(\d+):(\d+)\:(.*)', query)
 #|         groups = m.groups()
 #|         if len(groups) != 3:
 #|             self.logging.error(f"[_keygen_argparse] Failed to parse keygen argument {query}, expected format 'pub_exp:modulus_bits:label' but extracted groups {groups}")
 #|             return False, None
-#| 
+#|
 #|         pub_exp, modulus_bits, label = groups
 #|         return True, (int(pub_exp), int(modulus_bits), label)
-#| 
+#|
 #|     def keygen(self, query):
 #|         raise NotImplementedError("Must be implemented by child class.")
-#| 
+#|
 #|     def _sign_argparse(self, query):
 #|         m = re.match(r'([0-9a-f]+)\:(.*)', query)
 #|         groups = m.groups()
 #|         if len(groups) != 2:
 #|             self.logging.error(f"[_sign_argparse] Failed to parse sign argument {query}, expected format 'hex(data):label' but extracted groups {groups}")
 #|             return False, None
-#| 
+#|
 #|         data_hex, label = groups
 #|         data_bin = bytes.fromhex(data_hex)
 #|         return True, (data_bin, label)
-#| 
+#|
 #|     def sign(self, query):
 #|         raise NotImplementedError("Must be implemented by child class.")
-#| 
+#|
 #|     def _verify_argparse(self, query):
 #|         m = re.match(r'([0-9a-f]+):([0-9a-f]+)\:(.*)', query)
 #|         groups = m.groups()
 #|         if len(groups) != 3:
 #|             self.logging.error(f"[_verify_argparse] Failed to parse verify argument {query}, expected format 'hex(data):hex(sig):label' but extracted groups {groups}")
 #|             return False, None
-#| 
+#|
 #|         data_hex, sig_hex, label = groups
 #|         data_bin = bytes.fromhex(data_hex)
 #|         sig_bin = bytes.fromhex(sig_hex)
 #|         return True, (data_bin, sig_bin, label)
-#| 
+#|
 #|     def verify(self, query):
 #|         raise NotImplementedError("Must be implemented by child class.")
-#|     
+#$     $
 #|     def _wrap_argparse(self, query):
 #|         m = re.match(r'(.*)\:(.*)', query)
 #|         groups = m.groups()
 #|         if len(groups) != 2:
 #|             self.logging.error(f"[_wrap_argparse] Failed to parse wrap argument {query}, expected format 'wrapping_key_label:wrapped_key_label' but extracted groups {groups}")
 #|             return False, None
-#| 
+#|
 #|         wrapping_key_label, wrapped_key_label = groups
 #|         return True, (wrapping_key_label, wrapped_key_label)
-#|     
+#$     $
 #|     def wrap(self, query):
 #|         raise NotImplementedError("Must be implemented by child class.")
 
 #@ FILE code/oracles/remote_queries/README.md 644 823 9e99e0082d54dd03277acb9ecc30a52f37ec7904f9f915a609d1cac498fbeb13 text
 #| # Remote Queries
-#| 
+#|
 #| This folder has a self-contained set of scripts for the following HSM query architecture with three machines:
 #| - local_query_handler: runs on our internal cluster and generates batches of queries and uploads them to the public facing webserver.
 #| - webserver: hosts query batches, allows the remote machine to fetch batches and upload results.
 #| - remote_query_handler: fetches queries from webserver and runs them on the HSM, gathers the results, and uploads a batch of results plus some metadata to the webserver.
-#| 
+#|
 #| ## How to run
-#| 
+#|
 #| For `local_query_handler`, create a Python virtual environment inside folder [local_query_handler](/code/oracles/remote_queries/local_query_handler/) and install all needed dependencies:
 #| ```bash
 #| $ python3 -m venv venv
@@ -17031,26 +16980,26 @@ if __name__ == "__main__":
 
 #@ FILE code/oracles/remote_queries/local_query_handler/local_query_handler.py 644 6174 f1af80d776890ec5fddd521c1d96a17911470e6d11ab86316bd7fa8534178798 text
 #| #!/usr/bin/env python3
-#| 
+#|
 #| import argparse
 #| import logging
 #| import time
 #| import os
-#| 
+#|
 #| from webserver import Webserver
-#| 
+#|
 #| API_URL_FORMAT = "{}://{}/api"
 #| OUTSTANDING_BATCHES_THR = 100
 #| BATCH_SIZE = 100000
-#| 
+#|
 #| def get_parser():
 #|     parser = argparse.ArgumentParser(description='Local query handler')
-#| 
+#|
 #|     parser.add_argument('--work-dir', type=str, default='logs',
 #|                         help='Path to directory in which log files will be stored. (The directory must already exist.)')
 #|     parser.add_argument('--resume', action='store_true',
 #|                         help='Resume a previous run')
-#| 
+#|
 #|     # RSA parameters
 #|     parser.add_argument('--label', type=str,
 #|                         help='Name of the RSA key to use (default = id_oracle_rsa_{bits}_exp_{e})')
@@ -17072,14 +17021,14 @@ if __name__ == "__main__":
 #|                         help='Number of batch writing threads (there will always be different threads for receiving and sending).')
 #|     parser.add_argument('--download-nprocesses', type=int, default=1,
 #|                         help='Number of processes polling for and downloading signatures.')
-#| 
+#|
 #|     parser.add_argument('--api', default="hsm-api.domain.example",
 #|                         help='Domain name or IP (without protocol or URL path) of the webserver that exposes the REST API to download query batches and upload signatures.')
 #|     parser.add_argument('--api-token', action='store_true',
 #|                         help="Read authentication token for REST API on webserver from stdin")
 #|     parser.add_argument('--http-only-webserver', action='store_true',
 #|                         help="Use http instead of https to connect to webserver (only use in local networks!)")
-#| 
+#|
 #|     # Logging and debugging
 #|     parser.add_argument('--reuse_paths', action='store_true',
 #|                         help='Append to existing log files instead of creating a new subdir in <work_dir>')
@@ -17089,14 +17038,14 @@ if __name__ == "__main__":
 #|                         help="Set the log level for this application, use: 0 (NOTSET), 10 (DEBUG), 20 (INFO), 30 (WARNING), 40 (ERROR), 50 (FATAL). Without --verbose the default is 30 (WARNING), with --verbose it is 20 (INFO).")
 #|     parser.add_argument('--stderr', action='store_true',
 #|                         help='Log also to stderr, in addition to the log file.')
-#| 
+#|
 #|     return parser
-#| 
+#|
 #| if __name__ == "__main__":
 #|     parser = get_parser()
-#| 
+#|
 #|     args = parser.parse_args()
-#| 
+#|
 #|     do_resume           = args.resume
 #|     oracle              = args.oracle
 #|     label               = args.label
@@ -17110,21 +17059,21 @@ if __name__ == "__main__":
 #|     download_nprocesses = args.download_nprocesses
 #|     api                 = args.api
 #|     do_read_api_token   = args.api_token
-#| 
+#|
 #|     do_reuse_paths  = args.reuse_paths
 #|     work_dir        = args.work_dir
-#| 
+#|
 #|     if not do_resume and None in [oracle, label, modulus, infile, outfile, batches_thr, batch_size]:
 #|         raise Exception(f"Required arguments when no run is resumed include: --oracle, --label, --modulus, --infile, --outfile, --outstanding-batches-thr, --batch-size")
-#| 
+#|
 #|     if not do_reuse_paths and not do_resume:
 #|         subdir_name = 'run_' + time.strftime('%Y%m%d-%H%M%S')
 #|         work_dir += f'/{subdir_name}'
 #|         os.mkdir(work_dir)
-#| 
+#|
 #|     log_fpath = f"{work_dir}/local_query_handler.log"
 #|     log_level = args.log_level if args.verbose else logging.WARNING
-#| 
+#|
 #|     logging.basicConfig(
 #|         filename=log_fpath,
 #|         level=log_level,
@@ -17132,10 +17081,10 @@ if __name__ == "__main__":
 #|         datefmt="%Y-%m-%d %H:%M:%S"
 #|     )
 #|     print(f"Local query handler is logging to {log_fpath}")
-#| 
+#|
 #|     if args.stderr:
 #|         logging.getLogger().addHandler(logging.StreamHandler())
-#| 
+#|
 #|     if do_resume:
 #|         server = Webserver(work_dir, logging.getLogger())
 #|         server.continue_run()
@@ -17145,14 +17094,14 @@ if __name__ == "__main__":
 #|             if answer.lower() != "y":
 #|                 exit(1)
 #|             os.remove(outfile)
-#| 
+#|
 #|         protocol = "http" if args.http_only_webserver else "https"
 #|         api_url = API_URL_FORMAT.format(protocol, args.api)
 #|         if do_read_api_token:
 #|             api_token = input(f"Enter the authorization token for the REST API {api_url}: ").strip()
 #|         else:
 #|             api_token = "None"
-#| 
+#|
 #|         server = Webserver(work_dir, logging.getLogger(),
 #|                         oracle, label, modulus,
 #|                         batches_thr, batch_size,
@@ -17166,7 +17115,7 @@ if __name__ == "__main__":
 #| requests
 
 #@ FILE code/oracles/remote_queries/local_query_handler/webserver.py 644 32373 a795603cdfb69fe176e0789e18ed782ee67263038df3f26b68a29f1558ce7b18 text
-#| 
+#|
 #| import json
 #| import os
 #| import re
@@ -17175,35 +17124,35 @@ if __name__ == "__main__":
 #| import tempfile
 #| import zstandard
 #| import signal
-#| 
+#|
 #| from typing import List
 #| from logging import Logger
 #| from multiprocessing import Process, Manager
 #| from multiprocessing.pool import ThreadPool, Pool
 #| from queue import Queue as ThreadQueue
-#| 
+#|
 #| from webserver_api import WebserverApi
-#| 
+#|
 #| MAX_NUMBER_OF_API_ERRORS = 20
 #| MAX_BACKOFF_SECONDS = 10
 #| END_OF_QUEUE = -1
-#| 
+#|
 #| def _compute_query_byte_size(N: int):
 #|     """Return the number of bytes needed to store the modulus N (and hence any number mod N)"""
 #|     return (N.bit_length() + 7) // 8
-#| 
+#|
 #| class Metadata():
 #|     attrs = ["oracle", "label", "modulus",
 #|              "completed_recv", "completed_send", "completed_batches",
 #|              "nr_of_sent_batches", "nr_of_recv_batches"]
-#| 
+#|
 #|     def __init__(self, *args):
 #|         """
 #|         Supports two ways of initializing:
 #|             1. First time initialization: Metadata(oracle, label, modulus)
 #|             2. Load previous state from dictionary d: Metadata(d)
 #|         """
-#| 
+#|
 #|         if len(args) > 1:
 #|             oracle, label, modulus  = args
 #|             self.oracle             = oracle
@@ -17219,36 +17168,36 @@ if __name__ == "__main__":
 #|             for attr in self.attrs:
 #|                 if attr in d:
 #|                     setattr(self, attr, d[attr])
-#| 
+#|
 #|     def export(self):
 #|         d = dict()
 #|         for attr in self.attrs:
 #|             if hasattr(self, attr):
 #|                 d[attr] = getattr(self, attr)
 #|         return d
-#| 
+#|
 #|     @staticmethod
 #|     def load(fname):
 #|         with open(fname, "r") as fp:
 #|             return Metadata(json.load(fp))
-#| 
+#|
 #|     def load_self(self, fname):
 #|         with open(fname, "r") as fp:
 #|             for attr, value in json.load(fp).items():
 #|                 setattr(self, attr, value)
-#| 
+#|
 #|     def update(self, update: dict):
 #|         for attr, value in update.items():
 #|             if attr in self.attrs:
 #|                 setattr(self, attr, value)
-#| 
+#|
 #|     def save(self, fname):
 #|         """Save without risking race conditions with concurrent reads"""
 #|         dir_path = os.path.dirname(fname)
 #|         with tempfile.NamedTemporaryFile(mode="w+t", delete_on_close=False, dir=dir_path) as fp:
 #|             json.dump(self.export(), fp)
 #|             os.rename(fp.name, fname)
-#| 
+#|
 #| def signature_writing_pool_init_worker():
 #|     """
 #|     Ignore KeyboardInterrupt signals on multiprocessing pool
@@ -17256,7 +17205,7 @@ if __name__ == "__main__":
 #|     Hack from: https://stackoverflow.com/a/6191991
 #|     """
 #|     signal.signal(signal.SIGINT, signal.SIG_IGN)
-#| 
+#|
 #| class Webserver():
 #|     def _joint_init(self, work_dir: str, logging: Logger):
 #|         self.logging            = logging
@@ -17267,22 +17216,22 @@ if __name__ == "__main__":
 #|         self.metadata_file      = f"{self.work_dir}/metadata.json"
 #|         self.quotients_file     = f"{self.work_dir}/quotients.json"
 #|         self.run_file           = f"{self.work_dir}/run.json"
-#| 
+#|
 #|         for dirpath in [self.result_dir, self.query_dir]:
 #|             if not os.path.isdir(dirpath):
 #|                 os.mkdir(dirpath)
-#| 
+#|
 #|         self.batch_idx_pattern = re.compile(r'.*/query_batch_(\d+)\.bin.*')
-#| 
+#|
 #|     def __init__(self, work_dir, logging, *args):
 #|         """
 #|         Supports two ways to initialize:
 #|         1. First time initialization: Webserver(work_dir, logging, oracle, label, modulus, batches_thr, batch_size)
 #|         2. Resume a previous run: Webserver(work_dir, logging)
 #|         """
-#| 
+#|
 #|         self._joint_init(work_dir, logging)
-#| 
+#|
 #|         if len(args) == 0:
 #|             self.load()
 #|             self.init_metadata = Metadata.load(self.metadata_file)
@@ -17291,39 +17240,39 @@ if __name__ == "__main__":
 #|             batches_thr, batch_size, use_compression, \
 #|             batch_writing_nthreads, batch_download_nprocesses, \
 #|             api_url, api_token = args
-#| 
+#|
 #|             self.batches_thr                = batches_thr
 #|             self.batch_size                 = batch_size
 #|             self.use_compression            = use_compression
 #|             self.batch_writing_nthreads     = batch_writing_nthreads
 #|             self.batch_download_nprocesses  = batch_download_nprocesses
-#| 
+#|
 #|             self.api_token  = api_token
 #|             self.api_url    = api_url
-#| 
+#|
 #|             self.init_metadata = Metadata(oracle, label, modulus)
-#| 
+#|
 #|         self.do_stop_writer_threads = False
 #|         self.api = WebserverApi(self.work_dir, self.logging, self.api_token, self.api_url, self.use_compression)
 #|         if len(args) > 0:
 #|             self.send_label_and_modulus_metadata()
 #|         else:
 #|             self.init_metadata.completed_batches = self.api.get_metadata(blocking=True)["completed_batches"]
-#| 
+#|
 #|         if len(args) == 0:
 #|             nr_of_completed_batches = len(self.init_metadata.completed_batches)
 #|             self.init_metadata.nr_of_recv_batches = nr_of_completed_batches
-#| 
+#|
 #|         self.save()
 #|         self.init_metadata.save(self.metadata_file)
-#| 
+#|
 #|     def _extract_batch_idx(self, fname):
 #|         match = self.batch_idx_pattern.match(fname)
 #|         if match:
 #|             return True, int(match.groups(0)[0])
 #|         else:
 #|             return False, None
-#| 
+#|
 #|     def save_run_file(self, infile, outfile):
 #|         d = {
 #|             "infile": infile,
@@ -17331,31 +17280,31 @@ if __name__ == "__main__":
 #|         }
 #|         with open(self.run_file, "w") as fp:
 #|             json.dump(d, fp)
-#| 
+#|
 #|     def load_run_file(self):
 #|         with open(self.run_file, "r") as fp:
 #|             d = json.load(fp)
 #|         return d["infile"], d["outfile"]
-#| 
+#|
 #|     def save(self):
 #|         saved_attrs = ["batches_thr", "batch_size", "use_compression",
 #|                        "batch_writing_nthreads", "batch_download_nprocesses",
 #|                        "api_url", "api_token"]
-#| 
+#|
 #|         d = dict()
 #|         for attr in saved_attrs:
 #|             d[attr] = getattr(self, attr)
-#| 
+#|
 #|         with open(self.state_file, "w") as fp:
 #|             json.dump(d, fp)
-#| 
+#|
 #|     def load(self):
 #|         with open(self.state_file) as fp:
 #|             d = json.load(fp)
-#| 
+#|
 #|         for k, v in d.items():
 #|             setattr(self, k, v)
-#| 
+#|
 #|     def write_query_batch(self, batch_idx, in_fp, batch_fp, shared_metadata, quotients):
 #|         log_tag = "[write_query_batch] "
 #|         try:
@@ -17364,20 +17313,20 @@ if __name__ == "__main__":
 #|             batch_quotients = quotients.get(batch_idx, dict())
 #|             for query_idx in range(self.batch_size):
 #|                 line = in_fp.readline()
-#| 
+#|
 #|                 if line == None or len(line) == 0:
 #|                     self.logging.debug(f"{log_tag}Reached the end of the query file while writing batch.")
 #|                     quotients[batch_idx] = batch_quotients
 #|                     return query_idx + 1
-#| 
+#|
 #|                 query = int(line)
 #|                 if query < 0:
 #|                     quotient, query = divmod(query, modulus)
 #|                     batch_quotients[query_idx] = quotient
 #|                     query = query % modulus
-#| 
+#|
 #|                 batch_fp.write(query.to_bytes(query_byte_len))
-#| 
+#|
 #|             quotients[batch_idx] = batch_quotients
 #|             return self.batch_size
 #|         except KeyboardInterrupt as e:
@@ -17385,7 +17334,7 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             self.logging.error(f"{log_tag}Failed to write query batch {batch_idx}.")
 #|             raise e
-#| 
+#|
 #|     def parse_batch(self, batch_bytes: bytes, modulus: int):
 #|         entry_byte_len = _compute_query_byte_size(modulus)
 #|         entries = []
@@ -17393,7 +17342,7 @@ if __name__ == "__main__":
 #|             entries.append(int.from_bytes(batch_bytes[:entry_byte_len]))
 #|             batch_bytes = batch_bytes[entry_byte_len:]
 #|         return entries
-#| 
+#|
 #|     def compress_query_batch(self, fpath):
 #|         subprocess.run([
 #|             "zstd",
@@ -17402,47 +17351,47 @@ if __name__ == "__main__":
 #|             fpath
 #|         ])
 #|         return f"{fpath}.zst"
-#| 
+#|
 #|     def _update_metadata_after_batch_completion(self, shared_metadata: dict, completed_batch_idx: int):
 #|         log_tag = "[Webserver._update_metadata]"
 #|         if not self.api.update_metadata([completed_batch_idx]):
 #|             self.logging.warning(f"{log_tag}Failed to update metadata on webserver with new completed batch {completed_batch_idx}.")
-#| 
+#|
 #|         shared_metadata["completed_batches"] = shared_metadata["completed_batches"] + [completed_batch_idx]
 #|         shared_metadata["nr_of_recv_batches"] += 1
-#| 
+#|
 #|         if shared_metadata["completed_send"] and shared_metadata["nr_of_sent_batches"] == shared_metadata["nr_of_recv_batches"]:
 #|             shared_metadata["completed_recv"] = True
-#| 
+#|
 #|     def _update_metadata_after_sending(self, shared_metadata: dict, files_to_send: ThreadQueue):
 #|         log_tag = "[Webserver._update_metadata_after_sending]"
-#| 
+#|
 #|         shared_metadata["nr_of_sent_batches"] += 1
-#| 
+#|
 #|         if self.batch_writing_nthreads == self.nr_of_done_write_threads and files_to_send.unfinished_tasks == 0:
 #|             self.logging.info(f"{log_tag}Finished sending all query batches! (Setting `completed_send` to true in metadata)")
 #|             shared_metadata["completed_send"] = True
 #|             files_to_send.put(END_OF_QUEUE)
-#| 
+#|
 #|     def transfer_query_batch(self, batch_idx: int, fpath: str, shared_metadata: dict, files_to_send: ThreadQueue):
 #|         log_tag = "[transfer_query_batch] "
-#| 
+#|
 #|         if not self.api.upload_query_batch(batch_idx, fpath):
 #|             self.logging.error(f"{log_tag}Uploading batch {fpath} failed.")
 #|             return False
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Uploaded batch {batch_idx} in file {fpath}.")
 #|         files_to_send.task_done()
 #|         self._update_metadata_after_sending(shared_metadata, files_to_send)
 #|         return True
-#| 
+#|
 #|     def send_label_and_modulus_metadata(self):
 #|         modulus_byte_size = _compute_query_byte_size(self.init_metadata.modulus)
 #|         if not self.api.upload_metadata(self.init_metadata.label, modulus_byte_size):
 #|             self.logging.error(f"Sending metadata label={self.init_metadata.label} and modulus_byte_size={modulus_byte_size} failed.")
 #|             return False
 #|         return True
-#| 
+#|
 #|     def _calc_avg_batch_timings(self, curr_time: float):
 #|         batch_nr_1m = 0
 #|         batch_nr_10m = 0
@@ -17457,16 +17406,16 @@ if __name__ == "__main__":
 #|                     batch_nr_10m += 1
 #|                     if time_diff_s <= 60:
 #|                         batch_nr_1m += 1
-#| 
+#|
 #|         self.batch_timings = new_batch_timings
 #|         avg_sig_1m = batch_nr_1m * self.batch_size / 60
 #|         avg_sig_10m = batch_nr_10m * self.batch_size / 600
 #|         avg_sig_60m = batch_nr_60m * self.batch_size / 3600
 #|         return avg_sig_1m, avg_sig_10m, avg_sig_60m
-#| 
+#|
 #|     def _fetch_signature_batch(self, batch_idx: int):
 #|         log_tag = "[Webserver._fetch_signature_batch] "
-#| 
+#|
 #|         try:
 #|             batch_fpath = self.api.get_signature_batch(batch_idx)
 #|             if batch_fpath != None:
@@ -17475,7 +17424,7 @@ if __name__ == "__main__":
 #|                 total_sec = curr_time - self.server_start_time
 #|                 self.batch_timings.append(curr_time)
 #|                 avg_1m, avg_10m, avg_60m = self._calc_avg_batch_timings(curr_time)
-#| 
+#|
 #|                 metrics = {
 #|                     "signatures_per_second_overall": (total_nr_of_sigs - self.nr_of_completed_queries_at_start) / total_sec,
 #|                     "avg_signatures_last_1m": avg_1m * self.batch_download_nprocesses,
@@ -17493,26 +17442,26 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             self.logging.error(f"{log_tag}Fetching signature batch {batch_idx} from webserver failed.")
 #|             raise Exception(e)
-#| 
+#|
 #|     def _parse_signatures_and_queries(self, recv_batch_fpath: str, query_batch_fpath: str, modulus: int):
 #|         with open(recv_batch_fpath, "rb") as fp:
 #|             data = fp.read()
 #|             if self.use_compression:
 #|                 data = zstandard.decompress(data)
 #|             signatures = self.parse_batch(data, modulus)
-#| 
+#|
 #|         with open(query_batch_fpath, "rb") as fp:
 #|             data = fp.read()
 #|             if self.use_compression:
 #|                 data = zstandard.decompress(data)
 #|             queries = self.parse_batch(data, modulus)
-#| 
+#|
 #|         if len(queries) != len(signatures):
 #|             self.logging.error(f"Query-result mismatch! {len(queries)} queries in {query_batch_fpath} but {len(signatures)} signatures in {recv_batch_fpath}.")
 #|             return None
-#| 
+#|
 #|         return queries, signatures
-#| 
+#|
 #|     def _write_signatures(self, queries, signatures, batch_idx, out_fp, modulus, quotients):
 #|         log_tag = "[Webserver._write_signatures] "
 #|         self.logging.debug(f"{log_tag}Start writing signatures to file.")
@@ -17520,25 +17469,25 @@ if __name__ == "__main__":
 #|         for query_idx, query in enumerate(queries):
 #|             if query_idx in batch_quotients:
 #|                 query += batch_quotients[query_idx] * modulus
-#| 
+#|
 #|             out_fp.write(f"\"{query}\":\"{signatures[query_idx]}\",")
 #|         self.logging.debug(f"{log_tag}Done writing signatures to file.")
-#| 
+#|
 #|     def _delete_remote_files(self, batch_idx: int):
 #|         log_tag = "[Webserver._delete_remote_files] "
 #|         self.logging.info(f"{log_tag}Deleting remote files for query and signature batches {batch_idx}.")
 #|         success = self.api.delete_query_batch(batch_idx)
 #|         return success and self.api.delete_signature_batch(batch_idx)
-#| 
+#|
 #|     def _delete_local_files(self, fpaths_to_delete):
 #|         log_tag = "[Webserver._delete_local_files] "
 #|         self.logging.info(f"{log_tag}Deleting local files {','.join(fpaths_to_delete)}.")
-#| 
+#|
 #|         for fpath in fpaths_to_delete:
 #|             os.unlink(fpath)
-#| 
+#|
 #|         self.logging.debug(f"{log_tag}Done deleting local files.")
-#| 
+#|
 #|     def _get_next_batch_idx(self, shared_metadata: dict, start_idx: int=0, interval: int=1, additional_batch_indices_to_skip: List[int]=[]):
 #|         i = start_idx
 #|         completed_batches = shared_metadata["completed_batches"] + additional_batch_indices_to_skip
@@ -17546,26 +17495,26 @@ if __name__ == "__main__":
 #|             if i not in completed_batches:
 #|                 return i
 #|             i += interval
-#| 
+#|
 #|     def signature_writing_process(self, parsed_signatures_dict: list, outfile: str, shared_metadata: dict, quotients: dict):
 #|         """
 #|         Reads downloaded and parsed signatures from (multiprocessing managed) dictionary `parsed_signatures_dict`
 #|         and writes them to `outfile`, while synchronizing on metadata updates with all other processes over the
 #|         metadata queues `metadata_updates_for_receiver` and `metadata_updates_for_sender`.
 #|         """
-#| 
+#|
 #|         log_tag = f"[Webserver.signature_writing_process] "
 #|         self.logging.info(f"{log_tag}Starting process.")
-#| 
+#|
 #|         batch_idx = 0
 #|         backoff_time = 1
 #|         modulus = shared_metadata["modulus"]
-#| 
+#|
 #|         try:
 #|             with open(outfile, "a+") as out_fp:
 #|                 if out_fp.tell() == 0:
 #|                     out_fp.write("{")
-#| 
+#|
 #|                 while not shared_metadata["completed_recv"]:
 #|                     batch_idx = self._get_next_batch_idx(shared_metadata, start_idx=batch_idx)
 #|                     if batch_idx not in parsed_signatures_dict:
@@ -17574,11 +17523,11 @@ if __name__ == "__main__":
 #|                         backoff_time = min(2 * backoff_time, MAX_BACKOFF_SECONDS)
 #|                         continue
 #|                     backoff_time = 1
-#| 
+#|
 #|                     self.logging.info(f"{log_tag}Writing signatures for batch {batch_idx} to output file.")
 #|                     queries, signatures, query_batch_fpath, signature_batch_fpath = parsed_signatures_dict[batch_idx]
 #|                     self._write_signatures(queries, signatures, batch_idx, out_fp, modulus, quotients)
-#| 
+#|
 #|                     # Make sure signatures are written persistently to disk before deleting them
 #|                     out_fp.flush()
 #|                     os.fsync(out_fp)
@@ -17589,9 +17538,9 @@ if __name__ == "__main__":
 #|                     del parsed_signatures_dict[batch_idx]
 #|                     if batch_idx in quotients:
 #|                         del quotients[batch_idx]
-#| 
+#|
 #|                     self._update_metadata_after_batch_completion(shared_metadata, batch_idx)
-#| 
+#|
 #|             # Seek from end is only possible for byte stream
 #|             with open(outfile, "ab") as out_fp:
 #|                 out_fp.seek(-1, 2)
@@ -17604,23 +17553,23 @@ if __name__ == "__main__":
 #|             raise e
 #|         finally:
 #|             self.logging.info(f"{log_tag}Terminating process.")
-#| 
+#|
 #|     def signature_downloading_worker(self, args):
 #|         """
 #|         Possibly many worker processes that fetch signatures from the webserver,
 #|         parses them, and adds them to parsed_signatures_dict to be written to the
 #|         output file by the signature_writing_process process.
 #|         """
-#| 
+#|
 #|         id, parsed_signatures_dict, shared_metadata = args
 #|         log_tag = f"[Webserver.signature_downloading_worker #{id}] "
 #|         self.logging.info(f"{log_tag}Starting process.")
-#| 
+#|
 #|         # Note this is a per worker list, and the reported timings are relative to the worker.
 #|         # (It's not worth it to sync this across all workers.)
 #|         self.batch_timings: List[int] = []
 #|         modulus = shared_metadata["modulus"]
-#| 
+#|
 #|         backoff_time = 1
 #|         api_err_cnt = 0
 #|         batch_idx = 0
@@ -17629,30 +17578,30 @@ if __name__ == "__main__":
 #|             while api_err_cnt < MAX_NUMBER_OF_API_ERRORS and not shared_metadata["completed_recv"]:
 #|                 # Terminated forcefully when the signature_writing_process process realizes
 #|                 # all batches were downloaded.
-#| 
+#|
 #|                 writing_in_progress_batches = list(parsed_signatures_dict.keys())
 #|                 batch_idx = self._get_next_batch_idx(shared_metadata, start_idx=batch_idx,
 #|                                                      interval=self.batch_download_nprocesses,
 #|                                                      additional_batch_indices_to_skip=writing_in_progress_batches)
-#| 
+#|
 #|                 query_batch_fname = f"query_batch_{batch_idx}.bin.sent"
 #|                 query_batch_fpath = f"{self.query_dir}/{query_batch_fname}"
 #|                 was_sent = os.path.isfile(query_batch_fpath)
-#| 
+#|
 #|                 is_download_too_fast = len(writing_in_progress_batches) > self.batches_thr
-#| 
+#|
 #|                 if not was_sent:
 #|                     self.logging.info(f"{log_tag}Waiting to poll for signature batch until query batch {batch_idx} was sent ({query_batch_fpath} does not exist).")
 #|                 elif is_download_too_fast:
 #|                     self.logging.info(f"{log_tag}Pausing download (already {len(writing_in_progress_batches)} are in the writing queue).")
 #|                 else:
 #|                     signature_batch_fpath = self._fetch_signature_batch(batch_idx)
-#| 
+#|
 #|                 if not was_sent or is_download_too_fast or signature_batch_fpath == None:
 #|                     time.sleep(backoff_time)
 #|                     backoff_time = min(2 * backoff_time, MAX_BACKOFF_SECONDS)
 #|                     continue
-#| 
+#|
 #|                 backoff_time = 1
 #|                 result = self._parse_signatures_and_queries(signature_batch_fpath, query_batch_fpath, modulus)
 #|                 if result == None:
@@ -17663,11 +17612,11 @@ if __name__ == "__main__":
 #|                     elif not self.api.report_bad_batches([batch_idx]):
 #|                         api_err_cnt += 1
 #|                     continue
-#| 
+#|
 #|                 api_err_cnt = 0
 #|                 queries, signatures = result
 #|                 parsed_signatures_dict[batch_idx] = (queries, signatures, query_batch_fpath, signature_batch_fpath)
-#| 
+#|
 #|             if api_err_cnt >= MAX_NUMBER_OF_API_ERRORS:
 #|                 self.logging.error(f"{log_tag}Reached the maximum number of consecutive API errors when downloading signatures, aborting.")
 #|                 exit(1)
@@ -17678,31 +17627,31 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             self.logging.error(f"{log_tag}Downloading signatures for batch {batch_idx} failed with error:\n{e}")
 #|             raise e
-#| 
+#|
 #|     def _batch_writer_thread(self, args):
 #|         thread_id, batch_idx, infile, files_to_send, shared_metadata, quotients = args
 #|         log_tag = f"[Webserver._batch_writer_thread #{thread_id}] "
 #|         self.logging.info(f"{log_tag}Starting thread number {thread_id}.")
 #|         expected_batch_bytes = self.batch_size * _compute_query_byte_size(shared_metadata["modulus"])
-#| 
+#|
 #|         try:
 #|             batch_idx_remainder = batch_idx % self.batch_writing_nthreads
 #|             if batch_idx_remainder > thread_id:
 #|                 batch_idx += thread_id + (self.batch_writing_nthreads - batch_idx_remainder)
 #|             else:
 #|                 batch_idx +=  thread_id - batch_idx_remainder
-#| 
+#|
 #|             with open(infile, "r") as in_fp:
 #|                 in_line_idx = 0
 #|                 backoff_time = 1
-#| 
+#|
 #|                 while not shared_metadata["completed_send"] and not self.do_stop_writer_threads:
 #|                     if files_to_send.unfinished_tasks >= self.batches_thr:
 #|                         self.logging.info(f"{log_tag}Pause writing new batches until more batches were uploaded ({files_to_send.unfinished_tasks} are outstanding).")
 #|                         time.sleep(backoff_time)
 #|                         backoff_time = min(2 * backoff_time, MAX_BACKOFF_SECONDS)
 #|                         continue
-#| 
+#|
 #|                     backoff_time = 1
 #|                     while True:
 #|                         if batch_idx not in shared_metadata["completed_batches"]:
@@ -17712,9 +17661,9 @@ if __name__ == "__main__":
 #|                             else:
 #|                                 break
 #|                         batch_idx += self.batch_writing_nthreads
-#| 
+#|
 #|                     self.logging.debug(f"{log_tag}Start working on query batch {batch_idx}.")
-#| 
+#|
 #|                     start_line_idx = batch_idx * self.batch_size
 #|                     self.logging.debug(f"{log_tag}Fast forward to line number {start_line_idx} for query batch {batch_idx}")
 #|                     while in_line_idx < start_line_idx:
@@ -17722,7 +17671,7 @@ if __name__ == "__main__":
 #|                         if l == None or l == "":
 #|                             self.nr_of_done_write_threads += 1
 #|                             self.logging.info(f"{log_tag}Reached the end of the query file on line {in_line_idx} while forwarding, stopping write thread...")
-#| 
+#|
 #|                             if self.batch_writing_nthreads == self.nr_of_done_write_threads and files_to_send.unfinished_tasks == 0:
 #|                                 self.logging.info(f"{log_tag}Finished sending when sender queue was already empty.")
 #|                                 self.do_stop_writer_threads = True
@@ -17730,18 +17679,18 @@ if __name__ == "__main__":
 #|                                 if shared_metadata["nr_of_sent_batches"] == shared_metadata["nr_of_recv_batches"]:
 #|                                     shared_metadata["completed_recv"] = True
 #|                                 files_to_send.put(END_OF_QUEUE)
-#| 
+#|
 #|                             return
 #|                         in_line_idx += 1
-#| 
+#|
 #|                     query_batch_fpath = f"{self.query_dir}/query_batch_{batch_idx}.bin"
 #|                     with open(query_batch_fpath, "wb") as batch_fp:
 #|                         in_line_idx += self.write_query_batch(batch_idx, in_fp, batch_fp, shared_metadata, quotients)
 #|                         batch_fp.flush()
 #|                         os.fsync(batch_fp)
-#| 
+#|
 #|                     self.logging.info(f"{log_tag}Wrote query batch {batch_idx} to {query_batch_fpath}")
-#| 
+#|
 #|                     files_to_send.put(query_batch_fpath)
 #|                     batch_idx += self.batch_writing_nthreads
 #|         except KeyboardInterrupt:
@@ -17751,11 +17700,11 @@ if __name__ == "__main__":
 #|             raise e
 #|         finally:
 #|             self.logging.info(f"{log_tag}Terminating process.")
-#| 
+#|
 #|     def send_batches(self, files_to_send, shared_metadata):
 #|         log_tag = "[Webserver.send_batches] "
 #|         self.logging.info(f"{log_tag}Starting process.")
-#| 
+#|
 #|         error_cnt = 0
 #|         backoff_time = 1
 #|         try:
@@ -17765,17 +17714,17 @@ if __name__ == "__main__":
 #|                     time.sleep(backoff_time)
 #|                     backoff_time = min(2 * backoff_time, MAX_BACKOFF_SECONDS)
 #|                     continue
-#| 
+#|
 #|                 self.logging.debug(f"{log_tag}Fetch new batch file to send from queue.")
 #|                 batch_fpath = files_to_send.get()
 #|                 if batch_fpath == END_OF_QUEUE:
 #|                     files_to_send.task_done()
 #|                     break
-#| 
+#|
 #|                 self.logging.debug(f"{log_tag}Upload batch file {batch_fpath}.")
 #|                 if self.use_compression:
 #|                     batch_fpath = self.compress_query_batch(batch_fpath)
-#| 
+#|
 #|                 backoff_time = 1
 #|                 found_idx, batch_idx = self._extract_batch_idx(batch_fpath)
 #|                 if not found_idx:
@@ -17787,7 +17736,7 @@ if __name__ == "__main__":
 #|                     error_cnt += 1
 #|                 else:
 #|                     os.rename(batch_fpath, f"{batch_fpath}.sent")
-#| 
+#|
 #|                 if error_cnt >= MAX_NUMBER_OF_API_ERRORS:
 #|                     self.logging.error(f"{log_tag}Reached the maximum number of sending errors, aborting.")
 #|                     exit(1)
@@ -17799,11 +17748,11 @@ if __name__ == "__main__":
 #|         finally:
 #|             self.logging.info(f"{log_tag}Cancelling {files_to_send.unfinished_tasks} outstanding batch uploads.")
 #|             self.logging.info(f"{log_tag}Terminating process.")
-#| 
+#|
 #|     def run(self, infile, outfile):
 #|         log_tag = "[local query handler] "
 #|         self.logging.info(f"{log_tag}Starting local query handler.")
-#| 
+#|
 #|         write_thread_pool = None
 #|         sig_writing_process = None
 #|         sig_downloader_pool = None
@@ -17815,34 +17764,34 @@ if __name__ == "__main__":
 #|         with Manager() as manager:
 #|             try:
 #|                 parsed_signatures_dict = manager.dict()
-#| 
+#|
 #|                 shared_metadata = manager.dict()
 #|                 for k, v in self.init_metadata.export().items():
 #|                     shared_metadata[k] = v
-#| 
+#|
 #|                 quotients = manager.dict()
 #|                 if os.path.isfile(self.quotients_file):
 #|                     with open(self.quotients_file, "r") as fp:
 #|                         pending_quotients = json.load(fp)
 #|                     for batch_idx, batch_quotients in pending_quotients.items():
 #|                         quotients[int(batch_idx)] = {int(k): v for k, v in batch_quotients.items()}
-#| 
+#|
 #|                 self.save_run_file(infile, outfile)
-#| 
+#|
 #|                 sig_writing_process = Process(target=self.signature_writing_process,
 #|                                               args=(parsed_signatures_dict, outfile, shared_metadata, quotients))
 #|                 sig_writing_process.start()
-#| 
+#|
 #|                 sig_downloader_pool = Pool(self.batch_download_nprocesses, initializer=signature_writing_pool_init_worker)
 #|                 args = [(i, parsed_signatures_dict, shared_metadata) for i in range(self.batch_download_nprocesses)]
 #|                 sig_downloader_pool.map_async(self.signature_downloading_worker, args)
-#| 
+#|
 #|                 self.nr_of_done_write_threads = 0
 #|                 write_thread_pool = ThreadPool(self.batch_writing_nthreads)
 #|                 batch_idx = self._get_next_batch_idx(shared_metadata)
 #|                 args = [(i, batch_idx, infile, files_to_send, shared_metadata, quotients) for i in range(self.batch_writing_nthreads)]
 #|                 write_thread_pool.map_async(self._batch_writer_thread, args)
-#| 
+#|
 #|                 self.send_batches(files_to_send, shared_metadata)
 #|                 write_thread_pool.close()
 #|                 write_thread_pool.join()
@@ -17865,7 +17814,7 @@ if __name__ == "__main__":
 #|                 if shared_metadata != None:
 #|                     Metadata(shared_metadata).save(self.metadata_file)
 #|                 self.logging.info(f"{log_tag}Shut down local query handler.")
-#| 
+#|
 #|                 if quotients != None:
 #|                     with open(self.quotients_file, "w") as fp:
 #|                         json.dump(quotients.copy(), fp)
@@ -17879,42 +17828,42 @@ if __name__ == "__main__":
 #| import shutil
 #| import time
 #| import json
-#| 
+#|
 #| from logging import Logger
 #| from typing import Optional, List
-#| 
+#|
 #| METADATA_RETRY_PAUSE_SECONDS = 5
-#| 
+#|
 #| class WebserverApi:
 #|     """
 #|     This class provides functions to interact with the REST API
 #|     on the webserver to download query batchs, upload signature
 #|     batches, and report statistics and errors.
 #|     """
-#| 
+#|
 #|     def __init__(self, work_dir: str, logging: Logger,
 #|                  token: str, api_url: str, compression: bool,
 #|                  do_remote_logging: bool=False):
-#| 
+#|
 #|         self.work_dir           = work_dir
 #|         self.logging            = logging
 #|         self.token              = token
 #|         self.api_url            = api_url
 #|         self.compression        = compression
 #|         self.do_remote_logging  = do_remote_logging
-#| 
+#|
 #|         self.query_dir  = f"{self.work_dir}/queries"
 #|         self.sig_dir    = f"{self.work_dir}/signatures"
-#| 
+#|
 #|         for dir_path in [self.query_dir, self.sig_dir]:
 #|             if not os.path.isdir(dir_path):
 #|                 os.mkdir(dir_path)
-#| 
+#|
 #|     def _add_auth_headers(self, headers: dict = {}):
 #|         if self.token != "None" and "Authorization" not in headers:
 #|             headers["Authorization"] = f"Bearer {self.token}"
 #|         return headers
-#| 
+#|
 #|     def _get_batch(self, batch_idx: int, get_api: str, dest_fpath: str, metric_name: str):
 #|         try:
 #|             download_start = time.time()
@@ -17927,7 +17876,7 @@ if __name__ == "__main__":
 #|                     shutil.copyfileobj(response.raw, out_fp)
 #|                     out_fp.flush()
 #|                     os.fsync(out_fp)
-#| 
+#|
 #|                 download_seconds = download_end - download_start
 #|                 if "content-length" in response.headers:
 #|                     file_size = int(response.headers["content-length"])
@@ -17939,7 +17888,7 @@ if __name__ == "__main__":
 #|             self.report_error_msg(f"Failed to download query batch {batch_idx} with error:\n{e}")
 #|             return None
 #|         return dest_fpath
-#| 
+#|
 #|     def _delete_batch(self, batch_idx: int, delete_api: str):
 #|         try:
 #|             response = requests.post(delete_api, headers=self._add_auth_headers())
@@ -17949,7 +17898,7 @@ if __name__ == "__main__":
 #|         except requests.exceptions.RequestException as e:
 #|             self.report_error_msg(f"Failed to delete batch {batch_idx} using api call {delete_api} with error:\n{e}")
 #|             return False
-#| 
+#|
 #|     def _upload_dict(self, upload_api: str, d: dict):
 #|         try:
 #|             self.logging.debug(f"Uploading the following dictionary to {upload_api}:\n{d}")
@@ -17961,24 +17910,24 @@ if __name__ == "__main__":
 #|             self.logging.error(f"Failed to upload dictionary with error:\n{e}")
 #|             return False
 #|         return True
-#| 
+#|
 #|     def get_query_batch(self, batch_idx: int):
 #|         """Fetch query batch with index `batch_idx` from webserver"""
-#| 
+#|
 #|         get_api = f"{self.api_url}/queries/{batch_idx}?is_compressed={self.compression}"
 #|         dest_fpath = f"{self.query_dir}/query_batch_{batch_idx}.bin"
 #|         return self._get_batch(batch_idx, get_api, dest_fpath, "query_batch_download_bandwidth")
-#| 
+#|
 #|     def get_signature_batch(self, batch_idx: int):
 #|         """Fetch query batch with index `batch_idx` from webserver"""
-#| 
+#|
 #|         get_api = f"{self.api_url}/signatures/{batch_idx}?is_compressed={self.compression}"
 #|         dest_fpath = f"{self.query_dir}/signature_batch_{batch_idx}.bin"
 #|         return self._get_batch(batch_idx, get_api, dest_fpath, "signature_batch_download_bandwidth")
-#| 
+#|
 #|     def get_metadata(self, blocking=False):
 #|         """Fetch metadata for HSM computation from webserver"""
-#| 
+#|
 #|         get_api = f"{self.api_url}/metadata"
 #|         try:
 #|             while True:
@@ -17994,13 +17943,13 @@ if __name__ == "__main__":
 #|         except requests.exceptions.RequestException as e:
 #|             self.logging.error(f"Failed to download metadata with error:\n{e}")
 #|             raise e
-#| 
+#|
 #|     def get_bad_batches(self):
 #|         """
 #|         Download the indices of bad batches (query batches for which the signature batch was incomplete)
 #|         for the HSM computation from webserver
 #|         """
-#| 
+#|
 #|         get_api = f"{self.api_url}/metadata/badBatches"
 #|         try:
 #|             response = requests.get(get_api, headers=self._add_auth_headers())
@@ -18015,17 +17964,17 @@ if __name__ == "__main__":
 #|         except requests.exceptions.RequestException as e:
 #|             self.logging.error(f"Failed to download metadata with error:\n{e}")
 #|             raise e
-#| 
+#|
 #|     def delete_query_batch(self, batch_idx: int):
 #|         """Delete query batch with index `batch_idx` from webserver"""
 #|         delete_api = f"{self.api_url}/queries/{batch_idx}/delete?is_compressed={self.compression}"
 #|         return self._delete_batch(batch_idx, delete_api)
-#| 
+#|
 #|     def delete_signature_batch(self, batch_idx: int):
 #|         """Delete signature batch with index `batch_idx` from webserver"""
 #|         delete_api = f"{self.api_url}/signatures/{batch_idx}/delete?is_compressed={self.compression}"
 #|         return self._delete_batch(batch_idx, delete_api)
-#| 
+#|
 #|     def _upload_file(self, url: str, fpath: str):
 #|         try:
 #|             files = {"file": open(fpath, "rb")}
@@ -18037,7 +17986,7 @@ if __name__ == "__main__":
 #|             self.logging.error(f"Failed to upload file {fpath} with error:\n{e}")
 #|             return False
 #|         return True
-#| 
+#|
 #|     def _upload_batch(self, url: str, fpath: str, batch_idx: int, metric_name: str):
 #|         transfer_start = time.time()
 #|         if self._upload_file(url, fpath):
@@ -18047,21 +17996,21 @@ if __name__ == "__main__":
 #|             self.upload_metrics(batch_idx, metrics={metric_name: bandwidth})
 #|             return True
 #|         return False
-#| 
+#|
 #|     def upload_query_batch(self, batch_idx: int, query_fpath: str):
 #|         """Upload query batch with index `batch_idx` to webserver"""
 #|         upload_api = f"{self.api_url}/queries/{batch_idx}?is_compressed={self.compression}"
 #|         return self._upload_batch(upload_api, query_fpath, batch_idx, "query_batch_upload_bandwidth")
-#| 
+#|
 #|     def upload_signature_batch(self, batch_idx: int, sig_fpath: str):
 #|         """Upload signature batch with index `batch_idx` to webserver"""
 #|         upload_api = f"{self.api_url}/signatures/{batch_idx}?is_compressed={self.compression}"
 #|         return self._upload_batch(upload_api, sig_fpath, batch_idx, "signature_batch_upload_bandwidth")
-#| 
+#|
 #|     def upload_metadata(self, label: Optional[str]=None, modulus_byte_size: Optional[int]=None,
 #|                         completed_batches: Optional[List[int]]=None):
 #|         """Upload metadata to webserver"""
-#| 
+#|
 #|         metadata = dict()
 #|         if label != None:
 #|             metadata["label"] = label
@@ -18069,34 +18018,34 @@ if __name__ == "__main__":
 #|             metadata["modulus_byte_size"] = modulus_byte_size
 #|         if completed_batches != None:
 #|             metadata["completed_batches"] = completed_batches
-#| 
+#|
 #|         upload_api = f"{self.api_url}/metadata"
 #|         return self._upload_dict(upload_api, metadata)
-#| 
+#|
 #|     def update_metadata(self, additional_completed_batchs: List[int]):
 #|         """Add additional items to the already existing metadata on the webserver"""
 #|         add_api = f"{self.api_url}/metadata/update"
 #|         return self._upload_dict(add_api, {"additonal_completed_batches": additional_completed_batchs})
-#| 
+#|
 #|     def report_bad_batches(self, additional_bad_batchs: List[int]):
 #|         """Report more bad batches to the webserver"""
 #|         add_api = f"{self.api_url}/metadata/badBatches"
 #|         return self._upload_dict(add_api, {"bad_batches": additional_bad_batchs})
-#| 
+#|
 #|     def remove_bad_batches(self, bad_batchs_to_remove: List[int]):
 #|         """Report more bad batches to the webserver"""
 #|         add_api = f"{self.api_url}/metadata/badBatches/delete"
 #|         return self._upload_dict(add_api, {"bad_batches": bad_batchs_to_remove})
-#| 
+#|
 #|     def upload_logs(self, log_fpath: str):
 #|         """Upload log file at path `log_fpath` to webserver"""
 #|         upload_api = f"{self.api_url}/debug/logs"
 #|         return self._upload_file(upload_api, log_fpath)
-#| 
+#|
 #|     def report_error_msg(self, msg: str):
 #|         """Report error message with timestamp. If remote logging is enabled,
 #|         then this will be reported to the webserver."""
-#| 
+#|
 #|         err_ts = time.strftime('%Y/%m/%d %H:%M:%S')
 #|         if self.do_remote_logging:
 #|             upload_api = f"{self.api_url}/debug/error"
@@ -18107,7 +18056,7 @@ if __name__ == "__main__":
 #|             return self._upload_dict(upload_api, error)
 #|         else:
 #|             self.logging.error(f"[{err_ts}] {msg}")
-#| 
+#|
 #|     def upload_metrics(self, batch_idx: int, metrics: dict):
 #|         """Upload metrics for batch `batch_idx` to webserver"""
 #|         upload_api = f"{self.api_url}/metrics/{batch_idx}"
@@ -18115,9 +18064,9 @@ if __name__ == "__main__":
 
 #@ FILE code/oracles/remote_queries/remote_query_handler/README.md 644 24467 e6dbcf78d0652779f1896b2922e71aa7d1991a177c109a38fed1d46a1c0bc124 text
 #| # Remote Query Handler
-#| 
+#|
 #| This folder contains the "remote query handler" scripts that are part of a system to execute RSA-1024 signature queries on a remote HSM.
-#| 
+#|
 #| - [Remote Query Handler](#remote-query-handler)
 #|   - [System Overview](#system-overview)
 #|   - [Code Overview](#code-overview)
@@ -18137,28 +18086,28 @@ if __name__ == "__main__":
 #|     - [Enabling raw RSA operations](#enabling-raw-rsa-operations)
 #|     - [Importing an RSA-1024 bit key into a Luna HSM](#importing-an-rsa-1024-bit-key-into-a-luna-hsm)
 #|       - [Changing label](#changing-label)
-#| 
+#|
 #| ## System Overview
-#| 
+#|
 #| This system consists of three pieces:
 #| - "local query handler": Groups queries into batches and uploads them to the web server. Regularly attempts to download new signature batches and aggregates them.
 #| - "web server": Offers an authenticated REST API to upload and download batches, metadata, performance metrics, and debug information.
 #| - "remote query handler": Fetches query batches from the web server, runs them on the HSM, writes the resulting signatures into batches, and uploads them.
-#| 
+#|
 #| **Metrics**
-#| 
+#|
 #| Both query handlers upload measurements of the upload/download bandwidth to the web server.
 #| Additionally, the remote query handler uploads the measured signature signing speed, as well as CPU and memory usage to the web server.
-#| 
+#|
 #| **Debug Information**
-#| 
+#|
 #| The remote query handler catches most exceptions and reports them to the web server to enable remote debugging.
 #| In most cases, it restarts the remote query handler in case the errors can be handled with modifications to the local query handler / web server.
-#| 
+#|
 #| ## Code Overview
-#| 
+#|
 #| We first explain the code structure before going into setup instructions.
-#| 
+#|
 #| The application contains the following scripts:
 #| - [remote_query_handler.py](./remote_query_handler.py): Main entry point to run or resume the application. Supports various command line arguments to configure the run.
 #| - Web server related scrips: they implement any functionality that interacts with the web server.
@@ -18169,99 +18118,99 @@ if __name__ == "__main__":
 #|   - [luna_hsm_api.py](luna_hsm_api.py): This script uses HSM operations (see `luna_hsm_operations.py`) to provide a high-level API for the HSM, implementing the "sign" operation. It also manages HSM sessions and caches results of HSM queries for efficiency.
 #|   - [luna_hsm_operations.py](luna_hsm_operations.py): This script uses the [pycryptoki](https://pycryptoki.readthedocs.io/en/latest/index.html) Python package published by Thales to run operations on the HSM. `pycryptoki` is a (wrapper for a) PKCS11 library. The relevant operations for us are session management, fetching information about the RSA key (what internal handel it was assigned, so that we can specify that key for an operation), and performing raw signature queries.
 #| - The remaining files ([constants.py](constants.py) and [stateful_class.py](stateful_class.py)) contain a few miscellaneous items to support the above scripts.
-#| 
+#|
 #| **Process Communication**
-#| 
+#|
 #| The above processes use IPC (specifically, a Python multiprocessing Queue managed by another process) to exchange information and coordinate.
-#| 
+#|
 #| **Storage Management and Congestion Control**
-#| 
+#|
 #| Since the full query files are hundreds of gigabytes large, all of the above scripts include congestion control mechanisms that will regulate how many pending batches are stored on any machine at a given time.
 #| The goal is to store enough batches that the HSM is the sole bottleneck in the computation, and it is not waiting for new queries due to bandwidth or latency limitaitons.
 #| Completed batches will be deleted from the web server and remote server once their processing is completed.
-#| 
+#|
 #| ## Setup Instructions
-#| 
+#|
 #| This setup was tested with a Luna K6 HSM and a Thales Luna S750.
-#| 
+#|
 #| The main setup steps are:
 #| 1. Setting up remote authentication to the partition that contains our target RSA-1024 key.
 #| 2. Enabling raw RSA operations (i.e., without any padding, called `CKM_RSA_X_509`).
-#| 
+#|
 #| ### Preparation
-#| 
+#|
 #| Ensure the following four preparations are done.
-#| 
+#|
 #| #### Preparation 1: Enable remote authentication
-#| 
+#|
 #| Before importing any keys into a new partition on the HSM, you need to make sure that remote authentication is enabled because changing this setting may wipe the partition.
-#| 
+#|
 #| We need remote authentication to allow for HSM operations, including signing a message, to be performed without someone physically plugging in a pin entry device (PED) or allowing the signature to be computed with a remote PED.
-#| 
+#|
 #| Using the Luna command line tool `lunacm`, log in to the HSM and partition where our RSA key should be imported.
 #| Run `par showpolicies` to see the partition capabilities, which needs to have `22: Enable activation : 1` set to 1 to allow remote access.
 #| If this is not the case, follow the instructions in the ["Enable Remote Authentication" section](#enabling-remote-authentication-aka-user-activation-or-ped-key-less-login-without-physical-access) to enable it.
-#| 
+#|
 #| #### Preparation 2: Enable raw RSA operations
-#| 
+#|
 #| Make sure that your HSM allows one to perform raw RSA operations through a mechanism called `CKM_RSA_X_509`.
-#| 
+#|
 #| Again, you can check this in `lunacm` with a user logged into the target partition, by running:
-#| 
+#|
 #| ```
 #| lunacm:>par showmechanism
-#| 
-#| 
+#|
+#|
 #|  Mechanisms Supported:
 #|         [...]
 #|          0x00000003 - CKM_RSA_X_509
 #|         [...]
 #| ```
-#| 
+#|
 #| If this is not enabled, follow the instructions in the ["Enable raw RSA Operations" chapter](#enabling-raw-rsa-operations).
-#| 
+#|
 #| #### Preparation 3: Generate/Import an RSA-1024 Key
-#| 
+#|
 #| We recommend generating a 1024-bit RSA key outside the HSM and then importing it to avoid loosing all query process in case the HSM zeros out its state.
-#| 
+#|
 #| See ["Import RSA Wrapping Key to HSM" chapter](#import-rsa-wrapping-key-to-hsm) for instructions on how to import the key and how to change the key label.
-#| 
+#|
 #| #### Preparation 4: Install python packages
-#| 
+#|
 #| Create a virtual environment and install some additional python packages required to run the remote query handler as follows.
-#| 
+#|
 #| Navigate to the folder where you want to store the virtual environment and create a new one with:
 #| ```
 #| $ python3 -m venv venv
 #| ```
-#| 
+#|
 #| Activate the environment with:
 #| ```
 #| $ . venv/bin/activate
 #| ```
-#| 
+#|
 #| Install all required Python dependencies (listed in [requirements.txt](requirements.txt)) with:
 #| ```
 #| $ pip3 install -r <PATH/TO/FOLDER/OF/THIS/README>/requirements.txt
 #| ```
-#| 
+#|
 #| ## Testing Setup
-#| 
+#|
 #| To test the setup, it is possible to use a subset of our scripts to manually sign data on the HSM.
-#| 
+#|
 #| This can be done by directly running the [luna_hsm_api.py](luna_hsm_api.py) script.
 #| It supports the following arguments:
-#| 
+#|
 #| ```bash
 #| $ python luna_hsm_api.py --help
 #| usage: luna_hsm_api.py [-h] [--slot SLOT] [--userpin] [--logs_dir LOGS_DIR] [--verbose] label data
-#| 
+#|
 #| Luna HSM API
-#| 
+#|
 #| positional arguments:
 #|   label                Label of the key that should be used for signing.
 #|   data                 Data (in hex) to sign.
-#| 
+#|
 #| optional arguments:
 #|   -h, --help           show this help message and exit
 #|   --slot SLOT          Slot in which the HSM is installed.
@@ -18270,45 +18219,45 @@ if __name__ == "__main__":
 #|   --logs_dir LOGS_DIR  Path to directory in which log files will be stored. (Must already exist.)
 #|   --verbose            Enable extra debug output
 #| ```
-#| 
+#|
 #| The arguments `--slot` and `--userpin` are defined in the same way as for [remote_query_handler.py](remote_query_handler.py) (where they have a `hsm-` prefix).
 #| `--verbose` always sets the verbosity level to `DEBUG`.
-#| 
+#|
 #| This script is useful to check whether the interaction with the HSM is working, including:
 #| - Remote authentication with the `--userpin`
 #| - Running raw RSA operations
 #| - That the HSM slot and key label are correct
-#| 
+#|
 #| For example, to sign the message `aaaaaa` (i.e., 11184810 in hex), run the following:
 #| ```
 #| $ python3 luna_hsm_api.py --logs_dir </PATH/TO/WORKDIR> --verbose --slot <HSM SLOT> --userpin id_oracle_rsa_1024_exp_65537 aaaaaa
-#| 
+#|
 #| Please enter the userpin for your Luna HSM on slot 1: AAAA-BBBB-CCCC-DDDD
 #| Luna HSM API logging to </PATH/TO/WORKDIR>/luna_hsm_api.log
 #| Signing the following data with key with label id_oracle_rsa_1024_exp_65537: aaaaaa
 #| Produced signature: 60b44f82cb77bd1ed8139d78412ae658bf4327ca7c12bc9628041d1b7debc5f95ac8f08575c5c700b98eac6429a59ca7a6be84991d6091357c367c59631204998f6bd0ecdca
 #| 8797836accf5785cdd096a6da15ff649d90698b7b53332aedfa8fcf9363a4b65d8ccbe0bcabbf025548c4f3f1414b6d2247c05c3c242082f75596
 #| ```
-#| 
+#|
 #| If this command works without throwing an exception, likely the remote query handler will also work.
-#| 
+#|
 #| ## Running Instructions
-#| 
+#|
 #| This part includes instructions on how to run the remote query handler scripts.
-#| 
+#|
 #| ### Remote query handler CLI
-#| 
+#|
 #| As described above, `remote_query_handler.py` is the main entry point.
 #| It supports the following arguments.
-#| 
+#|
 #| ```
 #| $ python3 remote_query_handler.py --help
 #| usage: remote_query_handler.py [-h] [--api API] [--api-token] [--work-dir WORK_DIR] [--pending-batches-thr PENDING_BATCHES_THR]
 #|                                [--unpacked-batches-prefetch-thr UNPACKED_BATCHES_PREFETCH_THR] [--hsm-threads HSM_THREADS] [--hsm-slot HSM_SLOT]
 #|                                [--hsm-userpin] [--use-compression] [--resume] [--verbose] [--log-level {0,10,20,30,40,50}] [--stderr]
-#| 
+#|
 #| Local query handler
-#| 
+#|
 #| optional arguments:
 #|   -h, --help            show this help message and exit
 #|   --api API             Domain name of the webserver that exposes the REST API to download query batches and upload signatures.
@@ -18334,274 +18283,274 @@ if __name__ == "__main__":
 #|                         --verbose the default is 30 (WARNING), with --verbose it is 20 (INFO).
 #|   --stderr              Log also to stderr, in addition to the log file.
 #| ```
-#| 
-#| 
+#|
+#|
 #| **Debugging**
-#| 
+#|
 #| For debugging purposes, we recommend running the script with `--verbose --log-level 10` since this will enable (a lot of) additional output.
 #| Unfortunately, the `pycryptoki` package is very verbose, so it's better to not use `--stderr` and just look at the logs in the log file.
 #| This logging significantly slows down the HSM queries, so please don't use `--log-level 10` for queries (but do use `--verbose` to help us debug things from remote).
-#| 
+#|
 #| **Compression**
-#| 
+#|
 #| The use of `--use-compression` requires [zstd](https://github.com/facebook/zstd) to be installed (which is in the main package repos for many distributions but not installed by default).
 #| It's only really beneficial for one out of the three types of queries that we will run, saving about 20% bandwidth for rational queries.
-#| 
+#|
 #| ### First time starting remote query handler
-#| 
+#|
 #| The recommended command to start the remote query handler for the first time is:
-#| 
+#|
 #| ```
 #| $ python3 remote_query_handler.py --api hsm-api.domain.example --work-dir <PATH/TO/WORKDIR> --hsm-slot <HSM SLOT> --hsm-threads 30 --hsm-userpin --api-token --verbose
 #| ```
-#| 
+#|
 #| Replace the following:
 #| - `<PATH/TO/WORKDIR>` with the path to the working directory where the script can store batches and logs.
 #| - `<HSM SLOT>` with the slot that your HSM is using. This value can be found by running `partition showinfo` in the lunacm command line tool after authenticating to the relevant partition. The output should contain a line similar to `Slot Id -> 1` that shows the slot ID (for us, it is `1`).
-#| 
+#|
 #| [Official documentation](https://public.dhe.ibm.com/cloud/bluemix/network/vpx/administration_guide.pdf
 #| ) recommends using 20-40 threads for optimal performance, others mention 30.
 #| Hence, I recommend using 30 unless you have done benchmarking yourself to see which number of threads performs best for your HSM.
-#| 
+#|
 #| The arguments `--hsm-userpin` and `--api-token` will prompt the user to enter these values right after starting the script.
 #| They will later be stored in a file and it is not required to re-enter them when restarting a previous run with `--resume`.
 #| If you're concerned about the confidentiality of those values, make sure that the file that they are written to has limited permissions (say 0600).
 #| (However, our API token is only there to prevent anybody from tampering with this experiment and the authentication token likely only allows users to authenticate to the partition we use for running these queries, so little confidential information is protected by these tokens and storing them as is is fine from my perspective.)
-#| 
+#|
 #| Using `--verbose` will log at the `INFO` level, which is used moderately in the scripts and hence produced a managable volume of insightful information about the progress of the HSM.
 #| Using this option is recommended.
-#| 
+#|
 #| **Stopping the script**
-#| 
+#|
 #| The script is written in such a way that you can cancel it at any point (preferably by sending a keyboard interrupt with CTRL+C).
-#| 
+#|
 #| The query and signature batches that are temporarily stored in the working directory are not assumed to be persistent and can be deleted or left in a corrupted state.
-#| 
+#|
 #| To resume a run, see [the section below](#resuming-a-prior-run) for the correct command.
 #| If you rerun the above command, it will start a new run from scratch instead of resuming an existing run.
-#| 
+#|
 #| The script will fetch its progress from the webserver once resumed and re-process any batches that weren't already completed at the time of the interruption.
-#| 
+#|
 #| ### Resuming a prior run of remote query handler
-#| 
+#|
 #| After [starting the script for the first time](#first-time-starting-command), you can resume a prior run with the following command:
-#| 
+#|
 #| ```
 #| $ python3 remote_query_handler.py --work-dir `<PATH/TO/RUNDIR>` --resume
 #| ```
-#| 
+#|
 #| Replace the following:
 #| - `<PATH/TO/RUNDIR>` is the path to the directory for the run that should be resumed. Every run creates a folder in the working directory `<PATH/TO/WORKDIR>`, which was passed with `--work-dir` on the first run. Hence, you need to find that directory (e.g., the script outputs the log file location that includes the run directory when first started, or you can use `ls -ltr <PATH/TO/WORKDIR>` to find the most recently modified directory in the working directory).
-#| 
+#|
 #| :warning: Please note that most other arguments are **not supported** on resuming, i.e., you cannot change the configuration, number of threads, authorization tokens, etc.
 #| These values could be changed, at your own risk, by modifying the JSON files that store them.
-#| 
+#|
 #| ## Additional Setup Instructions
-#| 
+#|
 #| Note: These instructions are based on a Luna K6 HSM and might not (but hopefully will) transfer to newer models.
-#| 
+#|
 #| ### Enabling remote authentication aka user activation or PED key-less login without physical access
-#| 
+#|
 #| This section describes how to enable login without physical access to the HSM.
-#| 
+#|
 #| First, we need to enable the partition policy "Enable activation".
-#| 
+#|
 #| Run the command `par showpolicies` to find the number of this policy as follows.
-#| 
+#|
 #| ```
 #| lunacm:>par showpolicies
-#| 
+#|
 #|         Partition Capabilities
 #|                 ...
 #|                 22: Enable activation : 0
 #|                 23: Enable auto-activation : 1
-#| 
+#|
 #|         Partition Policies
 #|                 ...
 #|                 22: Allow activation : 0
 #|                 23: Allow auto-activation : 0
 #|                 ...
 #| ```
-#| 
+#|
 #| On our HSM, this is policy 22.
-#| 
+#|
 #| Now activate said policy by running the following command:
-#| 
+#|
 #| ```
 #| lunacm:>partition changepolicy -p 22 -v 1
-#| 
+#|
 #| Command Result : No Error
 #| ```
-#| 
+#|
 #| Then check that the policy is enabled:
-#| 
+#|
 #| ```
 #| lunacm:>par showpolicies
-#| 
+#|
 #|         Partition Capabilities
 #|                 ...
 #|                 22: Enable activation : 1
 #|                 23: Enable auto-activation : 1
-#| 
+#|
 #|         Partition Policies
 #|                 ...
 #|                 22: Allow activation : 1
 #|                 23: Allow auto-activation : 0
 #|                 ...
 #| ```
-#| 
+#|
 #| `auto-activation` is not needed (and per documentation, doesn't exist for PCI-e HSMs).
-#| 
+#|
 #| Then, create a user challenge:
 #| ```
 #| lunacm:>par crc
-#| 
+#|
 #|         Please attend to the PED.
-#| 
+#|
 #| Command Result : No Error
 #| ```
-#| 
+#|
 #| Which, on the PED, displays a secret value or remote autentication token, that you will need to enter in the remote query handler script after adding the CLI argument `--hsm-userpin`.
 #| Let's say the token is `AAAA-BBBB-CCCC-DDDD`
-#| 
+#|
 #| After that, you can log in using:
 #| ```
 #| lunacm:>par logi -p AAAA-BBBB-CCCC-DDDD
-#| 
+#|
 #|         User is activated, PED is not required.
-#| 
+#|
 #| Command Result : No Error
 #| ```
-#| 
+#|
 #| If this doesn't work, make sure you actually changed the partition policy to allow activation.
 #| Generating the CRC will work even if the policy isn't activated, but auto-login won't work.
-#| 
-#| 
+#|
+#|
 #| ### Enabling raw RSA operations
-#| 
+#|
 #| Enabling raw RSA operations is not FIPS approved and may require specific configuration.
-#| 
+#|
 #| We need to enable the policies to allow non-FIPS algorithms and raw RSA operations.
-#| 
+#|
 #| Run `hsm showpolicies` in the `lunacm` command line tool to find the policy numbers:
-#| 
+#|
 #| ```
 #| lunacm:>hsm showpolicies
-#| 
+#|
 #|         HSM Capabilities
 #|                 [...]
 #|                 12: Enable non-FIPS algorithms : 1
 #|                 [...]
-#| 
+#|
 #|         HSM Policies
 #|                 [...]
 #|                 12: Allow non-FIPS algorithms : 0
 #|                 [...]
-#| 
+#|
 #|         SO Capabilities
 #|                 [...]
 #| 				18: Enable raw RSA operations : 1
 #|                 [...]
-#| 
+#|
 #|        SO Policies
 #|                 [...]
 #|                 18: Allow raw RSA operations : 1
 #|                 [...]
-#| 
+#|
 #| Command Result : No Error
 #| ```
-#| 
+#|
 #| Here, the `Allow non-FIPS algorithms` policy has number 12 and is disabled, but the `raw RSA operations` capability and policy with number 18 were already allowed.
-#| 
+#|
 #| Activate/enable policies that arent already as follow.
 #| For example, to enable policy 12 for the partition:
-#| 
+#|
 #| ```
 #| lunacm:>hsm changeHSMPolicy -p 12 -v 1
-#| 
+#|
 #|         *** WARNING ***
 #|         Selection of this policy option places the HSM in a mode
 #|         of operation that is not approved by FIPS 140-2.
 #|         The User and all User objects will be deleted.
 #|         Are you sure you wish to continue?
-#| 
+#|
 #|         Type 'proceed' to continue, or 'quit' to quit now ->proceed
-#| 
+#|
 #| Command Result : No Error
 #| ```
-#| 
+#|
 #| Check that the `CKM_RSA_X_509` mechanism for raw RSA operations is now supported:
-#| 
+#|
 #| ```
 #| lunacm:>par showmechanism
-#| 
-#| 
+#|
+#|
 #|  Mechanisms Supported:
 #|          0x00000000 - CKM_RSA_PKCS_KEY_PAIR_GEN
 #|          0x00000001 - CKM_RSA_PKCS
 #|          0x00000003 - CKM_RSA_X_509
 #| ```
-#| 
-#| 
+#|
+#|
 #| ### Importing/Generate an RSA-1024 bit key into a Luna HSM
-#| 
-#| The RSA key must have PKCS#1 format and be stored in DER encoding. 
-#| 
+#|
+#$ The RSA key must have PKCS#1 format and be stored in DER encoding. $
+#|
 #| :warning: Guides and documentation claim PEM encoding works too, but it doesn't. Also, commands in the documentation don't work, the `cmu` binary is sensitive to the order of arguments and the order is not what they used in the docs.
-#| 
+#|
 #| Generate a PKCS#1 key in DER format:
 #| ```bash
 #| openssl genpkey -out id_rsa_2048.der -algorithm RSA -outform DER  -pkeyopt rsa_keygen_bits:2048
 #| ```
-#| 
+#|
 #| #### Alternative way
-#| 
+#|
 #| In case you have a key but it's not in PKCS#1 format, use this command to convert it:
 #| ```bash
 #| openssl pkcs8 -in id_rsa_1024.pem -topk8 -nocrypt -out id_rsa_1024_pkcs8.pem
 #| ```
-#| 
+#|
 #| In case you have a key in PEM format, convert it to DER format with the following command:
 #| ```bash
 #| openssl rsa -in id_rsa_1024.pem -out id_rsa_1024.der -outform DER -traditional
 #| ```
-#| 
-#| #### Import key 
-#| 
+#|
+#$ #### Import key $
+#|
 #| For this, we use the "Certificate Management Utility (CMU)" provided by Thales/Luna.
-#| 
+#|
 #| In our case, this binary is at the path: `/usr/safenet/lunaclient/bin/cmu`.
-#| 
+#|
 #| Import the key (careful, arguments are order-sensitive):
 #| ```
 #| $ /usr/safenet/lunaclient/bin/cmu importkey -keyalg RSA -in id_oracle_rsa_1024_exp_65537.der
 #| Please enter password for token in slot 1 : *******************
-#| 
+#|
 #| ...Autogenerating a 3DES key for unwrapping -> Handle (15)
 #| ...The key was sucessfully unwrapped onto the token -> Handle(19)
 #| ```
-#| 
+#|
 #| For our configuration of the HSM, one needs to enter a password here, which is the secret key or userpin that one can set up to support remote partition user authentication. See the ["Enabling Remote Authentication" chapter](#enabling-remote-authentication) for more information.
-#| 
+#|
 #| Check in `lunacm` that the key is there:
 #| ```
 #| lunacm:>par con
-#| 
+#|
 #|         The User is currently logged in.  Looking for objects in the
 #|         User's partition.
-#| 
+#|
 #|         Object list:
-#| 
+#|
 #|         Label:         CMU Unwrapped RSA Private Key
 #|         Handle:        19
 #|         Object Type:   Private Key
 #|         Object UID:    410000076e01000035730900
 #| ```
-#| 
+#|
 #| #### Changing label
-#| 
+#|
 #| By default, our code assumes the label `id_oracle_rsa_1024_exp_65537`. It can be changed after importing a key using the cmu binary as follows.
-#| 
+#|
 #| View the current key labels and handles:
 #| ```
 #| $ /usr/safenet/lunaclient/bin/cmu list
@@ -18610,16 +18559,16 @@ if __name__ == "__main__":
 #| handle=17	label=rsa-public-5ff954c11c377c09d8106599b67e2ee151c419be
 #| handle=18	label=rsa-private-5ff954c11c377c09d8106599b67e2ee151c419be
 #| ```
-#| 
+#|
 #| Take note of the handle of the key you want to change, and run:
 #| ```
 #| $ /usr/safenet/lunaclient/bin/cmu setattribute -handle=16 -label="id_oracle_rsa_1024_exp_65537"
 #| Please enter password for token in slot 1 : *******************
 #| ```
-#| 
+#|
 #| Confirm the label was changed:
 #| ```
-#| 
+#|
 #| $ /usr/safenet/lunaclient/bin/cmu list
 #| Please enter password for token in slot 1 : *******************
 #| handle=16	label=id_oracle_rsa_1024_exp_65537
@@ -18635,27 +18584,27 @@ if __name__ == "__main__":
 #| MAX_NEXT_BATCH_NOT_AVAILABLE_CNT = 50
 #| RETRY_PAUSE_SEC = 5
 #| END_OF_QUEUE = (-1, "exiting")
-#| 
+#|
 #| API_URL_FORMAT = "{}://{}/api"
-#| 
+#|
 #| DEFAULT_HSM_THREADS = 20
 #| DEFAULT_HSM_SLOT = 1
 
 #@ FILE code/oracles/remote_queries/remote_query_handler/luna_hsm.py 644 7522 f6e563541b7e80dd3e36633d271807274048340019b126e2bbc6ff788e6b6e21 text
 #| import os
 #| import time
-#| 
+#|
 #| from multiprocessing.pool import Pool
 #| from multiprocessing import Process, Manager
 #| from logging import Logger
 #| from typing import List
 #| import signal
-#| 
+#|
 #| from constants import *
 #| from luna_hsm_api import LunaHsmApi
 #| from webserver import Webserver
 #| from stateful_class import StatefulClass
-#| 
+#|
 #| def query_pool_init_worker():
 #|     """
 #|     Ignore KeyboardInterrupt signals on multiprocessing pool
@@ -18663,20 +18612,20 @@ if __name__ == "__main__":
 #|     Hack from: https://stackoverflow.com/a/6191991
 #|     """
 #|     signal.signal(signal.SIGINT, signal.SIG_IGN)
-#| 
+#|
 #| class LunaHsm(StatefulClass):
 #|     """
 #|     This class uses the LunaHsmApi class to interact with the HSM.
 #|     It runs multiple processes to keep the HSM fully utilized with
 #|     queries to sign.
 #|     """
-#| 
+#|
 #|     def __init__(self, work_dir: str, logging: Logger, webserver_args: tuple, *args):
 #|         super().__init__(work_dir, logging, ["slot", "userpin", "nprocesses", "compression"], "hsm.json", *args)
 #|         self.webserver = Webserver(*webserver_args)
 #|         self.queue_set: set[str] = set()
 #|         self.metadata = self.webserver.api.get_metadata(blocking=True)
-#| 
+#|
 #|     def parse_query_batch_file(self, fp):
 #|         query_byte_len = self.metadata["modulus_byte_size"]
 #|         while True:
@@ -18684,7 +18633,7 @@ if __name__ == "__main__":
 #|             if len(query_bytes) < query_byte_len:
 #|                 break
 #|             yield query_bytes
-#| 
+#|
 #|     def _query_worker_process(self, args: tuple):
 #|         """
 #|         Process which fetches query batch file names from a queue,
@@ -18695,15 +18644,15 @@ if __name__ == "__main__":
 #|         id, query_batch_queue, query_batch_idx_in_progress, signature_batch_queue = args
 #|         log_tag = f"[LunaHsm._query_worker #{id}] "
 #|         self.logging.info(f"{log_tag}Start query worker process #{id}.")
-#| 
+#|
 #|         # Note this creates a different session for every worker process,
 #|         # as required by the Cryptoki PKCS11 library.
 #|         self.api = LunaHsmApi(self.logging, self.slot, self.userpin)
-#| 
+#|
 #|         while True:
 #|             self.logging.debug(f"{log_tag}Waiting for next item in queue 'query_batch_queue'.")
 #|             item = query_batch_queue.get()
-#| 
+#|
 #|             if item == END_OF_QUEUE:
 #|                 self.logging.info(f"{log_tag}Query batch queue was shut down, stopping query worker.")
 #|                 while not query_batch_queue.empty():
@@ -18715,10 +18664,10 @@ if __name__ == "__main__":
 #|             if not os.path.isfile(batch_fpath):
 #|                 self.logging.warning(f"{log_tag}Encountered stale query batch {batch_fpath} (file no longer exists). Likely it was double-fetched (re-downloaded bad batch, overlapping with remote client reset). File is ignored.")
 #|                 continue
-#| 
+#|
 #|             query_batch_idx_in_progress.append(batch_idx)
 #|             self.logging.debug(f"{log_tag}Fetched query batch {batch_idx} in file {batch_fpath} from queue.")
-#| 
+#|
 #|             try:
 #|                 sig_fpath = f"{self.webserver.api.sig_dir}/signature_batch_{batch_idx}.bin"
 #|                 while True:
@@ -18731,10 +18680,10 @@ if __name__ == "__main__":
 #|                                 sig_fp.write(self.api.sign(query, self.metadata["label"]))
 #|                                 nsig += 1
 #|                             ts_query_end = time.time()
-#| 
+#|
 #|                             sig_fp.flush()
 #|                             os.fsync(sig_fp)
-#| 
+#|
 #|                     query_batch_size = os.path.getsize(batch_fpath)
 #|                     sig_batch_size = os.path.getsize(sig_fpath)
 #|                     if query_batch_size != sig_batch_size:
@@ -18743,7 +18692,7 @@ if __name__ == "__main__":
 #|                         time.sleep(RETRY_PAUSE_SEC)
 #|                     else:
 #|                         break
-#| 
+#|
 #|                 self.logging.info(f"{log_tag}Finished all queries from batch {batch_idx}, wrote signatures to {sig_fpath}.")
 #|                 signature_batch_queue.put((batch_idx, sig_fpath))
 #|                 os.unlink(batch_fpath)
@@ -18755,14 +18704,14 @@ if __name__ == "__main__":
 #|                 raise e
 #|             except Exception as e:
 #|                 self.webserver.report_error(f"{log_tag}Failed to parse query batch {batch_fpath} with error:\n{e}", is_fatal=True)
-#| 
+#|
 #|         self.logging.info(f"{log_tag}Stopped query worker thread #{id}.")
-#| 
+#|
 #|     def run(self, completed_batches: List[int], pending_batches_thr: int, unpacked_batches_prefetch_thr: int):
 #|         log_tag = f"[LunaHsm.run] "
-#| 
+#|
 #|         self.logging.info(f"{log_tag}HSM process starting")
-#| 
+#|
 #|         with Manager() as manager:
 #|             query_batch_queue = manager.Queue()
 #|             signature_batch_queue = manager.Queue()
@@ -18771,15 +18720,15 @@ if __name__ == "__main__":
 #|             worker_pool = None
 #|             try:
 #|                 worker_pool = Pool(self.nprocesses, initializer=query_pool_init_worker)
-#| 
+#|
 #|                 args = [(i, query_batch_queue, query_batch_idx_in_progress, signature_batch_queue) for i in range(self.nprocesses)]
 #|                 worker_pool.map_async(self._query_worker_process, args)
-#| 
+#|
 #|                 webserver_process = Process(target=self.webserver.run,
 #|                     args=(completed_batches, pending_batches_thr, unpacked_batches_prefetch_thr,
 #|                         query_batch_queue, signature_batch_queue, query_decompress_queue, query_batch_idx_in_progress))
 #|                 webserver_process.start()
-#| 
+#|
 #|                 self.logging.info(f"{log_tag}Waiting for webserver to finish.")
 #|                 webserver_process.join()
 #|                 self.logging.info(f"{log_tag}Waiting for query workers to finish {query_batch_queue.qsize()} operations.")
@@ -18789,7 +18738,7 @@ if __name__ == "__main__":
 #|                 self.logging.info(f"{log_tag}Caught user interrupt, terminating luna hsm")
 #|                 self.logging.info(f"{log_tag}Shutting down webserver...")
 #|                 self.webserver.stop()
-#| 
+#|
 #|                 self.logging.info(f"{log_tag}Shutting down query workers...")
 #|                 query_batch_queue.put(END_OF_QUEUE)
 #|                 if worker_pool != None:
@@ -18798,41 +18747,41 @@ if __name__ == "__main__":
 #|             except Exception as e:
 #|                 self.webserver.report_error(f"{log_tag}Running LunaHSM failed with error:\n{e}")
 #|                 raise e
-#| 
+#|
 #|         self.logging.info(f"{log_tag}HSM process shut down")
 
 #@ FILE code/oracles/remote_queries/remote_query_handler/luna_hsm_api.py 644 5176 fe7657bef3cc57d7c22ae50b965ce475bdc67767cd0777c651d5e788e452b565 text
 #| import argparse
 #| import logging
-#| 
+#|
 #| from logging import Logger
-#| 
+#|
 #| from luna_hsm_operations import *
-#| 
+#|
 #| class LunaHsmApi:
 #|     """
 #|     This class provides an interface to HSM operations (in our case, only signing.)
 #|     """
-#| 
+#|
 #|     def __init__(self, logging: Logger, slot: int, userpin: str) -> None:
 #|         self.logging    = logging
 #|         self.slot       = slot
 #|         self.userpin    = userpin
-#| 
+#|
 #|         self.key_info_cache: dict[str, tuple] = dict()
 #|         self.sk_handel_cache: dict[str, int]  = dict()
-#| 
+#|
 #|         self.logging.info("Starting Luna HSM session...")
-#| 
+#|
 #|         self.session = start_session(self.slot, self.userpin)
 #|         self.logging.info("Luna HSM session started successfully")
-#| 
+#|
 #|     def _get_pk_label(self, label: str):
 #|         return f"{label}_public_key"
-#| 
+#|
 #|     def _get_sk_label(self, label: str):
 #|         return f"{label}_secret_key"
-#| 
+#|
 #|     def _get_key_info(self, label, handel=None):
 #|         log_tag = "[_get_key_info] "
 #|         if label not in self.key_info_cache:
@@ -18841,96 +18790,96 @@ if __name__ == "__main__":
 #|                 if len(handels) != 1:
 #|                     self.logging.error(f"{log_tag}Couldn't find key with label {label}, got handels: {handels}.")
 #|                     raise Exception(f"Couldn't find unique result for key with label {label}.")
-#| 
+#|
 #|                 handel = handels[0]
-#| 
+#|
 #|             N, e = get_pub_key_info(self.session, handel)
 #|             modulus_bits = ((N.bit_length() + 7) // 8) * 8
-#| 
+#|
 #|             self.key_info_cache[label] = (N, e, modulus_bits)
 #|             self.logging.info(f"{log_tag}Retrieved following info for public key with label {label} (cached for future use): N={N}, e={e}, modulus_bits={modulus_bits}")
-#| 
+#|
 #|         N, e, modulus_bits = self.key_info_cache[label]
 #|         self.logging.debug(f"{log_tag}Retrieved following info for public key with label {label}: N={N}, e={e}, modulus_bits={modulus_bits}")
 #|         return N, e, modulus_bits
-#| 
+#|
 #|     def _get_rsa_sk_handel(self, rsa_sk_label, rsa_sk_handel=None):
 #|         log_tag = "[_get_rsa_sk_handel] "
 #|         self.logging.debug(f"{log_tag}Retrieve secret key handel for label {rsa_sk_label}")
-#| 
+#|
 #|         if rsa_sk_label not in self.sk_handel_cache:
 #|             if rsa_sk_handel == None:
 #|                 rsa_sk_handels = find_existing_rsa_key(self.session, rsa_sk_label)
-#| 
+#|
 #|                 if len(rsa_sk_handels) != 1:
 #|                     if len(rsa_sk_handels) == 0:
 #|                         error_msg = f"{log_tag}Secret key with label {rsa_sk_label} does not exist, did you use 'keygen' first?"
 #|                     else:
 #|                         error_msg = f"{log_tag}Invalid HSM state"
-#| 
+#|
 #|                     self.logging.error(error_msg)
 #|                     return None
-#| 
+#|
 #|                 rsa_sk_handel = rsa_sk_handels[0]
-#| 
+#|
 #|             self.sk_handel_cache[rsa_sk_label] = rsa_sk_handel
-#| 
+#|
 #|         self.logging.debug(f"{log_tag}Retrieved handel {self.sk_handel_cache[rsa_sk_label]}")
 #|         return self.sk_handel_cache[rsa_sk_label]
-#| 
+#|
 #|     def sign(self, data: bytes, label: str):
 #|         """Sign 'data' using the RSA key specified by 'label'"""
-#| 
+#|
 #|         log_tag = f"[{label}, sign]: "
-#| 
+#|
 #|         _, _, modulus_bits = self._get_key_info(label)
 #|         data_pad = pad(data, modulus_bits)
-#| 
+#|
 #|         rsa_sk_handel = self._get_rsa_sk_handel(label)
-#| 
+#|
 #|         self.logging.debug(f"{log_tag}sign the following data with key with label {label}: {data_pad.hex()}")
 #|         sig = sign(self.session, rsa_sk_handel, data_pad)
 #|         self.logging.debug(f"{log_tag}Produced signature {sig.hex()}")
-#| 
+#|
 #|         return sig
-#| 
+#|
 #| if __name__ == "__main__":
 #|     parser = argparse.ArgumentParser(description='Luna HSM API')
-#| 
+#|
 #|     parser.add_argument("label", type=str,
 #|         help='Label of the key that should be used for signing.')
 #|     parser.add_argument("data", type=str,
 #|         help='Data (in hex) to sign.')
-#| 
+#|
 #|     parser.add_argument('--slot', type=int,
 #|         help='Slot in which the HSM is installed.')
 #|     parser.add_argument('--userpin', action='store_true',
 #|         help='Read the secret value from stdin that is generated on the Luna HSM to allow user authentication without physically plugging in the PED.')
-#| 
+#|
 #|     parser.add_argument('--logs_dir', type=str, default='logs',
 #|         help='Path to directory in which log files will be stored. (Must already exist.)')
 #|     parser.add_argument('--verbose', action='store_true',
 #|         help='Enable extra debug output')
-#| 
+#|
 #|     args = parser.parse_args()
-#| 
+#|
 #|     label           = args.label
 #|     data            = bytes.fromhex(args.data)
 #|     logs_dir        = args.logs_dir
 #|     slot            = args.slot
 #|     do_read_userpin = args.userpin
-#| 
+#|
 #|     if do_read_userpin:
 #|         userpin = input(f"Please enter the userpin for your Luna HSM on slot {slot}: ")
-#| 
+#|
 #|     log_fpath = f"{logs_dir}/luna_hsm_api.log"
 #|     log_level = logging.DEBUG if args.verbose else logging.WARNING
-#| 
+#|
 #|     logging.basicConfig(filename=log_fpath, level=log_level)
-#| 
+#|
 #|     print(f"Luna HSM API logging to {log_fpath}")
 #|     oracle = LunaHsmApi(logging.getLogger(), slot, userpin)
-#| 
+#|
 #|     print(f"Signing the following data with key with label {label}: {data.hex()}")
 #|     sig = oracle.sign(data, label)
 #|     print(f"Produced signature: {sig.hex()}")
@@ -18941,8 +18890,8 @@ if __name__ == "__main__":
 #| Python package published by Thales. The functions are used by the
 #| LunaHsmApi class to perform the operations on the HSM.
 #| """
-#| 
-#| 
+#|
+#|
 #| from pycryptoki.default_templates import *
 #| from pycryptoki.defines import *
 #| from pycryptoki.key_generator import *
@@ -18952,25 +18901,25 @@ if __name__ == "__main__":
 #| from pycryptoki.encryption import *
 #| from pycryptoki.mechanism import *
 #| from pycryptoki.conversions import *
-#| 
+#|
 #| RAW_RSA_MECHANISM = Mechanism(mech_type=CKM_RSA_X_509)
-#| 
+#|
 #| # Must only be called once
 #| c_initialize_ex(CKF_OS_LOCKING_OK)
-#| 
+#|
 #| def pad(data, modulus_bits):
 #|     nbytes = modulus_bits // 8
 #|     return data.rjust(nbytes, b"\x00")
-#| 
+#|
 #| ## Wrapper functions for HSM operations
 #| def find_existing_rsa_key(h_session, label):
 #|     template = {CKA_LABEL: label}
 #|     return c_find_objects_ex(h_session, template, 1)
-#| 
+#|
 #| def get_rsa_key(h_session, pk_label, sk_label):
 #|     h_rsa_sks = find_existing_rsa_key(h_session, sk_label)
 #|     h_rsa_pks = find_existing_rsa_key(h_session, pk_label)
-#| 
+#|
 #|     if len(h_rsa_sks) == 1 and len(h_rsa_pks) == 1:
 #|         h_rsa_pk, h_rsa_sk = h_rsa_pks[0], h_rsa_sks[0]
 #|     else:
@@ -18980,48 +18929,48 @@ if __name__ == "__main__":
 #|         if len(h_rsa_sks) != 1:
 #|             err_msg += f" Found {len(h_rsa_sks)} public key(s) for label {sk_label}."
 #|         raise Exception(err_msg)
-#| 
+#|
 #|     return h_rsa_pk, h_rsa_sk
-#| 
+#|
 #| def start_session(slot, userpin):
 #|     h_session = c_open_session_ex(slot)
 #|     login_ex(h_session, slot, userpin)
 #|     return h_session
-#| 
+#|
 #| def dec(h_session, h_rsa_sk, ctxt):
 #|     return c_decrypt_ex(h_session, h_rsa_sk, ctxt, mechanism=RAW_RSA_MECHANISM)
-#| 
+#|
 #| def sign(h_session, h_rsa_sk, data):
 #|     return dec(h_session, h_rsa_sk, data)
-#| 
+#|
 #| def get_pub_key_info(h_session, h_rsa_pk):
 #|     pub_key_info_template = {
 #|         CKA_MODULUS: None,
 #|         LUNA_ATTR_PUBLIC_EXPONENT: None
 #|     }
-#| 
+#|
 #|     infos = c_get_attribute_value_ex(h_session, h_rsa_pk, pub_key_info_template)
-#| 
+#|
 #|     N = int.from_bytes(bytes.fromhex(infos[LUNA_ATTR_MODULUS].decode()), byteorder="big")
 #|     e = int.from_bytes(bytes.fromhex(infos[LUNA_ATTR_PUBLIC_EXPONENT].decode()), byteorder="big")
-#| 
+#|
 #|     return N, e
 
 #@ FILE code/oracles/remote_queries/remote_query_handler/remote_query_handler.py 644 7981 759fcd4fde561f3c2c25a44c2ac2a941967fa9b4cb1b1847ac8ff06765bc7a19 text
 #| #!/usr/bin/env python3
-#| 
+#|
 #| import argparse
 #| import json
 #| import logging
 #| import os
 #| import time
-#| 
+#|
 #| from constants import *
 #| from luna_hsm import LunaHsm
-#| 
+#|
 #| def get_parser():
 #|     parser = argparse.ArgumentParser(description='Local query handler')
-#| 
+#|
 #|     parser.add_argument('--api', default="hsm-api.domain.example",
 #|                         help='Domain name of the webserver that exposes the REST API to download query batches and upload signatures.')
 #|     parser.add_argument('--http-only-webserver', action='store_true',
@@ -19030,7 +18979,7 @@ if __name__ == "__main__":
 #|                         help="Read authentication token for REST API on webserver from stdin")
 #|     parser.add_argument('--work-dir', type=str, default='data',
 #|                         help='Path to directory in which log files, downloaded batches, signatures, metadata, etc will be stored. (The directory must already exist.)')
-#| 
+#|
 #|     parser.add_argument('--pending-batches-thr', type=int,
 #|                         help='Threshold for how many query batches are downloaded and stored locally before already downloaded ones are done (to prevent running out of storage space). By default, this is set to two times the number of HSM threads (see --hsm-threads).')
 #|     parser.add_argument('--unpacked-batches-prefetch-thr', type=int,
@@ -19043,23 +18992,23 @@ if __name__ == "__main__":
 #|                         help='Read remote authentication token for the slot passed in `--hsm-slot` from stdin.')
 #|     parser.add_argument('--use-compression', action='store_true',
 #|                         help='Compress/decompress batches with zst (only beneficial for rational queries).')
-#| 
+#|
 #|     parser.add_argument('--resume', action='store_true', help='Resume a previous run')
-#| 
+#|
 #|     parser.add_argument('--verbose', action='store_true',
 #|                         help='Enable extra debug output')
-#| 
+#|
 #|     parser.add_argument('--log-level', type=int, choices=[0, 10, 20, 30, 40, 50], default=20,
 #|                         help="Set the log level for this application, use: 0 (NOTSET), 10 (DEBUG), 20 (INFO), 30 (WARNING), 40 (ERROR), 50 (FATAL). Without --verbose the default is 30 (WARNING), with --verbose it is 20 (INFO).")
 #|     parser.add_argument('--stderr', action='store_true',
 #|                         help='Log also to stderr, in addition to the log file.')
-#| 
+#|
 #|     return parser
-#| 
+#|
 #| if __name__ == "__main__":
 #|     parser = get_parser()
 #|     args = parser.parse_args()
-#| 
+#|
 #|     api_domain                      = args.api
 #|     do_read_api_token               = args.api_token
 #|     pending_batches_thr             = args.pending_batches_thr
@@ -19070,20 +19019,20 @@ if __name__ == "__main__":
 #|     do_read_hsm_userpin             = args.hsm_userpin
 #|     do_resume                       = args.resume
 #|     work_dir                        = args.work_dir
-#| 
+#|
 #|     if pending_batches_thr == None:
 #|         pending_batches_thr = 2 * hsm_threads
 #|     if unpacked_batches_prefetch_thr == None:
 #|         unpacked_batches_prefetch_thr = pending_batches_thr
-#| 
+#|
 #|     if not do_resume:
 #|         subdir_name = "run_" + time.strftime("%Y%m%d-%H%M%S")
 #|         work_dir += f"/{subdir_name}"
 #|         os.mkdir(work_dir)
-#| 
+#|
 #|     log_fpath = f"{work_dir}/remote_query_handler.log"
 #|     log_level = args.log_level if args.verbose else logging.WARNING
-#| 
+#|
 #|     logging.basicConfig(
 #|         filename=log_fpath,
 #|         level=log_level,
@@ -19092,16 +19041,16 @@ if __name__ == "__main__":
 #|     )
 #|     logger = logging.getLogger()
 #|     print(f"Remote query handler is logging to {log_fpath}")
-#| 
+#|
 #|     if args.stderr:
 #|         logging.getLogger().addHandler(logging.StreamHandler())
-#| 
+#|
 #|     try:
 #|         state_path = f"{work_dir}/state.json"
 #|         if do_resume:
 #|             with open(state_path, "r") as fp:
 #|                 params = json.load(fp)
-#| 
+#|
 #|             webserver_args: tuple = (work_dir, logger, log_fpath)
 #|             hsm = LunaHsm(work_dir, logger, webserver_args)
 #|         else:
@@ -19111,39 +19060,39 @@ if __name__ == "__main__":
 #|                 api_token = "None"
 #|             if not do_read_hsm_userpin:
 #|                 raise Exception("Must specify --hsm-userpin on first run.")
-#| 
+#|
 #|             protocol = "http" if args.http_only_webserver else "https"
 #|             api_url = API_URL_FORMAT.format(protocol, args.api)
-#| 
+#|
 #|             if do_read_api_token:
 #|                 try:
 #|                     api_token = input(f"Enter the authorization token for the REST API {api_url}: ").strip()
 #|                 except:
 #|                     logging.error("Reading authorization token unsuccessful.")
 #|                     exit(1)
-#| 
+#|
 #|             if do_read_hsm_userpin:
 #|                 try:
 #|                     hsm_userpin = input(f"Enter the remote authentication token / user PIN for the HSM slot {hsm_slot}: ").strip()
 #|                 except:
 #|                     logging.error("Reading remote authentication token / user PIN for HSM unsuccessful.")
 #|                     exit(2)
-#| 
+#|
 #|             params = {
 #|                 "pending_batches_thr": pending_batches_thr,
 #|                 "unpacked_batches_prefetch_thr": unpacked_batches_prefetch_thr,
 #|             }
-#| 
+#|
 #|             with open(state_path, "w") as fp:
 #|                 json.dump(params, fp)
-#| 
+#|
 #|             webserver_args = (work_dir, logger, log_fpath, api_url, api_token, use_compression)
 #|             hsm = LunaHsm(work_dir, logger, webserver_args, hsm_slot,
 #|                 hsm_userpin, hsm_threads, use_compression)
 #|     except Exception as e:
 #|         logging.error(f"Failed to initialize LunaHsm with error:\n{e}")
 #|         exit(1)
-#| 
+#|
 #|     err_cnt = 0
 #|     while True:
 #|         try:
@@ -19165,7 +19114,7 @@ if __name__ == "__main__":
 #|         except Exception as e:
 #|             logging.error(f"Remote query handler failed with the following exception:\n{e}")
 #|             err_cnt += 1
-#| 
+#|
 #|             if err_cnt < MAX_ERROR_CNT:
 #|                 logging.info(f"Restarting remote query handler after exception. (restart {err_cnt} out of {MAX_ERROR_CNT})")
 #|             else:
@@ -19181,21 +19130,21 @@ if __name__ == "__main__":
 
 #@ FILE code/oracles/remote_queries/remote_query_handler/stateful_class.py 644 1405 00c9cf9b49ffcf02358b9a5c080bce86a146d58e9d766b5de9529ea6c24da74d text
 #| import json
-#| 
+#|
 #| from logging import Logger
-#| 
+#|
 #| class StatefulClassException(Exception):
 #|     pass
-#| 
+#|
 #| class StatefulClass:
 #|     def __init__(self, work_dir: str, logging: Logger,
 #|                  attrs: list, state_fname: str, *args):
-#|         
+#$         $
 #|         self.work_dir   = work_dir
 #|         self.logging    = logging
 #|         self.attrs      = attrs
 #|         self.state_file = f"{self.work_dir}/{state_fname}"
-#|         
+#$         $
 #|         if len(args) == 0:
 #|             with open(self.state_file, "r") as fp:
 #|                 state_dict = json.load(fp)
@@ -19206,19 +19155,19 @@ if __name__ == "__main__":
 #|                 state_dict[attr] = args[i]
 #|         else:
 #|             raise StatefulClassException(f"Invalid arguments for stateful class, expected: {', '.join(attrs)} but only got {len(args)} arguments.")
-#| 
+#|
 #|         for attr in self.attrs:
 #|             if attr in state_dict:
 #|                 setattr(self, attr, state_dict[attr])
 #|             else:
 #|                 self.logging.warning(f"Unknown attribute '{attr}' from {self.state_file} not in attribute list {self.attrs}.")
 #|         self.save()
-#|                 
+#$                 $
 #|     def save(self):
 #|         state_dict = dict()
 #|         for attr in self.attrs:
 #|             state_dict[attr] = getattr(self, attr)
-#| 
+#|
 #|         with open(self.state_file, "w") as fp:
 #|             json.dump(state_dict, fp)
 
@@ -19228,70 +19177,70 @@ if __name__ == "__main__":
 #| import time
 #| import subprocess
 #| from typing import List, Any
-#| 
+#|
 #| from logging import Logger
 #| from multiprocessing import Queue, Process
 #| from multiprocessing.managers import ListProxy
-#| 
+#|
 #| from constants import *
 #| from stateful_class import StatefulClass
 #| from webserver_api import WebserverApi
-#| 
+#|
 #| def put_priority(queue: Queue, items: List):
 #|     """An ugly hack to add super high priority items to the front of a queue."""
 #|     while not queue.empty():
 #|         items.append(queue.get())
 #|     for item in items:
 #|         queue.put(item)
-#| 
+#|
 #| class Webserver(StatefulClass):
 #|     """
 #|     This class runs different processes which use the
 #|     WebserverApi to fetch and upload query batches.
 #|     """
-#| 
+#|
 #|     def __init__(self, work_dir: str, logging: Logger, log_fpath: str, *args: tuple):
-#| 
+#|
 #|         super().__init__(work_dir, logging, ["api_url", "token", "compression"], "webserver.json", *args)
-#| 
+#|
 #|         self.log_fpath = log_fpath
 #|         self.api = WebserverApi(self.work_dir, self.logging,
 #|                                 self.token, self.api_url, self.compression,
 #|                                 do_remote_logging=True)
-#| 
+#|
 #|         self.queues: List[Queue] = []
-#| 
+#|
 #|     def _compress_file(self, fpath):
 #|         result = subprocess.run([ "zstd", "-z", "-T0", fpath])
 #|         if result.returncode != 0:
 #|             self.report_error(f"Failed to compress file '{fpath}' with stdout:\n{result.stdout}\nand stderr:\n{result.stderr}.")
 #|         return f"{fpath}.zst"
-#| 
+#|
 #|     def _decompress_file(self, fpath):
 #|         log_tag = "[Webserver._decompress_file] "
-#| 
+#|
 #|         self.logging.debug(f"{log_tag}Starting to decompress query batch file {fpath}.")
 #|         result = subprocess.run(["zstd", "-d", "-T0", "--rm", fpath], capture_output=True, text=True)
 #|         if result.returncode != 0:
 #|             self.report_error(f"{log_tag}Failed to unpack file '{fpath}' with stdout:\n{result.stdout}\nand stderr:\n{result.stderr}.",
 #|                 is_fatal=True)
 #|         self.logging.info(f"{log_tag}Decompressed query batch file {fpath}.")
-#| 
+#|
 #|     def _do_empty_queue(self, queue: Queue):
 #|         while not queue.empty():
 #|             queue.get()
-#| 
+#|
 #|     def _terminate_queue(self, queue: Queue):
 #|         self._do_empty_queue(queue)
 #|         queue.put(END_OF_QUEUE)
-#| 
+#|
 #|     def _get_next_batch_idx(self, completed_batches: List[int], query_batch_idx_in_progress: ListProxy, start_idx: int=0):
 #|         i = start_idx
 #|         while True:
 #|             if i not in completed_batches and i not in query_batch_idx_in_progress:
 #|                 return i
 #|             i += 1
-#| 
+#|
 #|     def report_error(self, error_msg: str, is_fatal: bool=False, do_error_backoff: bool=False):
 #|         self.logging.error(error_msg)
 #|         self.api.report_error_msg(error_msg)
@@ -19300,7 +19249,7 @@ if __name__ == "__main__":
 #|             exit(1)
 #|         if do_error_backoff:
 #|             time.sleep(MAX_BACKOFF_SEC)
-#| 
+#|
 #|     def _batch_fetching_process(self, completed_batches: List[int], pending_batches_thr: int,
 #|             query_batch_queue: Queue, query_decompress_queue: Queue, query_batch_idx_in_progress: ListProxy):
 #|         """
@@ -19309,13 +19258,13 @@ if __name__ == "__main__":
 #|         files need to be decompressed until the shutdown symbol END_OF_QUEUE is
 #|         added to the queue.
 #|         """
-#| 
+#|
 #|         log_tag = "[Webserver._batch_fetching_process] "
 #|         self.logging.info(f"{log_tag}Start process")
 #|         backoff_time = 1
 #|         next_batch_not_available_cnt = 0
 #|         batch_idx = 0
-#| 
+#|
 #|         try:
 #|             while True:
 #|                 # First check for bad batches to redo (urgently, because it blocks progress)
@@ -19329,16 +19278,16 @@ if __name__ == "__main__":
 #|                             continue
 #|                         self.logging.info(f"{log_tag}Re-downloaded bad batch {batch_idx} here: {batch_fname}")
 #|                         bad_batches_queue_items[batch_idx] = (batch_idx, batch_fname, True)
-#| 
+#|
 #|                 if len(bad_batches_queue_items) > 0:
 #|                     put_priority(query_decompress_queue, list(bad_batches_queue_items.values()))
 #|                     self.api.remove_bad_batches(list(bad_batches_queue_items.keys()))
-#| 
+#|
 #|                 # Second, download regular batches up to threshold
 #|                 if query_batch_queue.qsize() + query_decompress_queue.qsize() + len(query_batch_idx_in_progress) < pending_batches_thr:
 #|                     batch_idx = self._get_next_batch_idx(completed_batches, query_batch_idx_in_progress, batch_idx)
 #|                     batch_fname = self.api.get_query_batch(batch_idx)
-#| 
+#|
 #|                     if batch_fname != None:
 #|                         self.logging.info(f"{log_tag}Downloaded query batch {batch_idx} here: {batch_fname}")
 #|                         query_decompress_queue.put((batch_idx, batch_fname, False))
@@ -19369,7 +19318,7 @@ if __name__ == "__main__":
 #|                 is_fatal=True)
 #|         finally:
 #|             self.logging.info(f"{log_tag}Terminate process")
-#| 
+#|
 #|     def _batch_uploading_process(self, signature_batch_queue: Queue, query_batch_idx_in_progress: ListProxy):
 #|         """
 #|         Function, to be run in a process, that keeps uploading signature
@@ -19378,10 +19327,10 @@ if __name__ == "__main__":
 #|         files need to be decompressed until the shutdown symbol END_OF_QUEUE is
 #|         added to the queue.
 #|         """
-#| 
+#|
 #|         log_tag = "[Webserver._batch_uploading_process] "
 #|         self.logging.info(f"{log_tag}Start process")
-#| 
+#|
 #|         try:
 #|             while True:
 #|                 self.logging.debug(f"{log_tag}Fetching new signature batch from signature_batch_queue.")
@@ -19391,14 +19340,14 @@ if __name__ == "__main__":
 #|                     break
 #|                 batch_idx, batch_fpath = item
 #|                 self.logging.debug(f"{log_tag}Start to upload signature batch {batch_idx} in file {batch_fpath}")
-#| 
+#|
 #|                 metrics = dict()
 #|                 if self.compression:
 #|                     ts_compress_start = time.time()
 #|                     batch_fpath = self._compress_file(batch_fpath)
 #|                     ts_compress_end = time.time()
 #|                     metrics["compress_seconds"] = ts_compress_end - ts_compress_start
-#| 
+#|
 #|                 if not self.api.upload_signature_batch(batch_idx, batch_fpath):
 #|                     self.report_error(f"{log_tag}Failed to upload signature batch {batch_idx}.", do_error_backoff=True)
 #|                     # Try to upload again later
@@ -19425,7 +19374,7 @@ if __name__ == "__main__":
 #|                 is_fatal=True)
 #|         finally:
 #|             self.logging.info(f"{log_tag}Terminate process")
-#| 
+#|
 #|     def _batch_prepare_process(self, unpacked_batches_prefetch_thr: int,
 #|             query_batch_queue: Queue, query_decompress_queue: Queue):
 #|         """
@@ -19435,18 +19384,18 @@ if __name__ == "__main__":
 #|         files ready to be queried. This will keep checking if new files need to be
 #|         decompressed until the shutdown symbol END_OF_QUEUE is added to the queue.
 #|         """
-#| 
+#|
 #|         log_tag = "[Webserver._batch_prepare_process] "
 #|         self.logging.info(f"{log_tag}Start process")
 #|         backoff_time = 1
-#| 
+#|
 #|         try:
 #|             while True:
 #|                 while query_batch_queue.qsize() >= unpacked_batches_prefetch_thr:
 #|                     self.logging.info(f"{log_tag}Waiting to prepare more query batches (currently {query_batch_queue.qsize()} are prepared).")
 #|                     time.sleep(backoff_time)
 #|                     backoff_time = max(2 * backoff_time, MAX_BACKOFF_SEC)
-#| 
+#|
 #|                 backoff_time = 1
 #|                 self.logging.debug(f"{log_tag}Wait for new query batch to decompress/forward.")
 #|                 item = query_decompress_queue.get()
@@ -19455,12 +19404,12 @@ if __name__ == "__main__":
 #|                     break
 #|                 batch_idx, batch_fpath, is_high_priority = item
 #|                 self.logging.debug(f"{log_tag}Decompress/forward batch {batch_idx} in file {batch_fpath}.")
-#| 
+#|
 #|                 if self.compression:
 #|                     self._decompress_file(batch_fpath)
 #|                     batch_fpath, _ = os.path.splitext(batch_fpath)
 #|                     self.logging.info(f"{log_tag}Decompressed signature batch stored in file {batch_fpath}.")
-#| 
+#|
 #|                 if is_high_priority:
 #|                     put_priority(query_batch_queue, [(batch_idx, batch_fpath)])
 #|                 else:
@@ -19473,15 +19422,15 @@ if __name__ == "__main__":
 #|                 is_fatal=True)
 #|         finally:
 #|             self.logging.info(f"{log_tag}Terminate process")
-#| 
+#|
 #|     def run(self, completed_batches: List[int], pending_batches_thr: int,
 #|             unpacked_batches_prefetch_thr: int, query_batch_queue: Queue,
 #|             signature_batch_queue: Queue, query_decompress_queue: Queue,
 #|             query_batch_idx_in_progress: ListProxy):
-#| 
+#|
 #|         log_tag = "[Webserver.run] "
 #|         self.logging.info(f"{log_tag}Starting up webserver processes")
-#| 
+#|
 #|         try:
 #|             processes = [
 #|                 Process(target=self._batch_uploading_process, args=(signature_batch_queue, query_batch_idx_in_progress)),
@@ -19490,14 +19439,14 @@ if __name__ == "__main__":
 #|                 Process(target=self._batch_prepare_process,
 #|                     args=(unpacked_batches_prefetch_thr, query_batch_queue, query_decompress_queue))
 #|             ]
-#| 
+#|
 #|             for process in processes:
 #|                 process.start()
-#| 
+#|
 #|             # These queues cannot be field attributes when the class is forked because
 #|             # they need to be passed as arguments (aka "through inheritance").
 #|             self.queues = [query_batch_queue, query_decompress_queue, signature_batch_queue]
-#| 
+#|
 #|             for process in processes:
 #|                 process.join()
 #|         except KeyboardInterrupt as e:
@@ -19510,268 +19459,30 @@ if __name__ == "__main__":
 #|             for process in processes:
 #|                 process.terminate()
 #|             self.logging.info(f"{log_tag}Shut down webserver")
-#| 
+#|
 #|     def stop(self):
 #|         for queue in self.queues:
 #|             self._terminate_queue(queue)
 
-#@ FILE code/oracles/remote_queries/remote_query_handler/webserver_api.py 644 10965 d3029c326d6ff02ccc9637d1b7e540b7a9aff80730f452709b6c40454ce5ecf2 text
-#| import os
-#| import requests
-#| import shutil
-#| import time
-#| import json
-#| 
-#| from logging import Logger
-#| from typing import Optional, List
-#| 
-#| METADATA_RETRY_PAUSE_SECONDS = 5
-#| 
-#| class WebserverApi:
-#|     """
-#|     This class provides functions to interact with the REST API
-#|     on the webserver to download query batchs, upload signature
-#|     batches, and report statistics and errors.
-#|     """
-#| 
-#|     def __init__(self, work_dir: str, logging: Logger,
-#|                  token: str, api_url: str, compression: bool,
-#|                  do_remote_logging: bool=False):
-#| 
-#|         self.work_dir           = work_dir
-#|         self.logging            = logging
-#|         self.token              = token
-#|         self.api_url            = api_url
-#|         self.compression        = compression
-#|         self.do_remote_logging  = do_remote_logging
-#| 
-#|         self.query_dir  = f"{self.work_dir}/queries"
-#|         self.sig_dir    = f"{self.work_dir}/signatures"
-#| 
-#|         for dir_path in [self.query_dir, self.sig_dir]:
-#|             if not os.path.isdir(dir_path):
-#|                 os.mkdir(dir_path)
-#| 
-#|     def _add_auth_headers(self, headers: dict = {}):
-#|         if self.token != "None" and "Authorization" not in headers:
-#|             headers["Authorization"] = f"Bearer {self.token}"
-#|         return headers
-#| 
-#|     def _get_batch(self, batch_idx: int, get_api: str, dest_fpath: str, metric_name: str):
-#|         try:
-#|             download_start = time.time()
-#|             response = requests.get(get_api, stream=True, headers=self._add_auth_headers())
-#|             download_end = time.time()
-#|             if response.status_code == 200:
-#|                 if self.compression:
-#|                     dest_fpath += ".zst"
-#|                 with open(dest_fpath, "wb") as out_fp:
-#|                     shutil.copyfileobj(response.raw, out_fp)
-#|                     out_fp.flush()
-#|                     os.fsync(out_fp)
-#| 
-#|                 download_seconds = download_end - download_start
-#|                 if "content-length" in response.headers:
-#|                     file_size = int(response.headers["content-length"])
-#|                     bandwidth = file_size / download_seconds
-#|                     self.upload_metrics(batch_idx, metrics={metric_name: bandwidth})
-#|             else:
-#|                 return None
-#|         except requests.exceptions.RequestException as e:
-#|             self.report_error_msg(f"Failed to download query batch {batch_idx} with error:\n{e}")
-#|             return None
-#|         return dest_fpath
-#| 
-#|     def _delete_batch(self, batch_idx: int, delete_api: str):
-#|         try:
-#|             response = requests.post(delete_api, headers=self._add_auth_headers())
-#|             if response.status_code != 200:
-#|                 self.report_error_msg(f"Failed to delete batch {batch_idx} using api call {delete_api} returned status code {response.status_code}")
-#|             return True
-#|         except requests.exceptions.RequestException as e:
-#|             self.report_error_msg(f"Failed to delete batch {batch_idx} using api call {delete_api} with error:\n{e}")
-#|             return False
-#| 
-#|     def _upload_dict(self, upload_api: str, d: dict):
-#|         try:
-#|             self.logging.debug(f"Uploading the following dictionary to {upload_api}:\n{d}")
-#|             response = requests.post(upload_api, json=d, headers=self._add_auth_headers())
-#|             if response.status_code != 200:
-#|                 self.logging.error(f"Uploading dictionary had status code {response.status_code}:\n{response}")
-#|                 return False
-#|         except requests.exceptions.RequestException as e:
-#|             self.logging.error(f"Failed to upload dictionary with error:\n{e}")
-#|             return False
-#|         return True
-#| 
-#|     def get_query_batch(self, batch_idx: int):
-#|         """Fetch query batch with index `batch_idx` from webserver"""
-#| 
-#|         get_api = f"{self.api_url}/queries/{batch_idx}?is_compressed={self.compression}"
-#|         dest_fpath = f"{self.query_dir}/query_batch_{batch_idx}.bin"
-#|         return self._get_batch(batch_idx, get_api, dest_fpath, "query_batch_download_bandwidth")
-#| 
-#|     def get_signature_batch(self, batch_idx: int):
-#|         """Fetch query batch with index `batch_idx` from webserver"""
-#| 
-#|         get_api = f"{self.api_url}/signatures/{batch_idx}?is_compressed={self.compression}"
-#|         dest_fpath = f"{self.query_dir}/signature_batch_{batch_idx}.bin"
-#|         return self._get_batch(batch_idx, get_api, dest_fpath, "signature_batch_download_bandwidth")
-#| 
-#|     def get_metadata(self, blocking=False):
-#|         """Fetch metadata for HSM computation from webserver"""
-#| 
-#|         get_api = f"{self.api_url}/metadata"
-#|         try:
-#|             while True:
-#|                 response = requests.get(get_api, headers=self._add_auth_headers())
-#|                 if response.status_code != 200:
-#|                     if blocking:
-#|                         self.logging.info(f"Metadata not yet available (response status code {response.status_code}).")
-#|                         time.sleep(METADATA_RETRY_PAUSE_SECONDS)
-#|                         continue
-#|                     self.logging.error(f"Failed to download metadata with not 200 response:\n{response}")
-#|                     exit(1)
-#|                 return json.loads(response.text)
-#|         except requests.exceptions.RequestException as e:
-#|             self.logging.error(f"Failed to download metadata with error:\n{e}")
-#|             raise e
-#| 
-#|     def get_bad_batches(self):
-#|         """
-#|         Download the indices of bad batches (query batches for which the signature batch was incomplete)
-#|         for the HSM computation from webserver
-#|         """
-#| 
-#|         get_api = f"{self.api_url}/metadata/badBatches"
-#|         try:
-#|             response = requests.get(get_api, headers=self._add_auth_headers())
-#|             if response.status_code != 200:
-#|                 self.logging.warning(f"Fetching bad batches failed with non-200 response (ignored and continuing): {response}")
-#|                 return []
-#|             d = json.loads(response.text)
-#|             if "bad_batches" not in d:
-#|                 self.logging.warning(f"Unexpected response format missing 'bad_batches' key in {d}")
-#|                 return []
-#|             return d["bad_batches"]
-#|         except requests.exceptions.RequestException as e:
-#|             self.logging.error(f"Failed to download metadata with error:\n{e}")
-#|             raise e
-#| 
-#|     def delete_query_batch(self, batch_idx: int):
-#|         """Delete query batch with index `batch_idx` from webserver"""
-#|         delete_api = f"{self.api_url}/queries/{batch_idx}/delete?is_compressed={self.compression}"
-#|         return self._delete_batch(batch_idx, delete_api)
-#| 
-#|     def delete_signature_batch(self, batch_idx: int):
-#|         """Delete signature batch with index `batch_idx` from webserver"""
-#|         delete_api = f"{self.api_url}/signatures/{batch_idx}/delete?is_compressed={self.compression}"
-#|         return self._delete_batch(batch_idx, delete_api)
-#| 
-#|     def _upload_file(self, url: str, fpath: str):
-#|         try:
-#|             files = {"file": open(fpath, "rb")}
-#|             response = requests.post(url, files=files, headers=self._add_auth_headers())
-#|             if response.status_code != 200:
-#|                 self.logging.error(f"Uploading file {fpath} had status code {response.status_code}:\n{response}")
-#|                 return False
-#|         except requests.exceptions.RequestException as e:
-#|             self.logging.error(f"Failed to upload file {fpath} with error:\n{e}")
-#|             return False
-#|         return True
-#| 
-#|     def _upload_batch(self, url: str, fpath: str, batch_idx: int, metric_name: str):
-#|         transfer_start = time.time()
-#|         if self._upload_file(url, fpath):
-#|             transfer_end = time.time()
-#|             file_size = os.path.getsize(fpath)
-#|             bandwidth = file_size / (transfer_end - transfer_start)
-#|             self.upload_metrics(batch_idx, metrics={metric_name: bandwidth})
-#|             return True
-#|         return False
-#| 
-#|     def upload_query_batch(self, batch_idx: int, query_fpath: str):
-#|         """Upload query batch with index `batch_idx` to webserver"""
-#|         upload_api = f"{self.api_url}/queries/{batch_idx}?is_compressed={self.compression}"
-#|         return self._upload_batch(upload_api, query_fpath, batch_idx, "query_batch_upload_bandwidth")
-#| 
-#|     def upload_signature_batch(self, batch_idx: int, sig_fpath: str):
-#|         """Upload signature batch with index `batch_idx` to webserver"""
-#|         upload_api = f"{self.api_url}/signatures/{batch_idx}?is_compressed={self.compression}"
-#|         return self._upload_batch(upload_api, sig_fpath, batch_idx, "signature_batch_upload_bandwidth")
-#| 
-#|     def upload_metadata(self, label: Optional[str]=None, modulus_byte_size: Optional[int]=None,
-#|                         completed_batches: Optional[List[int]]=None):
-#|         """Upload metadata to webserver"""
-#| 
-#|         metadata = dict()
-#|         if label != None:
-#|             metadata["label"] = label
-#|         if modulus_byte_size != None:
-#|             metadata["modulus_byte_size"] = modulus_byte_size
-#|         if completed_batches != None:
-#|             metadata["completed_batches"] = completed_batches
-#| 
-#|         upload_api = f"{self.api_url}/metadata"
-#|         return self._upload_dict(upload_api, metadata)
-#| 
-#|     def update_metadata(self, additional_completed_batchs: List[int]):
-#|         """Add additional items to the already existing metadata on the webserver"""
-#|         add_api = f"{self.api_url}/metadata/update"
-#|         return self._upload_dict(add_api, {"additonal_completed_batches": additional_completed_batchs})
-#| 
-#|     def report_bad_batches(self, additional_bad_batchs: List[int]):
-#|         """Report more bad batches to the webserver"""
-#|         add_api = f"{self.api_url}/metadata/badBatches"
-#|         return self._upload_dict(add_api, {"bad_batches": additional_bad_batchs})
-#| 
-#|     def remove_bad_batches(self, bad_batchs_to_remove: List[int]):
-#|         """Report more bad batches to the webserver"""
-#|         add_api = f"{self.api_url}/metadata/badBatches/delete"
-#|         return self._upload_dict(add_api, {"bad_batches": bad_batchs_to_remove})
-#| 
-#|     def upload_logs(self, log_fpath: str):
-#|         """Upload log file at path `log_fpath` to webserver"""
-#|         upload_api = f"{self.api_url}/debug/logs"
-#|         return self._upload_file(upload_api, log_fpath)
-#| 
-#|     def report_error_msg(self, msg: str):
-#|         """Report error message with timestamp. If remote logging is enabled,
-#|         then this will be reported to the webserver."""
-#| 
-#|         err_ts = time.strftime('%Y/%m/%d %H:%M:%S')
-#|         if self.do_remote_logging:
-#|             upload_api = f"{self.api_url}/debug/error"
-#|             error = {
-#|                 "msg": msg,
-#|                 "timestamp": err_ts
-#|             }
-#|             return self._upload_dict(upload_api, error)
-#|         else:
-#|             self.logging.error(f"[{err_ts}] {msg}")
-#| 
-#|     def upload_metrics(self, batch_idx: int, metrics: dict):
-#|         """Upload metrics for batch `batch_idx` to webserver"""
-#|         upload_api = f"{self.api_url}/metrics/{batch_idx}"
-#|         return self._upload_dict(upload_api, metrics)
+#@ FILE code/oracles/remote_queries/remote_query_handler/webserver_api.py 644 10965 d3029c326d6ff02ccc9637d1b7e540b7a9aff80730f452709b6c40454ce5ecf2 dup:code/oracles/remote_queries/local_query_handler/webserver_api.py
 
 #@ FILE code/oracles/remote_queries/webserver/hsm-api.nginx 644 370 041186d428d10b71e018c9c1f0e34ad0ac04722b1a8bc84f5883c90d24ca32a1 text
 #| server {
 #|     listen 80;
 #|     listen [::]:80;
-#| 
+#|
 #|     server_name hsm-api.domain.example;
-#| 
+#|
 #|     # Allow large batch sizes
 #|     client_max_body_size 200M;
-#| 
+#|
 #|     location / {
 #|             root /var/www/html/hsm-api;
-#| 
+#|
 #|             if ($http_authorization != "Bearer <TODO: replace>") {
 #|                 return 401;
 #|             }
-#| 
+#|
 #|             proxy_pass http://localhost:6800;
 #|     }
 #| }
@@ -19782,11 +19493,11 @@ if __name__ == "__main__":
 #| # systemctl --user enable hsm_webserver.service
 #| # and start it now with:
 #| # systemctl --user start hsm_webserver.service
-#| 
+#|
 #| [Unit]
 #| Description=HSM query webserver (REST API to download query batches and upload signatures)
 #| After=network.target
-#| 
+#|
 #| [Service]
 #| # XXX: change these following user/group/path as needed.
 #| Type=simple
@@ -19795,7 +19506,7 @@ if __name__ == "__main__":
 #| ExecStart=/home/hsms/venv/bin/gunicorn webserver:app --workers 8 --timeout 120 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:6800
 #| StandardOutput=append:/home/hsms/webserver.log
 #| StandardError=append:/home/hsms/webserver.err
-#| 
+#|
 #| [Install]
 #| WantedBy=default.target
 #| RequiredBy=network.target
@@ -19813,15 +19524,15 @@ if __name__ == "__main__":
 #| import os
 #| import fcntl
 #| import logging
-#| 
+#|
 #| from typing import Optional, List
 #| from fastapi import FastAPI, UploadFile, HTTPException, Response
 #| from pathlib import Path
 #| from pydantic import BaseModel
-#| 
-#| 
+#|
+#|
 #| app = FastAPI()
-#| 
+#|
 #| app_root = Path("/var/www/html/hsm-api")
 #| query_path = app_root / "queries"
 #| sig_path = app_root / "signatures"
@@ -19829,23 +19540,23 @@ if __name__ == "__main__":
 #| metrics_path = app_root / "metrics"
 #| metadata_fpath = app_root / "web_metadata.json"
 #| metadata_bad_batches_fpath = app_root / "bad_batches.json"
-#| 
+#|
 #| def get_batch(batch_fname: str, batch_dir: Path, is_compressed: bool):
 #|     if is_compressed:
 #|         batch_fname += ".zst"
 #|     file_path = batch_dir / batch_fname
-#| 
+#|
 #|     if not file_path.resolve().is_relative_to(batch_dir.resolve()):
 #|         logging.debug(f"get_batch failed because path {file_path} is not relative to batch directory {batch_dir}.")
 #|         raise HTTPException(status_code=400, detail="Batch doesn't exist.")
-#| 
+#|
 #|     if not file_path.exists():
 #|         logging.debug(f"get_batch failed because path {file_path} does not exist.")
 #|         raise HTTPException(status_code=400, detail="Batch doesn't exist.")
-#| 
+#|
 #|     with file_path.open("rb") as fp:
 #|         fcntl.fcntl(fp.fileno(), fcntl.LOCK_EX)
-#| 
+#|
 #|         return Response(
 #|             content=fp.read(),
 #|             media_type="application/octet-stream",
@@ -19853,16 +19564,16 @@ if __name__ == "__main__":
 #|                 "Content-Disposition": f"attachment; filename={batch_fname}"
 #|             }
 #|         )
-#| 
+#|
 #| def put_batch(batch_fname: str, batch_dir: Path, file: UploadFile, is_compressed: bool):
 #|     if is_compressed:
 #|         batch_fname += ".zst"
-#| 
+#|
 #|     if file.filename != batch_fname:
 #|         msg = f"Invalid file name '{file.filename}' instead of '{batch_fname}'"
 #|         logging.error(f"put_batch failed with message: {msg}.")
 #|         raise HTTPException(status_code=400, detail=msg)
-#| 
+#|
 #|     try:
 #|         fpath = batch_dir / file.filename
 #|         with open(fpath, "wb") as fp:
@@ -19875,7 +19586,7 @@ if __name__ == "__main__":
 #|         raise HTTPException(status_code=500, detail="File upload failed.")
 #|     finally:
 #|         file.file.close()
-#| 
+#|
 #| def delete_batch(batch_fname: str, batch_dir: Path, is_compressed: bool):
 #|     try:
 #|         if is_compressed:
@@ -19887,43 +19598,43 @@ if __name__ == "__main__":
 #|     except Exception as e:
 #|         logging.error(f"delete_batch failed with exception: {e}.")
 #|         raise HTTPException(status_code=500, detail="Internal error.")
-#| 
+#|
 #| @app.get("/api/queries/{batch_idx}", status_code=200)
 #| async def get_query_batch(batch_idx: int, is_compressed: bool=False):
 #|     fname = f"query_batch_{batch_idx}.bin"
 #|     return get_batch(fname, query_path, is_compressed)
-#| 
+#|
 #| @app.post("/api/queries/{batch_idx}", status_code=200)
 #| async def put_query_batch(batch_idx: int, file: UploadFile, is_compressed: bool=False):
 #|     fname = f"query_batch_{batch_idx}.bin"
 #|     put_batch(fname, query_path, file, is_compressed)
-#| 
+#|
 #| @app.post("/api/queries/{batch_idx}/delete", status_code=200)
 #| async def delete_query_batch(batch_idx: int, is_compressed: bool=False):
 #|     fname = f"query_batch_{batch_idx}.bin"
 #|     delete_batch(fname, query_path, is_compressed)
-#| 
+#|
 #| @app.get("/api/signatures/{batch_idx}", status_code=200)
 #| async def get_signature_batch(batch_idx: int, is_compressed: bool=False):
 #|     fname = f"signature_batch_{batch_idx}.bin"
 #|     return get_batch(fname, sig_path, is_compressed)
-#| 
+#|
 #| @app.post("/api/signatures/{batch_idx}", status_code=200)
 #| async def put_signature_batch(batch_idx: int, file: UploadFile, is_compressed: bool=False):
 #|     fname = f"signature_batch_{batch_idx}.bin"
 #|     put_batch(fname, sig_path, file, is_compressed)
-#| 
+#|
 #| @app.post("/api/signatures/{batch_idx}/delete", status_code=200)
 #| async def delete_signature_batch(batch_idx: int, is_compressed: bool=False):
 #|     fname = f"signature_batch_{batch_idx}.bin"
 #|     delete_batch(fname, sig_path, is_compressed)
-#| 
+#|
 #| @app.get("/api/metadata", status_code=200)
 #| async def get_metadata():
 #|     if not metadata_fpath.exists():
 #|         logging.error(f"get_metadata failed because file {metadata_fpath} does not exist.")
 #|         raise HTTPException(status_code=404, detail="File not found")
-#| 
+#|
 #|     try:
 #|         with open(metadata_fpath, "r") as fp:
 #|             fcntl.fcntl(fp.fileno(), fcntl.LOCK_EX)
@@ -19931,7 +19642,7 @@ if __name__ == "__main__":
 #|     except Exception as e:
 #|         logging.error(f"get_metadata failed with exception: {e}.")
 #|         raise HTTPException(status_code=500, detail="Internal error.")
-#| 
+#|
 #| @app.get("/api/metadata/badBatches", status_code=200)
 #| async def get_metadata_bad_batches():
 #|     try:
@@ -19943,12 +19654,12 @@ if __name__ == "__main__":
 #|     except Exception as e:
 #|         logging.error(f"get_metadata_bad_batches failed with exception: {e}.")
 #|         raise HTTPException(status_code=500, detail="Internal error.")
-#| 
+#|
 #| class Metadata(BaseModel):
 #|     label: Optional[str] = None
 #|     modulus_byte_size: Optional[int] = None
 #|     completed_batches: Optional[List[int]] = []
-#| 
+#|
 #| @app.post("/api/metadata", status_code=200)
 #| async def post_metadata(metadata: Metadata):
 #|     with open(metadata_fpath, "w") as fp:
@@ -19956,35 +19667,35 @@ if __name__ == "__main__":
 #|         fp.write(metadata.model_dump_json())
 #|         fp.flush()
 #|         os.fsync(fp)
-#| 
+#|
 #| class MetadataUpdate(BaseModel):
 #|     additonal_completed_batches: Optional[List[int]] = []
-#| 
+#|
 #| @app.post("/api/metadata/update", status_code=200)
 #| async def post_metadata_add_completed_batch(update: MetadataUpdate):
 #|     if not metadata_fpath.exists():
 #|         logging.error(f"post_metadata_add_completed_batch failed because file {metadata_fpath} does not exist.")
 #|         raise HTTPException(status_code=500, detail="Update failed")
-#| 
+#|
 #|     with open(metadata_fpath, "r+") as fp:
 #|         fcntl.fcntl(fp.fileno(), fcntl.LOCK_EX)
-#| 
+#|
 #|         metadata = json.load(fp)
 #|         fp.seek(0)
 #|         fp.truncate()
-#| 
+#|
 #|         if "completed_batches" not in metadata:
 #|             logging.error(f"post_metadata_add_completed_batch failed because key 'completed_batches' does not exist in {metadata}.")
 #|             raise HTTPException(status_code=500, detail="Update failed.")
 #|         metadata["completed_batches"] += update.additonal_completed_batches
-#| 
+#|
 #|         json.dump(metadata, fp)
 #|         fp.flush()
 #|         os.fsync(fp)
-#| 
+#|
 #| class MetadataBadBatches(BaseModel):
 #|     bad_batches: List[int] = []
-#| 
+#|
 #| def update_metadata_bad_batches(metadata_bb_to_add: List[int]=[],
 #|                                 metadata_bb_to_remove: List[int]=[]):
 #|     """
@@ -20001,15 +19712,15 @@ if __name__ == "__main__":
 #|         metadata_bb_set = set(json.load(fp)["bad_batches"])
 #|         fp.seek(0)
 #|         fp.truncate()
-#| 
+#|
 #|     metadata_bb_set.update(set(metadata_bb_to_add))
 #|     metadata_bb_set.difference_update(set(metadata_bb_to_remove))
-#| 
+#|
 #|     json.dump({"bad_batches": list(metadata_bb_set)}, fp)
 #|     fp.flush()
 #|     os.fsync(fp)
 #|     fp.close()
-#| 
+#|
 #| @app.post("/api/metadata/badBatches", status_code=200)
 #| async def post_metadata_bad_batches(metadata_bb_update: MetadataBadBatches):
 #|     try:
@@ -20017,7 +19728,7 @@ if __name__ == "__main__":
 #|     except Exception as e:
 #|         logging.error(f"post_metadata_bad_batches failed with exception: {e}.")
 #|         raise HTTPException(status_code=500, detail="Internal error.")
-#| 
+#|
 #| @app.post("/api/metadata/badBatches/delete", status_code=200)
 #| async def post_metadata_delete_bad_batches(metadata_bb_update: MetadataBadBatches):
 #|     try:
@@ -20025,7 +19736,7 @@ if __name__ == "__main__":
 #|     except Exception as e:
 #|         logging.error(f"post_metadata_bad_batches failed with exception: {e}.")
 #|         raise HTTPException(status_code=500, detail="Internal error.")
-#| 
+#|
 #| @app.post("/api/debug/logs", status_code=200)
 #| async def put_debug_logs(file: UploadFile):
 #|     try:
@@ -20040,11 +19751,11 @@ if __name__ == "__main__":
 #|         raise HTTPException(status_code=500, detail="Uploading log file failed.")
 #|     finally:
 #|         file.file.close()
-#| 
+#|
 #| class ErrorMsg(BaseModel):
 #|     msg: str
 #|     timestamp: str
-#| 
+#|
 #| @app.post("/api/debug/error", status_code=200)
 #| async def post_error(error: ErrorMsg):
 #|     fpath = debug_path / "error_messages.txt"
@@ -20053,7 +19764,7 @@ if __name__ == "__main__":
 #|         fp.write(f"[{error.timestamp}]: {error.msg}\n")
 #|         fp.flush()
 #|         os.fsync(fp)
-#| 
+#|
 #| class BatchMetrics(BaseModel):
 #|     avg_signatures_last_1m: Optional[float] = None
 #|     avg_signatures_last_10m: Optional[float] = None
@@ -20067,7 +19778,7 @@ if __name__ == "__main__":
 #|     query_batch_download_bandwidth: Optional[float] = None
 #|     remote_mem_usage_percent: Optional[float] = None
 #|     remote_cpu_usage_percent: Optional[List[float]] = None
-#| 
+#|
 #| @app.post("/api/metrics/{batch_idx}", status_code=200)
 #| async def post_metrics(batch_idx: int, metrics: BatchMetrics):
 #|     fpath = metrics_path / f"metrics_batch_{batch_idx}.json"
@@ -20086,7 +19797,7 @@ if __name__ == "__main__":
 
 #@ FILE code/oracles/sage_oracle.py 644 2644 fd9e37d82aaadc1fec9d41be006a0f007019165252af3b5bea7b049b3caa2172 text
 #| #/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| import argparse
 #| import json
@@ -20097,20 +19808,20 @@ if __name__ == "__main__":
 #| from time import time
 #| from datetime import datetime
 #| from misc_tools import fast_json_dump
-#| 
-#| 
+#|
+#|
 #| def fast_union(s1, s2):
 #|     s1.update(s2)
 #|     return s1
-#| 
+#|
 #| def timestamp(ts=None):
 #|     if not ts:
 #|         ts = time()
 #|     return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-#| 
+#|
 #| def timeprint(*args):
 #|     print(f"{timestamp()}:", *args)
-#| 
+#|
 #| def query_worker(d, N, lines):
 #|     rdict = dict()
 #|     for line in lines:
@@ -20118,7 +19829,7 @@ if __name__ == "__main__":
 #|         ad = a.powermod(d, N)
 #|         rdict[str(a)] = str(ad)
 #|     return rdict
-#| 
+#|
 #| if __name__=='__main__':
 #|     parser = argparse.ArgumentParser(prog='oracle.py',description='eth root computation')
 #|     parser.add_argument('-d', '--d', dest='d', required=True)
@@ -20128,36 +19839,36 @@ if __name__ == "__main__":
 #|     parser.add_argument('--mpi', action='store_true')
 #|     parser.add_argument('--thr', type=int, default=cpu_count())
 #|     args = parser.parse_args()
-#| 
+#|
 #|     d = Integer(args.d)
 #|     N = Integer(args.N)
-#| 
+#|
 #|     with open(args.infile) as infile:
 #|         lines = infile.readlines()
-#| 
+#|
 #|     nlines = len(lines)
 #|     proccount = args.thr
 #|     batch_size = ceil(nlines / proccount)
-#| 
+#|
 #|     # XXX: deactivated because, for some reason, this doesn't work consistently.
 #|     if False:
 #|     # if args.mpi:
 #|         from mpi4py.futures import MPIPoolExecutor
-#| 
+#|
 #|         with MPIPoolExecutor(max_workers=proccount) as executor:
 #|             timeprint(f"Running sage oracle on {proccount} workers with MPI (WARNING: doesn't seem to be fully stable and throws PMIX_ERROR error; but seems to work correctly despite the PMIX_ERROR error, if it terminates).")
 #|             rdict_futures = [executor.submit(query_worker, d, N, lines[i * batch_size : (i+1) * batch_size]) for i in range(proccount)]
 #|     else:
 #|         from concurrent.futures import ProcessPoolExecutor
 #|         from concurrent.futures import wait as concurrent_wait
-#| 
+#|
 #|         with ProcessPoolExecutor(max_workers=proccount) as executor:
 #|             timeprint(f"Running sage oracle on {proccount} threads on single machine.")
 #|             rdict_futures = [executor.submit(query_worker, d, N, lines[i * batch_size : (i+1) * batch_size]) for i in range(proccount)]
 #|             concurrent_wait(rdict_futures)
-#| 
+#|
 #|     timeprint("Finished oracle queries")
-#| 
+#|
 #|     rdict = reduce(fast_union, [future.result() for future in rdict_futures], {})
 #|     fast_json_dump(rdict, args.outfile)
 
@@ -20181,7 +19892,7 @@ if __name__ == "__main__":
 #| # prime. We'll do higher dimensional rational reconstruction.
 #| #
 #| #
-#| 
+#|
 #| from sage.functions.other import factorial
 #| from sage.rings.infinity import infinity
 #| from sage.arith.misc import primes
@@ -20194,8 +19905,8 @@ if __name__ == "__main__":
 #| from sage.arith.misc import inverse_mod, power_mod
 #| from timing import *
 #| from candy import major_message
-#| 
-#| 
+#|
+#|
 #| def find_inert_prime(f, TTplus=[], TTminus=[], avoid=set()):
 #|     for i, p in enumerate(primes(2, infinity)):
 #|         if i > 2 * factorial(f.degree()):
@@ -20216,8 +19927,8 @@ if __name__ == "__main__":
 #|         if prod([(a-b*Fpn.gen())**k for (a,b),k in TTminus]) == 0:
 #|             continue
 #|         return p
-#| 
-#| 
+#|
+#|
 #| def reconstruct_as_short_polynomial_fraction(z):
 #|     """
 #|     Given z an element of a modular quotient ring (with a certain
@@ -20225,7 +19936,7 @@ if __name__ == "__main__":
 #|     degree), return a univariate integer rational fration that is
 #|     equivalent to z, but with short coefficients
 #|     """
-#| 
+#|
 #|     Zpkn = z.parent()
 #|     n = Zpkn.degree()
 #|     pk = Zpkn.characteristic()
@@ -20248,15 +19959,15 @@ if __name__ == "__main__":
 #|     # an ever so slightly bit, but this is totally negligible anyways.
 #|     score = max([1+c.ndigits(2) for c in rn.list() + rd.list()])
 #|     return rn/rd, score
-#| 
-#| 
+#|
+#|
 #| def padic_root_of_algebraic_product(TTplus, TTminus, f, p, e,
 #|                                     pre_multiply_root=None, pre_multiply_gamma_fac=None):
 #|     """
 #|     This is the main part of the root computation
-#| 
+#|
 #|     The main use case is root_fragment==None
-#| 
+#|
 #|     given TTplus and TTminus as lists of pairs ((a,b),k), compute the
 #|     e-th root of the product y/z in the number field
 #|     defined by f, where y is the product of the (a-b*alpha)^k in TTplus,
@@ -20264,17 +19975,17 @@ if __name__ == "__main__":
 #|     done modulo increasing powers of the inert prime p (at step i we work
 #|     modulo p^(2^i)), and we stop when we have found a rational fraction
 #|     that is apparently valid over Z.
-#| 
+#|
 #|     Note that this algorithm will only terminate if the solution indeed
 #|     exists over Z, which is not something we check!
-#| 
+#|
 #|     If pre_multiply_root is given, it's the inverse a part of the root
 #|     that we already know, and we incorporate it in the computation (given
 #|     as a univariate rational fraction over the integers). That is, we
 #|     compute an e-th root of y/z*pre_multiply_root**e
 #|     """
 #|     ZP = ZZ['x']
-#| 
+#|
 #|     d = f.degree()
 #|     # Ri is (Z/p^(2^i))[x]/f(x)
 #|     R0 = GF(p**(f.degree()), 'alpha_p', modulus=f)
@@ -20286,18 +19997,18 @@ if __name__ == "__main__":
 #|     rf0 = 1
 #|     if pre_multiply_root is not None:
 #|         rf0 = pre_multiply_root.change_ring(R0)(alpha0)
-#| 
+#|
 #|     if pre_multiply_gamma_fac is not None:
 #|         for fac in pre_multiply_gamma_fac:
 #|             nf_elt = fac[0]
 #|             exp = fac[1]
 #|             poly_alpha0 = nf_elt.polynomial().change_ring(R0)(alpha0)
 #|             rf0 *= (1/(poly_alpha0**exp))       # whole product is 1/gamma
-#| 
+#|
 #|     r0 = (z0 / y0 / rf0**e).nth_root(e)
-#| 
+#|
 #|     y,z,u,r,R,pk,i,rf = y0,z0,u0,r0,R0,p,0,rf0
-#| 
+#|
 #|     magic = 0
 #|     while True:
 #|         # invariants:
@@ -20309,15 +20020,15 @@ if __name__ == "__main__":
 #|         assert r in R
 #|         assert u * z == 1
 #|         assert r**e * y * rf**e * u == 1
-#| 
+#|
 #|         i += 1
 #|         pk = pk * pk
 #|         R = Integers(pk).extension(f)
-#| 
+#|
 #|         r = ZP(r.list())(R.gen())
 #|         # lift the preinverse of z, too.
 #|         u = ZP(u.list())(R.gen())
-#| 
+#|
 #|         # Newton step
 #|         # We need to recompute the thing we're computing an e-th root
 #|         # for, at larger precision. It smells like a waste of time, but
@@ -20327,35 +20038,35 @@ if __name__ == "__main__":
 #|         # need to keep track of various things to make it work.
 #|         y = prod([(a-b*R.gen())**k for (a,b),k in TTplus])
 #|         z = prod([(a-b*R.gen())**k for (a,b),k in TTminus])
-#| 
+#|
 #|         # if u*z = 1+pb, then the higher order inverse of z is u*(1-pb)
 #|         # IOW, a Newton step on u: u becomes u*(1-(u*z-1))
 #|         u = u * (1 - (u * z - 1))
-#| 
+#|
 #|         rf = 1
 #|         if pre_multiply_root is not None:
 #|             rf = pre_multiply_root.change_ring(R)(R.gen())
-#| 
+#|
 #|         if pre_multiply_gamma_fac is not None:
 #|             for fac in pre_multiply_gamma_fac:
 #|                 nf_elt = fac[0]
 #|                 exp = fac[1]
 #|                 poly_R_gen = nf_elt.polynomial().change_ring(R)(R.gen())
 #|                 rf *= (1/(poly_R_gen**exp))     # whole product is 1/gamma
-#| 
+#|
 #|         # This is the Newton iteration on the function f(x) = y/z - x^-e
 #|         r += r * (1 - r**e * rf**e * y * u) / e
-#| 
+#|
 #|         fractional, score = reconstruct_as_short_polynomial_fraction(r)
-#| 
+#|
 #|         magic = 2 * d * max(pk.ndigits(2)//2-score, 0)
 #|         timeprint(f"Lifting modulo {p}^(2^{i}): {magic} magic zeros")
-#| 
+#|
 #|         if magic > 100:
 #|             # remember that we have computed the _inverse_ of the e-th
 #|             # root.
 #|             return 1/fractional
-#| 
+#|
 #| @timing
 #| def padic_eth_root(params,
 #|                    linalg_output,
@@ -20367,27 +20078,27 @@ if __name__ == "__main__":
 #|     m = params.poly.m
 #|     f = params.poly.f[1]
 #|     ZN = Integers(N)
-#| 
+#|
 #|     # centered lifts are better because we reach the solution way
 #|     # earlier.
 #|     if lift_centered:
 #|         sol = linalg_output.sol.lift_centered()
 #|     else:
 #|         sol = linalg_output.sol.lift()
-#| 
+#|
 #|     TT = [(linalg_output.row_to_aquery[i],s) for i,s in enumerate(sol)]
 #|     TT += list(linalg_output.ST_list.items())
-#| 
+#|
 #|     TTplus  = [((a,b),k)  for (a,b),k in TT if k>0]
 #|     TTminus = [((a,b),-k) for (a,b),k in TT if k<0]
-#| 
+#|
 #|     SU_m = prod([ZN(a-b*m)**k for (a,b),k in TT])
-#| 
+#|
 #|     p = find_inert_prime(f, TTplus, TTminus, avoid=set([e]))
 #|     print(f"Beginning e-th root computation mod powers of {p}")
 #|     print(f"  TTplus has {len(TTplus)} pairs")
 #|     print(f"  TTminus has {len(TTminus)} pairs")
-#| 
+#|
 #|     if pre_multiply_gamma_fac is not None:
 #|         major_message("Using the saved gamma-fac object...")
 #|         r = padic_root_of_algebraic_product(TTplus, TTminus,
@@ -20399,33 +20110,33 @@ if __name__ == "__main__":
 #|             poly_m = nf_elt.polynomial().change_ring(ZN)(m)
 #|             #poly_m_inv = inverse_mod(poly_m, N)
 #|             SU_m *= ZN(poly_m)**(-e*exp)
-#| 
+#|
 #|         assert r(ZN(m))**e == SU_m
 #|         return r
-#| 
+#|
 #|     # usual case
 #|     r = padic_root_of_algebraic_product(TTplus, TTminus,
 #|                                         f, p, e,
 #|                                         pre_multiply_root=pre_multiply_root)
-#| 
+#|
 #|     if pre_multiply_root is not None:
 #|         SU_m *= pre_multiply_root.change_ring(ZN)(m)**e
-#| 
+#|
 #|     assert r(ZN(m))**e == SU_m
-#| 
+#|
 #|     return r
 
 #@ FILE code/partial_R.py 644 8081 bb2c4a37a3a02a92d1ba2573c138e1a408f7f6846741b946d0cb704c97594969 text
 #| import sys
 #| import os
 #| from sage.all import *
-#| 
+#|
 #| # This class has the relevant renumber information for our 1024-bit computation,
 #| # specifically for this one descent.
 #| # All the functions here should allow us to call construct_S.
-#| 
+#|
 #| class PartialRenumber1024(object):
-#| 
+#|
 #|     def __init__(self, polynomial):
 #|         self._number_of_rational_queries_36 = 2874398515
 #|         self._number_of_fb_valuations_31 = 105113360
@@ -20439,53 +20150,53 @@ if __name__ == "__main__":
 #|         self._easy_p_r_to_renum = dict()
 #|         self._ideals = dict()   # similar to usual R. dict rather than list. side 1 only. no J.
 #|         self.poly = polynomial
-#| 
+#|
 #|     def number_of_rational_queries(self):
 #|         return self._number_of_rational_queries_36
-#| 
+#|
 #|     def number_of_fb_valuations(self, given_boundA):
 #|         assert given_boundA == 2**31 or given_boundA == 2**35
 #|         if given_boundA == 2**31:
 #|             return self._number_of_fb_valuations_31
 #|         else:
 #|             return self._number_of_fb_valuations_35
-#| 
+#|
 #|     def renumber_to_rational_prime_index(self, index):
 #|         if index not in self._renumber_to_rational_prime_index:
 #|             print(f"WARNING: index={index} not in renumber_to_rational_prime_index.")
 #|             raise KeyError
 #|         return self._renumber_to_rational_prime_index[index]
-#| 
+#|
 #|     def rational_prime_to_prime_index(self, prime):
 #|         if prime not in self._rational_prime_to_prime_index:
 #|             print(f"WARNING: prime={prime} not in rational_prime_to_prime_index.")
 #|             raise KeyError
 #|         return self._rational_prime_to_prime_index[prime]
-#| 
+#|
 #|     def rational_prime_index_to_prime(self, index):
 #|         if index not in self._rational_prime_index_to_prime:
 #|             print(f"WARNING: index={index} not in rational_prime_index_to_prime.")
 #|             raise KeyError
 #|         return self._rational_prime_index_to_prime[index]
-#| 
+#|
 #|     def renumber_to_column(self, index):
 #|         if index not in self._renumber_to_column:
 #|             return -1
 #|         return self._renumber_to_column[index]
-#| 
+#|
 #|     def column_to_renumber(self, col_index):
 #|         if col_index not in self._column_to_renumber:
 #|             print(f"WARNING: col_index={col_index} not in column_to_renumber.")
 #|             raise KeyError
 #|         return self._column_to_renumber[col_index]
-#| 
+#|
 #|     def column_to_sage_ideal(self, col_index, side_hint=None):
 #|         # Needed for run_S_sanity_checks
 #|         if col_index not in self._column_to_sage_ideal:
 #|             print(f"WARNING: col_index={col_index} not in column_to_sage_ideal.")
 #|             raise KeyError
 #|         return self._column_to_sage_ideal[col_index]
-#| 
+#|
 #|     def side_and_index_to_ideal(self, side, side_restricted_index):
 #|         # could be defined for side 0 if needed
 #|         assert side == 1
@@ -20494,7 +20205,7 @@ if __name__ == "__main__":
 #|             raise KeyError
 #|         I = self._ideals[side_restricted_index]
 #|         return side, *I
-#| 
+#|
 #|     def easy_p_r_to_renum(self, side, p, r):
 #|         # return the decimal renumber index for this (p,r) ideal
 #|         # this is ONLY called on 'easy' extension ideals
@@ -20505,28 +20216,28 @@ if __name__ == "__main__":
 #|             print(f"WARNING: entry=({side},{p},{r}) not in easy_p_r_to_renum.")
 #|             raise KeyError
 #|         return self._easy_p_r_to_renum[(side,p,r)]
-#| 
+#|
 #|     def load(self, filename):
 #|         # lines in filename look like
 #|         # <renumber index> <side-restricted index> <the entire line from renumber.explained>
 #|         with open(filename, 'r') as infile:
 #|             for line in infile:
 #|                 line = line.strip()
-#| 
+#|
 #|                 renum_index_str, side_restricted_index_str, parser, *data = line.split()
 #|                 renum_index = int(renum_index_str)
 #|                 side_restricted_index = int(side_restricted_index_str)
-#| 
+#|
 #|                 assert parser in ['J', 'rat', 'proj', 'easy', 'generic']
 #|                 assert side_restricted_index <= renum_index
-#| 
+#|
 #|                 if parser == 'J':
 #|                     assert renum_index == 0
 #|                     assert side_restricted_index == 0
 #|                     self._renumber_to_column[renum_index] = side_restricted_index
 #|                     self._column_to_renumber[side_restricted_index] = renum_index
 #|                     self._column_to_sage_ideal[side_restricted_index] = self.poly.nt.J()[1]
-#| 
+#|
 #|                 elif parser == 'rat':
 #|                     side, rat_prime = data
 #|                     side = int(side)
@@ -20535,7 +20246,7 @@ if __name__ == "__main__":
 #|                     self._renumber_to_rational_prime_index[renum_index] = side_restricted_index
 #|                     self._rational_prime_to_prime_index[rat_prime] = side_restricted_index
 #|                     self._rational_prime_index_to_prime[side_restricted_index] = rat_prime
-#| 
+#|
 #|                 elif parser == 'proj':
 #|                     side, p = data
 #|                     side = int(side)
@@ -20543,12 +20254,12 @@ if __name__ == "__main__":
 #|                     p = ZZ(p)
 #|                     OK = self.poly.nt.maximal_orders()
 #|                     I = OK[side].fractional_ideal(p) + self.poly.nt.J()[side]
-#| 
+#|
 #|                     self._renumber_to_column[renum_index] = side_restricted_index
 #|                     self._column_to_renumber[side_restricted_index] = renum_index
 #|                     self._column_to_sage_ideal[side_restricted_index] = I
 #|                     self._ideals[side_restricted_index] = (p,p)
-#| 
+#|
 #|                 elif parser == 'easy':
 #|                     side, p, r = data
 #|                     side = int(side)
@@ -20559,13 +20270,13 @@ if __name__ == "__main__":
 #|                     K = self.poly.K
 #|                     J = self.poly.nt.J()
 #|                     I = OK[side].fractional_ideal(p, K[side].gen() - r) * J[side]
-#| 
+#|
 #|                     self._renumber_to_column[renum_index] = side_restricted_index
 #|                     self._column_to_renumber[side_restricted_index] = renum_index
 #|                     self._column_to_sage_ideal[side_restricted_index] = I
 #|                     self._ideals[side_restricted_index] = (p,r)
 #|                     self._easy_p_r_to_renum[(side,p,r)] = renum_index
-#| 
+#|
 #|                 elif parser == 'generic':
 #|                     side, p, denom, *coeffs = data
 #|                     side = int(side)
@@ -20575,19 +20286,19 @@ if __name__ == "__main__":
 #|                     OK = self.poly.nt.maximal_orders()
 #|                     K = self.poly.K
 #|                     J = self.poly.nt.J()
-#| 
+#|
 #|                     try:
 #|                         theta = K[side]([ZZ(c) for c in coeffs]) / denom
 #|                     except Exception as e:
 #|                         print(side, p, denom, coeffs)
 #|                         raise e
-#| 
+#|
 #|                     I = OK[side].fractional_ideal(p, theta)
 #|                     self._renumber_to_column[renum_index] = side_restricted_index
 #|                     self._column_to_renumber[side_restricted_index] = renum_index
 #|                     self._column_to_sage_ideal[side_restricted_index] = I
 #|                     self._ideals[side_restricted_index] = (p,theta)
-#| 
+#|
 #|     def do_sanity_checks(self):
 #|         assert self.renumber_to_column(0) == 0
 #|         assert self.column_to_renumber(0) == 0
@@ -20603,13 +20314,13 @@ if __name__ == "__main__":
 #| import sys
 #| import os
 #| import time
-#| 
+#|
 #| if __name__=='__main__':
-#| 
+#|
 #|     time0 = time.time()
-#| 
+#|
 #|     DESC_FILE = 'n1024/desc/seed1774555967/desc.total.rels.CHKPT.714'
-#| 
+#|
 #|     uv_primes = [
 #|         2,
 #|         2,
@@ -20643,40 +20354,40 @@ if __name__ == "__main__":
 #|         570917114759400722614787,
 #|         628050395217726952177507
 #|     ]
-#| 
+#|
 #|     desc_primes = set()
 #|     # technically, just the norm. it doesn't matter too much
 #|     # if we load some extras in there.
-#| 
+#|
 #|     for jj in uv_primes:
 #|         if jj < 2**36:
 #|             desc_primes.add(jj)
-#| 
+#|
 #|     with open(DESC_FILE, 'r') as descfile:
 #|         for line in descfile:
 #|             if line.startswith('#'):
 #|                 continue
-#| 
+#|
 #|             if 'Taken' in line:
 #|                 relation_str = line.strip().split(" ")[1]
 #|                 rat_str = relation_str.split(":")[1]
 #|                 alg_str = relation_str.split(":")[2]
-#| 
+#|
 #|                 for rat_fac in rat_str.split(","):
 #|                     rat_prime = int(rat_fac, 16)
 #|                     if rat_prime < 2**36:
 #|                         desc_primes.add(rat_prime)
-#| 
+#|
 #|                 for alg_fac in alg_str.split(","):
 #|                     alg_prime = int(alg_fac, 16)
 #|                     if alg_prime < 2**35:
 #|                         desc_primes.add(alg_prime)
-#| 
+#|
 #|     print(f"Encountered {len(desc_primes)} primes in the descent output.")
-#| 
+#|
 #|     RENUMBER_INFO_FILE = 'n1024/renumber.explained'
 #|     PARTIAL_RENUMBER_FILE = 'n1024/partial.renumber.map'
-#| 
+#|
 #|     # We have a few constants to save:
 #|     #   number_of_rational_queries, number_of_fb_valuations
 #|     # Plus mappings between:
@@ -20692,69 +20403,69 @@ if __name__ == "__main__":
 #|     #
 #|     # This file will contain the following info:
 #|     # <renumber index> <side-restricted index> <the entire line from renumber.explained>
-#| 
+#|
 #|     writing_file = open(PARTIAL_RENUMBER_FILE, 'w')
 #|     current_renumber_index = 0
 #|     current_column = 0
 #|     current_rational_prime_index = 0
-#| 
+#|
 #|     num_alg_primes_upto_31 = -1
-#| 
+#|
 #|     with open(RENUMBER_INFO_FILE, 'r') as reading_file:
 #|         for line in reading_file:
 #|             if line.startswith('#'):
 #|                 continue
-#| 
+#|
 #|             line = line.strip()
 #|             #renum_index_str = line.split()[0]
 #|             #assert renum_index_str[0:4] == 'i=0x'
 #|             #renum_index = int(renum_index_str[4:], 16)
 #|             #assert renum_index == current_renumber_index
-#| 
+#|
 #|             parser, *data = line.split()
-#| 
+#|
 #|             if parser == 'J':
 #|                 # definitely include J
 #|                 writing_file.write(f'{current_renumber_index} {current_column} {line}\n')
 #|                 current_column += 1
-#| 
+#|
 #|             elif parser == 'rat':
 #|                 side, p_str = data
 #|                 assert int(side) == 0
 #|                 this_prime = int(p_str)
-#| 
+#|
 #|                 if this_prime in desc_primes:
 #|                     writing_file.write(
 #|                         f'{current_renumber_index} {current_rational_prime_index} {line}\n'
 #|                     )
-#| 
+#|
 #|                 current_rational_prime_index += 1
-#| 
+#|
 #|             else:
 #|                 assert parser in ['easy', 'proj', 'generic']
 #|                 side_str = line.split()[1]
 #|                 assert side_str == '1'
 #|                 p_str = line.split()[2]
 #|                 this_prime = int(p_str)
-#| 
+#|
 #|                 if this_prime in desc_primes:
 #|                     writing_file.write(f'{current_renumber_index} {current_column} {line}\n')
-#| 
+#|
 #|                 current_column += 1
-#| 
+#|
 #|                 if num_alg_primes_upto_31 == -1 and this_prime > 2**31:
 #|                     num_alg_primes_upto_31 = current_column
-#| 
+#|
 #|             current_renumber_index += 1
-#| 
+#|
 #|     writing_file.close()
-#| 
+#|
 #|     total_num_rational_primes = current_rational_prime_index
 #|     total_num_alg_primes = current_column
-#| 
+#|
 #|     time1 = time.time()
 #|     print(f"Took time: {time1-time0}")
-#| 
+#|
 #|     print(f"num_alg_primes_upto_31: {num_alg_primes_upto_31}")
 #|     print(f"total_num_rational_primes: {total_num_rational_primes}")
 #|     print(f"total_num_alg_primes: {total_num_alg_primes}")
@@ -20765,21 +20476,21 @@ if __name__ == "__main__":
 #| import argparse
 #| import json
 #| from cado_nfs_binaries import CadoNFS, CadoNFSBinaries
-#| 
+#|
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='poly_ropt_helper.py')
 #|     topparser.add_argument('--params',dest='params')
 #|     topparser.add_argument('--infile',dest='infile')
 #|     topparser.add_argument('--outfile',dest='outfile')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     # Doing horrible things to fake the params object from a json exportable object
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #|     output = CadoNFS("polyselect/polyselect_ropt",
 #|                      "-t",params.polyselect_nthreads_or_auto,
 #|                      "-inputpolys",topargs.infile,
@@ -20788,7 +20499,7 @@ if __name__ == "__main__":
 #|                      "-Bg",params.parameters['poly.Bg'],
 #|                      "-ropteffort",params.parameters.get('poly.ropteffort',5),
 #|                      capture=True)
-#| 
+#|
 #|     with open(topargs.outfile,"w") as outfile:
 #|         outfile.write(output.decode('utf-8'))
 
@@ -20798,10 +20509,10 @@ if __name__ == "__main__":
 #| import argparse
 #| import json
 #| from cado_nfs_binaries import CadoNFS, CadoNFSBinaries
-#| 
+#|
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='polyselect_helper.py')
 #|     topparser.add_argument('--params',dest='params')
@@ -20809,11 +20520,11 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--admax',dest='admax')
 #|     topparser.add_argument('--outfile',dest='outfile')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     # Doing horrible things to fake the params object from a json exportable object
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #|     output = CadoNFS("polyselect/polyselect",
 #|                      "-P", params.parameters['poly.P'],
 #|                      "-N", params.parameters['N'],
@@ -20825,7 +20536,7 @@ if __name__ == "__main__":
 #|                      "-nq", params.parameters['poly.nq'],
 #|                      "-keep", params.parameters['poly.keep'],
 #|                      capture=True)
-#| 
+#|
 #|     firstline = True
 #|     lines = iter(output.decode('utf-8').split("\n"))
 #|     with open(topargs.outfile, "w") as f:
@@ -20840,10 +20551,10 @@ if __name__ == "__main__":
 #@ FILE code/random_access_renumber.py 644 11281 ed0fb2025cb27c92d735ea2d5fc799d9c7cae371be7697022008be8b6ff14b5a text
 #| from os.path import dirname
 #| import struct
-#| 
+#|
 #| from sage.all import ZZ
 #| from cado_sage import CadoPolyFile
-#| 
+#|
 #| """
 #| Time/space tradeoff by not loading the whole renumber table into RAM and instead reading entries from disk as needed.
 #| Run this before the montgomery root step: sage random_access_renumber.py input-file
@@ -20851,7 +20562,7 @@ if __name__ == "__main__":
 #| 	and output is written to e.g. data/n256/renumber.explained.toc, data/n256/renumber_to_column, and data/n256/column_to_renumber
 #| Then run the root step wiht --montgomery-new-renumber
 #| """
-#| 
+#|
 #| class RandomAccessRenumberTable:
 #|     # Need for montgomery:
 #|     #   renumber_to_column # we can get rid of this if we make ST_alg_vector use renumber indices instead of columns
@@ -20870,7 +20581,7 @@ if __name__ == "__main__":
 #|         Maintains some open file descriptors, so be sure to call close() when finished, or use in a with block. ("with RandomAccessRenumberTable(explain_renumber_filename, polyfile) as R:")
 #|         To create the necessary files from an existing explain_renumber file, use RandomAccessRenumberTable.create(...)
 #|         polyfile can either be a CadoPolyFile or a path to a polyfile (which will then be loaded, taking possibly a tenth of a second or so)
-#| 
+#|
 #|         A single RandomAccessRenumberTable instance can't safely be used in multiple threads, but it's safe for each thread to make its own instance pointing at the same files.
 #|         """
 #|         # The explain renumber file is structured like this:
@@ -20892,7 +20603,7 @@ if __name__ == "__main__":
 #|             self.poly.read()
 #|         else:
 #|             self.poly = polyfile
-#| 
+#|
 #|     def close(self):
 #|         self.explainfile.close()
 #|         self.tocfile.close()
@@ -20902,27 +20613,27 @@ if __name__ == "__main__":
 #|         return self
 #|     def __exit__(self, *args, **kwargs):
 #|         self.close()
-#| 
+#|
 #|     @staticmethod
 #|     def create(explain_renumber_filename, tocfilename=None, c2rfilename=None, r2cfilename=None):
 #|         """
 #|         Create the tocfile, c2r, and r2c files from a given explain_renumber file.
 #|         Each of these files will likely be almost the size of the explain_renumber table, but will support random access.
-#| 
-#|         Format of the tocfile: 
+#|
+#$         Format of the tocfile: $
 #|         first uint64: number of algebraic columns
 #|         bytes 8n+8 to 8n+16 (for n >= 0): uint64le byte-offset in explain_renumber file of ideal with renumber index n
-#| 
+#|
 #|         Format of c2rfile:
 #|         bytes 8n to 8n+8 (for n >=0): uint64le renumber index for column number n
-#| 
+#|
 #|         Format of r2cfile:
 #|         bytes 8n to 8n+8 (for n >=0): (signed) int64le column number for renumber index n, or -1 (0xffffffffffffffff) if that renumber index is not on side 1 (and thus has no column number)
 #|         """
 #|         if not tocfilename: tocfilename = explain_renumber_filename + ".toc"
 #|         if not c2rfilename: c2rfilename = dirname(explain_renumber_filename) + "/column_to_renumber"
 #|         if not r2cfilename: r2cfilename = dirname(explain_renumber_filename)  + "/renumber_to_column"
-#| 
+#|
 #|         cur_idx = 0
 #|         cur_side1_idx = 0
 #|         cur_byteoffset = 0
@@ -20935,17 +20646,17 @@ if __name__ == "__main__":
 #|                             if line[0] == 35: # 35 = ord('#'). This is almost twice as fast as line.startswith(b"#")
 #|                                 cur_byteoffset = explain_file.tell()
 #|                                 continue
-#| 
+#|
 #|                             parser, *data = line.split()
 #|                             if parser == b"J" and len(data) > 1:
 #|                                 # merged J
 #|                                 side = tuple(int(s) for s in data)
 #|                             else:
 #|                                 side = int(data[0])
-#| 
+#|
 #|                             # renumber index (cur_idx) is at byte offset (cur_byteoffset)
 #|                             toc_file.write(struct.pack("<Q", cur_byteoffset))
-#| 
+#|
 #|                             if side == 1 or (isinstance(side, tuple) and 1 in side):
 #|                                 # column (cur_side1_idx) is renumber index (cur_idx)
 #|                                 c2r_file.write(struct.pack("<Q", cur_idx))
@@ -20958,62 +20669,62 @@ if __name__ == "__main__":
 #|                 # Write the number of algebraic columns to bytes 0-8 of the toc
 #|                 toc_file.seek(0)
 #|                 toc_file.write(struct.pack("<Q", cur_side1_idx))
-#| 
+#|
 #|     def number_of_algebraic_columns(self):
 #|         if self.num_columns is None:
 #|             self.tocfile.seek(0)
 #|             buf = self.tocfile.read(8)
 #|             self.num_columns = struct.unpack("<Q", buf)[0]
 #|         return self.num_columns
-#| 
+#|
 #|     def renumber_to_offset(self, index):
 #|         self.tocfile.seek(index * 8 + 8)
 #|         offset = self.tocfile.read(8)
 #|         return struct.unpack("<Q", offset)[0]
-#| 
+#|
 #|     def renumber_to_ideal(self, index):
 #|         offset = self.renumber_to_offset(index)
 #|         self.explainfile.seek(offset)
 #|         parser, side, I = parse_ideal(self.explainfile.readline(), self.poly)
 #|         return side, *I
-#| 
+#|
 #|     def renumber_to_sage_ideal(self, index):
 #|         offset = self.renumber_to_offset(index)
 #|         self.explainfile.seek(offset)
 #|         parser, side, I = parse_ideal(self.explainfile.readline(), self.poly)
 #|         return renumber_ideal_to_sage_ideal(parser, side, I, self.poly)
-#| 
+#|
 #|     def column_to_renumber(self, col):
 #|         self.c2rfile.seek(col * 8)
 #|         buf = self.c2rfile.read(8)
 #|         return struct.unpack("<Q", buf)[0]
-#| 
+#|
 #|     def renumber_to_column(self, index):
 #|         self.r2cfile.seek(index * 8)
 #|         buf = self.r2cfile.read(8)
 #|         return struct.unpack("<q", buf)[0]
-#| 
+#|
 #|     def column_to_ideal(self, col):
 #|         return self.renumber_to_ideal(self.column_to_renumber(col))
-#| 
+#|
 #|     def column_to_sage_ideal(self, col):
 #|         return self.renumber_to_sage_ideal(self.column_to_renumber(col))
-#| 
+#|
 #|     def side_and_index_to_ideal(self, side, i):
 #|         # We only ever use this with side=1, which is the same as column_to_ideal.
 #|         if side != 1: raise NotImplementedError("side_and_index_to_ideal only implemented for side 1")
 #|         return self.column_to_ideal(i)
-#| 
-#| 
+#|
+#|
 #| def parse_ideal(line, poly):
 #|     """
 #|     Parse a (non-comment) line of the explain renumber file. Adapted from CadoExplainRenumberFile.read() in helpers.py
 #|     Return (parser, side, I)
-#| 
+#|
 #|     line must be a bytes object, not a string
 #|     """
 #|     parser, *data = line.split()
-#| 
+#|
 #|     if parser == b'J':
 #|         # the "data" field is actually a bit of a lie, b
 #|         has_merged_J = len(data) > 1
@@ -21055,12 +20766,12 @@ if __name__ == "__main__":
 #|             raise e
 #|         I = (p, theta)
 #|     return (parser, side, I)
-#| 
+#|
 #| def renumber_ideal_to_sage_ideal(parser, side, Idata, poly):
 #|         K = poly.K
 #|         J = poly.nt.J()
 #|         OK = poly.nt.maximal_orders()
-#| 
+#|
 #|         if parser == b'J':
 #|             # If we have merged J, the existing column_to_sage_ideal functions use side 1
 #|             if isinstance(side, tuple):
@@ -21081,7 +20792,7 @@ if __name__ == "__main__":
 #|         else:
 #|             raise AssertionError("Unknown parser:", parser)
 #|         return I
-#| 
+#|
 #| if __name__ == "__main__":
 #|     from sys import argv
 #|     if len(argv) < 2:
@@ -21107,7 +20818,7 @@ if __name__ == "__main__":
 #| import os
 #| import re
 #| from timing import *
-#| 
+#|
 #| class las_relation:
 #|     """
 #|     a "las"-relation is a relation as it is output by the las program,
@@ -21127,11 +20838,11 @@ if __name__ == "__main__":
 #|         self.a = int(a, 10)
 #|         self.b = int(b, 10)
 #|         self.sides = sides
-#| 
+#|
 #|     def __str__(self):
 #|         return ":".join([f"{self.a},{self.b}",
 #|                          *[",".join([f"{x:x}" for x in s]) for s in self.sides]])
-#| 
+#|
 #|     def norm(self, poly, i):
 #|         """
 #|         return the norm on side i
@@ -21139,13 +20850,13 @@ if __name__ == "__main__":
 #|         x = polygen(QQ, 'x')
 #|         phi = self.a - self.b * x
 #|         return poly.f[i].resultant(phi)
-#| 
+#|
 #|     def check(self, poly):
 #|         """
 #|         given a CadoPolyFile argument, check this relation for
 #|         consistency
 #|         """
-#| 
+#|
 #|         # This check is not terribly
 #|         # useful to do: we don't expect las to fail, here.
 #|         for i, s in enumerate(self.sides):
@@ -21155,7 +20866,7 @@ if __name__ == "__main__":
 #|                 assert(abs(self.norm(poly, i)) == prod(s))
 #|             except AssertionError:
 #|                 raise RuntimeError(f"norm check failed on side {i}, norm={self.norm(poly, i)}, rel={self}")
-#| 
+#|
 #|     def pull_large_factors(self, bounds, avoid_sq=None, missing_ideals=None):
 #|         """
 #|         This modifies the relation and removes the primes above the given
@@ -21163,11 +20874,11 @@ if __name__ == "__main__":
 #|         removed from the relation.
 #|         The primes above the bounds, on each side, are returned.
 #|         """
-#| 
+#|
 #|         missing_q = set()   # side=1 always.
 #|         if missing_ideals is not None:
 #|             missing_q = missing_ideals
-#| 
+#|
 #|         newsides = []
 #|         rough = []
 #|         for i, s in enumerate(self.sides):
@@ -21179,27 +20890,27 @@ if __name__ == "__main__":
 #|                 if p >= bounds[i]:
 #|                     rough[i].append(p)
 #|                     continue
-#| 
+#|
 #|                 is_smooth = True
-#| 
+#|
 #|                 if i == 1:
 #|                     # check for missing_q
 #|                     if gcd(self.b, p) != 1:
 #|                         r = p
 #|                     else:
 #|                         r = (self.a * inverse_mod(self.b, p)) % p
-#| 
+#|
 #|                     if (1,p,r) in missing_q:
 #|                         is_smooth = False
-#| 
+#|
 #|                 if is_smooth:
 #|                     newsides[i].append(p)
 #|                 else:
 #|                     rough[i].append(p)
-#| 
+#|
 #|         self.sides = newsides
 #|         return rough
-#| 
+#|
 #| class indexed_relation:
 #|     """
 #|     an "indexed"-relation is a relation as it is output by the dup2,
@@ -21221,13 +20932,13 @@ if __name__ == "__main__":
 #|             self.indices = [int(x, 16) for x in indices.split(',')]
 #|         self.a = int(a, 16)
 #|         self.b = int(b, 16)
-#| 
+#|
 #|     def __str__(self):
 #|         return ":".join([f"{self.a:x},{self.b:x}",
 #|                          ",".join([f"{x:x}" for x in self.indices])])
-#| 
-#| 
-#| 
+#|
+#|
+#|
 #| def convert_to_indexed_relation(rels, params, filename=None):
 #|     """
 #|     (ab)Use dup2 to convert these las relations to indexed ones, and return
@@ -21235,13 +20946,13 @@ if __name__ == "__main__":
 #|     """
 #|     if filename is None:
 #|         filename = os.path.join(params.dirs['TEMP_OUTPUT_DIR'], "rels")
-#| 
+#|
 #|     nrels = 0
 #|     with open(filename, 'w') as f:
 #|         for r in rels:
 #|             print(r, file=f)
 #|             nrels += 1
-#| 
+#|
 #|     if rels and nrels:
 #|         CadoNFS("filter/dup2",
 #|                 "-poly", 'POLY',
@@ -21258,10 +20969,10 @@ if __name__ == "__main__":
 #|                 )
 #|     else:
 #|         major_message(f"{filename} contains no relations, leaving it as it is")
-#| 
+#|
 #|     return indexed_relations_from_file(filename)
-#| 
-#| 
+#|
+#|
 #| def big_convert_to_indexed_relation(rels, params, filename=None):
 #|     """
 #|     Some of the a,b may be over 64 bits, which means dup2 will not
@@ -21270,13 +20981,13 @@ if __name__ == "__main__":
 #|     """
 #|     if filename is None:
 #|         filename = os.path.join(params.dirs['TEMP_OUTPUT_DIR'], "rels")
-#| 
+#|
 #|     bigrels = []
 #|     n_smallrels = 0
 #|     file_big = filename + ".big"
 #|     file_small = filename + ".small"
 #|     # combined output will be written to filename
-#| 
+#|
 #|     with open(file_small, 'w') as f:
 #|         for r in rels:
 #|             a = Integer(r.a)
@@ -21286,7 +20997,7 @@ if __name__ == "__main__":
 #|                 n_smallrels += 1
 #|             else:
 #|                 bigrels.append(r)
-#| 
+#|
 #|     if n_smallrels > 0:
 #|         CadoNFS("filter/dup2",
 #|                 "-poly", 'POLY',
@@ -21303,13 +21014,13 @@ if __name__ == "__main__":
 #|                 )
 #|     else:
 #|         major_message(f"{file_small} contains no relations, leaving it as it is")
-#| 
+#|
 #|     if len(bigrels) > 0:
 #|         alg_abp_to_renum = dict()   # (a, b, alg p) --> renumber index
 #|         alg_abp_to_multiplicity = dict()
 #|         rat_p_to_renum = dict()     # (rat p) --> renumber index
 #|         rat_seen_factors = set()
-#| 
+#|
 #|         for r in bigrels:
 #|             a = Integer(r.a)
 #|             b = Integer(r.b)
@@ -21323,14 +21034,14 @@ if __name__ == "__main__":
 #|                     alg_abp_to_renum[(a,b,f1)] = None
 #|                 else:
 #|                     alg_abp_to_multiplicity[(a,b,f1)] += 1
-#| 
+#|
 #|         # Fill in the dictionary mappings
-#| 
+#|
 #|         nlines = 0
 #|         rat_ordering = list(rat_seen_factors)
 #|         rat_ordering.sort()
 #|         alg_ordering = []
-#| 
+#|
 #|         with open(file_big, 'w') as f:
 #|             # Do all the rational primes in one go (the first line)
 #|             a = 10
@@ -21341,10 +21052,10 @@ if __name__ == "__main__":
 #|             f.write(":\n")
 #|             nlines += 1
 #|             uniqueness_mult = 10
-#| 
+#|
 #|             # Next do the algebraic primes. One line for each a-b-p
 #|             for (a,b,p) in alg_abp_to_renum.keys():
-#| 
+#|
 #|                 if p.nbits() < 10:
 #|                     # For the "bad" and "exceptional" ideals things seem to be done mod p^k rather than
 #|                     # mod p, where k is usually at most 2, and the size of p is usually < 256 or so.
@@ -21353,7 +21064,7 @@ if __name__ == "__main__":
 #|                     mm = p**2
 #|                 else:
 #|                     mm = p
-#| 
+#|
 #|                 new_a = uniqueness_mult*mm + int(mod(a,mm))      # just want to avoid tiny a
 #|                 new_b = uniqueness_mult*mm + int(mod(b,mm))      # just want to avoid tiny b
 #|                 multiplicity = alg_abp_to_multiplicity[(a,b,p)]
@@ -21371,7 +21082,7 @@ if __name__ == "__main__":
 #|                 print("p", str(p))
 #|                 print("new_a", str(new_a))
 #|                 print("new_b", str(new_b))
-#| 
+#|
 #|         CadoNFS("filter/dup2",
 #|                 "-poly", 'POLY',
 #|                 "-renumber", 'RENUMBER',
@@ -21387,7 +21098,7 @@ if __name__ == "__main__":
 #|                 )
 #|     else:
 #|         major_message(f"{file_big} contains no relations, leaving it as it is")
-#| 
+#|
 #|     if os.path.isfile(file_big):
 #|         with open(file_big, "r") as f:
 #|             ratline = f.readline().strip()
@@ -21400,7 +21111,7 @@ if __name__ == "__main__":
 #|                 p_i = rat_ordering[i]
 #|                 index_p_i = hex(indices_int[i])[2:]
 #|                 rat_p_to_renum[p_i] = index_p_i
-#| 
+#|
 #|             # algebraic
 #|             j = 0
 #|             for line in f.readlines():
@@ -21414,14 +21125,14 @@ if __name__ == "__main__":
 #|                 print("real_a", str(real_a))
 #|                 print("real_b", str(real_b))
 #|                 print("real_p", str(real_p))
-#| 
+#|
 #|                 if real_p.nbits() < 10:
 #|                     mm = real_p**3
 #|                 elif real_p.nbits() < 20:
 #|                     mm = real_p**2
 #|                 else:
 #|                     mm = real_p
-#| 
+#|
 #|                 assert mod(a,mm) == mod(real_a,mm)
 #|                 assert mod(b,mm) == mod(real_b,mm)
 #|                 indices = line.strip().split(":")[1].split(",")
@@ -21434,21 +21145,21 @@ if __name__ == "__main__":
 #|                     index = hex(indices_int[0])[2:]
 #|                 else:
 #|                     index = ",".join([hex(z)[2:] for z in indices_int])
-#| 
+#|
 #|                 # I think the above should account for multiplicity correctly.
 #|                 # This comes up with "exceptional ideals" as well, where the number of factors
 #|                 # of the given norm matters for mapping back to an ideal. Something about
 #|                 # ideals of exceptional inertia...
-#| 
+#|
 #|                 alg_abp_to_renum[(real_a,real_b,real_p)] = index
 #|                 j += 1
-#| 
+#|
 #|     outfile = open(filename, 'w')
-#| 
+#|
 #|     with open(file_small, 'r') as f:
 #|         for line in f.readlines():
 #|             outfile.write(line)
-#| 
+#|
 #|     for r in bigrels:
 #|         a = Integer(r.a)
 #|         b = Integer(r.b)
@@ -21457,7 +21168,7 @@ if __name__ == "__main__":
 #|         print("making output")
 #|         print("a", str(a))
 #|         print("b", str(b))
-#| 
+#|
 #|         if a >= 0:
 #|             hexa = hex(a)[2:]
 #|         else:
@@ -21466,7 +21177,7 @@ if __name__ == "__main__":
 #|             hexb = hex(b)[2:]
 #|         else:
 #|             hexb = "-" + hex(b)[3:]
-#| 
+#|
 #|         outfile.write(str(hexa))
 #|         outfile.write(",")
 #|         outfile.write(str(hexb))
@@ -21484,11 +21195,11 @@ if __name__ == "__main__":
 #|         renum_string = ",".join(renums)
 #|         outfile.write(renum_string)
 #|         outfile.write("\n")
-#| 
+#|
 #|     outfile.close()
 #|     return indexed_relations_from_file(filename)
-#| 
-#| 
+#|
+#|
 #| def las_relations_from_file(filename):
 #|     """
 #|     This function takes a file name, and yields its contents, i.e.,
@@ -21499,7 +21210,7 @@ if __name__ == "__main__":
 #|             if line.startswith("#"):
 #|                 continue
 #|             yield las_relation(line)
-#| 
+#|
 #| def indexed_relations_from_file(filename):
 #|     """
 #|     This function takes a file name, and yields its contents, i.e.,
@@ -21510,8 +21221,8 @@ if __name__ == "__main__":
 #|             if line.startswith("#"):
 #|                 continue
 #|             yield indexed_relation(line)
-#| 
-#| 
+#|
+#|
 #| def strip_rational_part_of_relations(filename):
 #|     """
 #|     takes a filename containing las relations, and keep only the
@@ -21523,7 +21234,7 @@ if __name__ == "__main__":
 #|             rel.sides[0] = []
 #|             print(rel, file=outfile)
 #|     os.rename(filename + ".strip", filename)
-#| 
+#|
 #| @timing
 #| def swap_parts_of_relations(filename, remove_tmp_suffix=False, do_ext_dedup=None, extra_relation_check=None):
 #|     """
@@ -21540,15 +21251,15 @@ if __name__ == "__main__":
 #|     if extra_relation_check is not None:
 #|         assert extra_relation_check[0]
 #|         renum_info_file = extra_relation_check[1]
-#| 
+#|
 #|         # faster for this specific computation
 #|         if 'n1024' in renum_info_file:
 #|             projective_ideals = [2,3,5,7,13,41,79]
-#| 
+#|
 #|         else:
 #|             # usual case
 #|             projective_ideals = [2]
-#| 
+#|
 #|             with open(renum_info_file, "r") as rf:
 #|                 for line in rf:
 #|                     # Looks like:
@@ -21572,11 +21283,11 @@ if __name__ == "__main__":
 #|                         if p == rho:
 #|                             q = Integer(p)
 #|                             projective_ideals.append(q)
-#| 
+#|
 #|         relation_check = True
 #|     else:
 #|         relation_check = False
-#| 
+#|
 #|     if do_ext_dedup is not None:
 #|         assert do_ext_dedup[0]
 #|         BOUNDA_queries = do_ext_dedup[1]
@@ -21585,11 +21296,11 @@ if __name__ == "__main__":
 #|         # check can vacuously fail
 #|         BOUNDA_queries = -1
 #|         BOUNDA = -1
-#| 
+#|
 #|     # If do_ext_dedup=True, we ensure that each "large q" has only one relation.
 #|     # This is specific to extension sieving, where we only want one relation per large q.
 #|     seen_large_qs = set()
-#| 
+#|
 #|     with open(filename + ".strip", "w") as outfile:
 #|         for rel in las_relations_from_file(filename):
 #|             if relation_check:
@@ -21598,7 +21309,7 @@ if __name__ == "__main__":
 #|                 facs = rel.sides[0]     # one-sided relation, in decimal
 #|                 good_relation = True
 #|                 largeq = None
-#| 
+#|
 #|                 for q in facs:
 #|                     if not is_prime(q):
 #|                         # All the factors q should be prime!
@@ -21618,7 +21329,7 @@ if __name__ == "__main__":
 #|                         else:
 #|                             rho = q
 #|                         largeq = (q, rho)
-#| 
+#|
 #|                 if do_ext_dedup is not None:
 #|                     assert largeq is not None
 #|                     if largeq in seen_large_qs:
@@ -21627,36 +21338,36 @@ if __name__ == "__main__":
 #|                     else:
 #|                         if good_relation:
 #|                             seen_large_qs.add(largeq)
-#| 
+#|
 #|                 if good_relation:
 #|                     rel.sides[1] = rel.sides[0]
 #|                     rel.sides[0] = []
 #|                     print(rel, file=outfile)
-#| 
+#|
 #|             else:
 #|                 rel.sides[1] = rel.sides[0]
 #|                 rel.sides[0] = []
 #|                 print(rel, file=outfile)
-#| 
+#|
 #|     new_filename = filename[:-4] if remove_tmp_suffix else filename
 #|     os.rename(filename + ".strip", new_filename)
-#| 
-#| 
+#|
+#|
 #| def parse_fb_extension_relations(filename, qrange):
 #|     """
 #|     takes a filename containing las relations, and keep only one relation
 #|     per q in the given qrange. Return it as a dictionary.
 #|     The qrange is specified as (side, q0, q1).
-#| 
+#|
 #|     Of course this is used pretty much _only_ in the FB extension
 #|     phase, and it should probably be a subroutine of that code area, in
 #|     fact.
 #|     """
-#| 
+#|
 #|     per_q = dict()
-#| 
+#|
 #|     side, q0, q1 = qrange
-#| 
+#|
 #|     for rel in las_relations_from_file(filename):
 #|         found_a_special_q = False
 #|         for q in rel.sides[side]:
@@ -21673,24 +21384,24 @@ if __name__ == "__main__":
 #|             found_a_special_q = True
 #|             if (side,q,rho) not in per_q:
 #|                 per_q[side, q, rho] = rel
-#| 
+#|
 #|     return per_q
-#| 
-#| 
+#|
+#|
 #| def keep_only_one_relation_per_q(filename, qrange, keep_file=False):
 #|     per_q = parse_fb_extension_relations(filename, qrange)
-#| 
+#|
 #|     with open(filename + ".mini", "w") as outfile:
 #|         for qq in sorted(per_q.keys()):
 #|             print(per_q[qq], file=outfile)
-#| 
+#|
 #|     if re.search(r"\.gz$", filename):
 #|         raise NotImplementedError
-#| 
+#|
 #|     if keep_file:
 #|         os.rename(filename, filename + ".old")
 #|     os.rename(filename + ".mini", filename)
-#| 
+#|
 #|     # Return per_q so that missing q's can be found.
 #|     return per_q.keys()
 
@@ -21725,26 +21436,26 @@ if __name__ == "__main__":
 #| import hybrid_root_step
 #| import descent_large_las
 #| import tocfile
-#| 
+#|
 #| try:
 #|     from pebble import ProcessPool
 #| except ImportError as e:
 #|     from concurrent.futures import ProcessPoolExecutor as ProcessPool
-#| 
+#|
 #| from candy import major_message, error_message
 #| from candy import OK, NOK, HURRAH
-#| 
+#|
 #| from cado.scripts import descent
-#| 
+#|
 #| from cado_nfs_binaries import CadoNFS, CadoNFSBinaries
-#| 
+#|
 #| from cado.tests.sagemath import cado_sage
 #| from cado_sage import CadoIdealsDebugFile
-#| 
+#|
 #| x = polygen(QQ, 'x')
-#| 
+#|
 #| class LuckySplitException(Exception): pass
-#| 
+#|
 #| def kill_subprocesses():
 #|     for process in multiprocessing.active_children():
 #|         if process.poll() is None:
@@ -21753,9 +21464,9 @@ if __name__ == "__main__":
 #|             os.killpg(os.getpgid(process.pid),signal.SIGTERM)
 #|             process.terminate()
 #|             process.wait()
-#| 
+#|
 #| atexit.register(kill_subprocesses)
-#| 
+#|
 #| class Logger(object):
 #|     def __init__(self, params, isstdout=True):
 #|         if isstdout:
@@ -21764,16 +21475,16 @@ if __name__ == "__main__":
 #|         else:
 #|             self.terminal = sys.stderr
 #|             self.log = open(params.files['ERRFILE'], "a")
-#| 
+#|
 #|     def write(self, message):
 #|         self.terminal.write(message)
 #|         self.log.write(message)
 #|         self.flush()
-#| 
+#|
 #|     def flush(self):
 #|         self.terminal.flush()
 #|         self.log.flush()
-#| 
+#|
 #| @timing
 #| def gen_N(params):
 #|     """
@@ -21785,7 +21496,7 @@ if __name__ == "__main__":
 #|     MODULUS_BITS = parameters['MODULUS_BITS']
 #|     e = parameters['e']
 #|     prime_bits = int(MODULUS_BITS/2)
-#| 
+#|
 #|     done = False
 #|     while(not done):
 #|         p = random_prime(2**prime_bits-1, False, 2**(prime_bits-1))
@@ -21793,37 +21504,37 @@ if __name__ == "__main__":
 #|         phi = (p-1)*(q-1)
 #|         if gcd(e, phi) == 1:
 #|             done = True
-#| 
+#|
 #|     N = p*q
 #|     d = Integer(inverse_mod(e,phi))
 #|     print("N =", N)
 #|     print("d =", d)
 #|     return N,d
-#| 
+#|
 #| @timing
 #| def run_polysel(params, already_selected=False):
 #|     parameters = params.parameters
 #|     POLY_DEG = parameters['POLY_DEG']
-#| 
+#|
 #|     if 'N' not in parameters:
 #|         timeprint("N not found in config, generating random N")
 #|         parameters['N'], parameters['d'] = gen_N(params)
 #|     else:
 #|         timeprint("Found parameter N=",parameters['N'],"in config")
-#| 
+#|
 #|     N = parameters['N']
 #|     e = Integer(parameters['e'])
-#| 
+#|
 #|     if not already_selected:
 #|         if params.cadopoly:
 #|             write_polyfile(params, 'cado', N, e, POLY_DEG, params.files['POLYFILE'])
 #|         else:
 #|             write_polyfile(params, 'custom', N, e, POLY_DEG, params.files['POLYFILE'])
-#| 
+#|
 #|     major_message("----Polynomial Selection----")
 #|     print(params.poly)
 #|     print("Shared root mod N:", params.poly.m)
-#| 
+#|
 #|     CadoNFS("utils/numbertheory_tool",
 #|             "-poly", 'POLY',
 #|             "-badideals", 'BADIDEALS',
@@ -21838,7 +21549,7 @@ if __name__ == "__main__":
 #|                 }
 #|             )
 #|     params.save_to_file()
-#| 
+#|
 #| @timing
 #| def run_precomp(params, nopolysel=False):
 #|     parameters = params.parameters
@@ -21850,10 +21561,10 @@ if __name__ == "__main__":
 #|     LPB0 = parameters['LPB0']
 #|     LPB1 = parameters['LPB1']
 #|     LPB1_queries = parameters['LPB1_queries']
-#| 
+#|
 #|     if nopolysel:
 #|         timeprint("Not running polysel, using existing f.poly")
-#| 
+#|
 #|         CadoNFS("utils/numbertheory_tool",
 #|                 "-poly", 'POLY',
 #|                 "-badideals", 'BADIDEALS',
@@ -21869,15 +21580,15 @@ if __name__ == "__main__":
 #|                 )
 #|     else:
 #|         run_polysel(params)
-#| 
+#|
 #|     major_message("----Algebraic Sieving----")
-#| 
+#|
 #|     if LPB1 > 32:
 #|         # Make a second, smaller fb.gz
 #|         # (I believe we do not need any of the associated freerel, renum files)
-#| 
+#|
 #|         capped_lim = min(2**32, BOUNDA_queries)
-#| 
+#|
 #|         major_message(f"LPB1={LPB1} is large so we are making capped.fb.gz")
 #|         CadoNFS("sieve/makefb",
 #|                 "-poly", 'POLY',
@@ -21890,7 +21601,7 @@ if __name__ == "__main__":
 #|                     }
 #|                 )
 #|         major_message("Finished making the capped factor base!")
-#| 
+#|
 #|     CadoNFS("sieve/makefb",
 #|             "-poly", 'POLY',
 #|             "-out", 'FB',
@@ -21902,7 +21613,7 @@ if __name__ == "__main__":
 #|                 }
 #|             )
 #|     major_message("Finished making the factor base!")
-#| 
+#|
 #|     CadoNFS("sieve/freerel",
 #|             "-poly", 'POLY',
 #|             "-renumber", 'RENUMBER',
@@ -21916,7 +21627,7 @@ if __name__ == "__main__":
 #|                 'FREEREL': params.files['FREERELFILE'],
 #|                 }
 #|             )
-#| 
+#|
 #|     CadoNFS("misc/debug_renumber",
 #|             "-poly", 'POLY',
 #|             "-renumber", 'RENUMBER',
@@ -21927,7 +21638,7 @@ if __name__ == "__main__":
 #|                 },
 #|             capture=open(params.files['DEBUG_RENUMBER_FILE'], 'w')
 #|             )
-#| 
+#|
 #|     # This one is actually more machine readable than the debug_renumber
 #|     # format, and also contains more information.
 #|     CadoNFS("misc/explain_indexed_relation",
@@ -21943,24 +21654,24 @@ if __name__ == "__main__":
 #|             capture=open(params.files['EXPLAIN_RENUMBER_FILE'], 'w')
 #|             )
 #|     major_message("Finished renumbering!")
-#| 
+#|
 #|     #do_algebraic_query_sieving(params)
 #|     call_algebraic_query_sieving(params)
 #|     major_message("Finished query sieving!")
-#| 
+#|
 #|     #call_fb_extension_sieving(params)
 #|     #major_message("Finished extension sieving!")
-#| 
+#|
 #|     MM = filter_relation_file(params)
 #|     major_message("matrix:", MM)
 #|     fast_persistent_save(MM, params.dirs['TEMP_OUTPUT_DIR']+"MM.sobj")
-#| 
+#|
 #|     if params.cado_nfs_filter:
 #|         build_killer_rels_dict(params, MM)
-#| 
+#|
 #|     call_fb_extension_sieving(params)
 #|     major_message("Finished extension sieving!")
-#| 
+#|
 #|     if 'n1024' not in params.files['RENUMBERFILE']:
 #|         timeprint("parse_fb_extension_relations...")
 #|         per_q = parse_fb_extension_relations(params.files["EXTRELS_FILE"], (1, params.BOUNDA_queries, params.BOUNDA))
@@ -21968,73 +21679,73 @@ if __name__ == "__main__":
 #|         indexed_relations_file = big_convert_to_indexed_relation(per_q.values(),
 #|                                                    params,
 #|                                                    params.files["EXTRELS_INDEXED"])
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def run_queries(params, steps=["rqueries", "aqueries", "extqueries"]):
 #|     if steps == ["queries"]:
 #|         steps = ["rqueries", "aqueries", "extqueries"]
-#| 
+#|
 #|     if "rqueries" in steps:
 #|         major_message("----Rational Queries----")
 #|         timeprint("Using rational bound " + str(params.BOUNDR) + "...")
 #|         num_rqueries = do_rational_queries(params)
 #|         timeprint(f"Completed {num_rqueries} rational queries!")
-#| 
+#|
 #|     if "aqueries" in steps:
 #|         major_message("----Algebraic Queries----")
 #|         timeprint(f"Using algebraic bound {params.BOUNDA_queries}...")
 #|         num_aqueries = do_algebraic_queries(params, "algebraic")
 #|         timeprint(f"Completed {num_aqueries} algebraic queries!")
-#| 
+#|
 #|     if "extqueries" in steps:
 #|         timeprint(f"Starting extension queries.")
 #|         num_ext_queries = do_algebraic_queries(params, "extension")
 #|         timeprint(f"Completed {num_ext_queries} extension queries!")
-#| 
+#|
 #| @timing
 #| def run_descent(target, params, seedval=None):
 #|     # Return a target info struct, or None on failure
-#| 
+#|
 #|     # XXX This is dead code! See call_descents instead
-#| 
+#|
 #|     #files = params.files
 #|     parameters = params.parameters
-#| 
+#|
 #|     e = parameters['e']
 #|     N = params.poly.N
-#| 
+#|
 #|     ZN = Integers(N)
-#| 
+#|
 #|     with seed(seedval):
 #|         mask, h, u, v = masked_target(ZN(target), e)
-#| 
+#|
 #|     timeprint(f"Initializing descent with seed={seedval}, tgt=(u,v): {target}={u},{v}")
-#| 
+#|
 #|     prefix = f"desc.{u}.{v}"
-#| 
+#|
 #|     u_fac = factor(Integer(u))
 #|     v_fac = factor(Integer(v))
 #|     special_qs = [p for p,k in factor(ZZ(u)/ZZ(v)) if p > params.BOUNDR]
-#| 
+#|
 #|     target_info = dict(tgt=target, mask=mask, h=h, u=u, v=v)
-#| 
+#|
 #|     target_info['lucky'] = len(special_qs) == 0
-#| 
+#|
 #|     if target_info['lucky']:
 #|         major_message("Got lucky with the initial split! No descent necessary.")
 #|         return target_info
-#| 
+#|
 #|     with open(params.dirs['DESC']+prefix+'.todo', "w") as file:
 #|         for q in special_qs:
 #|             # 0 for the rational side
 #|             print(f"0 {q}", file=file)
-#| 
+#|
 #|     timeprint("Descent initialized " + str(len(special_qs)) + " special-q's on the rational side.")
-#| 
+#|
 #|     try:
 #|         target_info['DRELS_FILE'] = do_descent_sieving(params, prefix)
-#| 
+#|
 #|         return target_info
 #|     except RuntimeError as ex:
 #|         if re.match(r"Failed descents", str(ex)):
@@ -22048,59 +21759,59 @@ if __name__ == "__main__":
 #|     except Exception as ex:
 #|         error_message("Got exception", ex)
 #|         raise ex
-#| 
+#|
 #| @timing
 #| def run_validate_descent(params, use_target_info_file=None):
 #|     assert use_target_info_file is not None
-#| 
+#|
 #|     target_info = json.load(open(use_target_info_file))
 #|     u = ZZ(target_info['u'])
 #|     v = ZZ(target_info['v'])
-#| 
+#|
 #|     uv_fac = get_uv_fac(u, v, target_info)
-#| 
+#|
 #|     DRELS_FILE = target_info['DRELS_FILE']
 #|     DRELS_INDEXED = DRELS_FILE + ".cond.indexed"
-#| 
+#|
 #|     timeprint("Making sure construct_S works...")
 #|     S_list, S_alg_vector, S_rat_vector = construct_S(
 #|         params, DRELS_FILE, DRELS_INDEXED, u, v, already_indexed=False, partial_R=True, uv_fac=uv_fac
 #|     )
 #|     timeprint("Done with construct_S")
-#| 
+#|
 #|     timeprint("Making sure run_S_sanity_checks works...")
 #|     run_S_sanity_checks(params, S_list, S_alg_vector, S_rat_vector, u, v, partial_R=True)
 #|     timeprint("Done with run_S_sanity_checks")
-#| 
+#|
 #|     timeprint(f"S_alg_vector nonzero positions: {len(S_alg_vector.nonzero_positions())}")
 #|     timeprint(f"S_rat_vector nonzero positions: {len(S_rat_vector.nonzero_positions())}")
 #|     timeprint(f"len of S_list: {len(S_list)}")
-#| 
+#|
 #|     timeprint("Making sure truncate_S works...")
 #|     T_list, ST_list, ST_alg_vector = truncate_S(params, S_list, S_alg_vector, partial_R=True)
-#| 
+#|
 #|     timeprint("Running the truncation assertion...")
 #|     assert all([ST_list[k] == S_list.get(k,0) + T_list.get(k,0) for k in list(S_list.keys()) + list(T_list.keys())])
-#| 
+#|
 #|     timeprint("Running run_ST_sanity_checks...")
 #|     run_ST_sanity_checks(params, S_list, T_list, ST_alg_vector, S_rat_vector, u, v, partial_R=True)
-#| 
+#|
 #|     timeprint("Everything looks good!")
 #|     return
-#| 
-#| 
+#|
+#|
 #| @timing
 #| def run_linalg(params, use_target_info_file=None):
 #|     # We've had these files for a while already, we could have done this
 #|     # filtering earlier, especially _before the descent_
 #|     # Note: MM depends only on aqrels, NOT on the seed or descent
 #|     mm_path = params.dirs['TEMP_OUTPUT_DIR'] + "MM.sobj"
-#| 
+#|
 #|     try:
 #|         import mr4mp
 #|     except ModuleNotFoundError:
 #|         timeprint("WARNING: Install Python package 'mr4mp' for faster mapreduce operation")
-#| 
+#|
 #|     if ('n1024' in params.files['RENUMBERFILE']) or (params.overwrite_MC):
 #|         # MM.sobj too big!
 #|         timeprint("Loading LinearAlgebraMatrix_Filtered...")
@@ -22119,7 +21830,7 @@ if __name__ == "__main__":
 #|         timeprint(f"Loading {mm_path} from disk")
 #|         MM = fast_persistent_load(mm_path)
 #|         timeprint(f"Finished loading")
-#| 
+#|
 #|     if use_target_info_file is None:
 #|         target_info = params.target_info #json.load(open(params.files['TGT_INFO']))
 #|         seed_ten = None
@@ -22128,19 +21839,19 @@ if __name__ == "__main__":
 #|         target_info = json.load(open(use_target_info_file))
 #|         seed_ten = str(target_info['seed'])[:10]
 #|         seed_pfx = seed_ten + "-"
-#| 
+#|
 #|     u = ZZ(target_info['u'])
 #|     v = ZZ(target_info['v'])
-#| 
+#|
 #|     uv_fac = get_uv_fac(u, v, target_info)
-#| 
+#|
 #|     #rdict = json.load(cat_or_zcat(params.files['RQUERIES_FILE']))
 #|     #if len(rdict) != params.R.number_of_rational_queries():
 #|     #    raise RuntimeError(f"Weird. {len(rdict)} queries in the json file, {params.R.number_of_rational_queries()} are #expected in the renumber table ({len(params.R._ideals)} ideals)")
-#| 
+#|
 #|     DRELS_FILE = target_info['DRELS_FILE']
 #|     DRELS_INDEXED = DRELS_FILE + ".cond.indexed"
-#| 
+#|
 #|     # depends only on matrix
 #|     MC_saved_file = params.dirs['TEMP_OUTPUT_DIR']+"MC.sobj"
 #|     S_block_saved_file = params.dirs['TEMP_OUTPUT_DIR']+"S_block.sobj"
@@ -22153,7 +21864,7 @@ if __name__ == "__main__":
 #|     ST_alg_vector_saved_file = params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"ST_alg_vector.sobj"
 #|     SC_vector_saved_file = params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"SC_vector.sobj"
 #|     C_block_saved_file = params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"C_block.sobj"
-#| 
+#|
 #|     check_files_exist = [
 #|         MC_saved_file, S_block_saved_file,
 #|         S_list_saved_file, S_alg_vector_saved_file,
@@ -22161,15 +21872,15 @@ if __name__ == "__main__":
 #|         ST_list_saved_file, ST_alg_vector_saved_file,
 #|         SC_vector_saved_file, C_block_saved_file
 #|     ]
-#| 
+#|
 #|     skip_make_linalg_system = True  # it's very slow, so if we can, skip as much as possible
 #|     if params.overwrite_MC or params.overwrite_SC:
 #|         skip_make_linalg_system = False
-#| 
+#|
 #|     for check_file in check_files_exist:
 #|         if not os.path.exists(check_file):
 #|             skip_make_linalg_system = False
-#| 
+#|
 #|     if skip_make_linalg_system:
 #|         major_message("Skipping make_linalg_system, since the files all exist.")
 #|         MC = fast_persistent_load(MC_saved_file)
@@ -22182,55 +21893,55 @@ if __name__ == "__main__":
 #|         ST_alg_vector = fast_persistent_load(ST_alg_vector_saved_file)
 #|         SC_vector = fast_persistent_load(SC_vector_saved_file)
 #|         C_block = fast_persistent_load(C_block_saved_file)
-#| 
+#|
 #|     else:
 #|         if 'n1024' in params.files['RENUMBERFILE']:
 #|             partial_R=True
 #|         else:
 #|             partial_R=False
-#| 
+#|
 #|         timeprint("Start make_linalg_system")
-#| 
+#|
 #|         S_list, S_alg_vector, S_rat_vector = construct_S(
 #|             params, DRELS_FILE, DRELS_INDEXED, u, v, already_indexed=False, partial_R=partial_R, uv_fac=uv_fac
 #|         )
-#| 
+#|
 #|         if 'n1024' not in params.files['RENUMBERFILE']:
 #|             # still WIP
 #|             run_S_sanity_checks(params, S_list, S_alg_vector, S_rat_vector, u, v, partial_R=partial_R)
-#| 
+#|
 #|         timeprint(f"S_alg_vector nonzero positions: {len(S_alg_vector.nonzero_positions())}")
 #|         timeprint(f"S_rat_vector nonzero positions: {len(S_rat_vector.nonzero_positions())}")
 #|         timeprint(f"len of S_list: {len(S_list)}")
-#| 
+#|
 #|         T_list, ST_list, ST_alg_vector = truncate_S(params, S_list, S_alg_vector, partial_R=partial_R)
-#| 
+#|
 #|         # well it's not _exactly_ the concatenation, because if a key k is in
 #|         # both S_list and T_list, we have ST_list[k] = S_list[k] + T_list[k]
 #|         # assert ST_list == S_list | T_list
 #|         if 'n1024' not in params.files['RENUMBERFILE']:
 #|             assert all([ST_list[k] == S_list.get(k,0) + T_list.get(k,0) for k in list(S_list.keys()) + list(T_list.keys())])
-#| 
+#|
 #|         # items from T list are not smooth, they're just extra queries.
 #|         if 'n1024' not in params.files['RENUMBERFILE']:
 #|             run_ST_sanity_checks(params, S_list, T_list, ST_alg_vector, S_rat_vector, u, v, partial_R=partial_R)
-#| 
+#|
 #|         MC, SC_vector, S_block, C_block = make_linalg_system(params,
 #|                                                              MM,
 #|                                                              ST_list,
 #|                                                              ST_alg_vector)
-#| 
+#|
 #|         if 'n1024' not in params.files['RENUMBERFILE']:
 #|             # too expensive currently
 #|             # for n1024
-#| 
+#|
 #|             # Files don't exist, so we need to write them
 #|             # OR we want to overwrite them.
 #|             if (not os.path.exists(MC_saved_file)) or params.overwrite_MC:
 #|                 major_message("Overwriting/writing to MC and S_block.")
 #|                 fast_persistent_save(MC, MC_saved_file)
 #|                 fast_persistent_save(S_block, S_block_saved_file)
-#| 
+#|
 #|             # If we have gone through with all of make_linalg_system,
 #|             # the whole point was to get a new SC vector, so we write that information.
 #|             major_message("Overwriting/writing to the SC vector files.")
@@ -22242,52 +21953,52 @@ if __name__ == "__main__":
 #|             fast_persistent_save(ST_alg_vector, ST_alg_vector_saved_file)
 #|             fast_persistent_save(SC_vector, SC_vector_saved_file)
 #|             fast_persistent_save(C_block, C_block_saved_file)
-#| 
+#|
 #|     # Matrix M : num_rows x num_cols
 #|     # Vector S_alg_vector : num_cols
 #|     # Want : coefficient for each row of M (each algebraic query)
 #|     # [1 x r] [r x c] = [1 x c]
-#| 
+#|
 #|     # Here, the objects are confusingly named:
 #|     # MC: M || S_block, where M is the main matrix, and S_block is the character block
 #|     # S_block: Character block of the matrix
 #|     # SC_vector: ST_alg_vector || C_block, so it is the target vector and the characters
 #|     # C_block: Character segment of the target vector
-#| 
+#|
 #|     # MC is used for all/any target vectors, so should always be loaded if it exists.
 #|     # S_block as well.
 #|     # SC_vector and C_block do depend on the specified seed and target vector.
-#| 
+#|
 #|     # pull these back from our abstraction layer in order to interface
 #|     # with the rest of the code.
 #|     M = MM.matrix()
-#| 
+#|
 #|     # M is MM.matrix(), and MC is M=MM.matrix() + the character block
-#| 
+#|
 #|     row_to_aquery = MM.row_to_aquery
 #|     indexed_relations_file = MM.indexed_relations_filename(params)
-#| 
+#|
 #|     major_message("----Linear Algebra----")
 #|     timeprint(f"The matrix M is {MC.nrows()}x{MC.ncols()}",
 #|               f"({MC.ncols()-M.ncols()} columns are characters)")
 #|     timeprint(f"The SC vector is of length {len(SC_vector)}")
-#| 
+#|
 #|     @timing
 #|     def solve_sage(params=params):
 #|         sol = MC.solve_left(-SC_vector)
 #|         assert(M.nrows()==len(sol))
 #|         return sol
-#| 
+#|
 #|     if params.sage_linalg and not params.cado_nfs_filter:
 #|         timeprint("Solving with Sage solve_left")
 #|         sol = solve_sage()
-#| 
+#|
 #|     elif params.sage_linalg and params.cado_nfs_filter:
 #|         timeprint("Solving with -C (full filtering) and -S (sage solve_left)")
 #|         # sol should be a solution for target=-SC_vector
 #|         sol = solve_filtering_plus_sage(params, M, MM, MC, -SC_vector)
 #|     else:
-#| 
+#|
 #|         bwc_failed = None
 #|         try:
 #|             if type(MM) is LinearAlgebraMatrix_IndexedFileOnly:
@@ -22312,11 +22023,11 @@ if __name__ == "__main__":
 #|                 #                                                 ST_list)
 #|                 #sys.exit(0)
 #|                 #pass
-#| 
+#|
 #|         except FileNotFoundError as ex:
 #|             error_message("bwc failed", NOK)
 #|             bwc_failed = ex
-#| 
+#|
 #|         if bwc_failed is not None:
 #|             # raise bwc_failed
 #|             if params.cado_nfs_filter:
@@ -22325,12 +22036,12 @@ if __name__ == "__main__":
 #|             else:
 #|                 error_message("Fallback: Sage solve_left")
 #|                 sol = solve_sage()
-#| 
+#|
 #|     # Make the aqrels table-of-contents if it doesn't already exist, so that we have fast random access to the indexed relations
 #|     timeprint("Making indexed relations table-of-contents file...")
 #|     tocfile.maketoc(indexed_relations_file, indexed_relations_file + ".toc")
 #|     timeprint("Done making indexed relations table-of-contents file")
-#| 
+#|
 #|     run_sol_sanity_checks(params, sol, ST_alg_vector, indexed_relations_file)
 #|     timeprint("Found a solution! We have sol*M = ST mod e.")
 #|     try:
@@ -22353,15 +22064,15 @@ if __name__ == "__main__":
 #|                 fast_persistent_save(S_rat_vector, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-S_rat_vector.sobj")
 #|                 # we can get row_to_aquery and indexed_relations_file
 #|                 # pretty easily otherwise.
-#| 
+#|
 #|                 fast_persistent_save(toreturn, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-linalgoutput.sobj")
 #|             except:
 #|                 pass
-#| 
+#|
 #|         else:
 #|             fast_persistent_save(toreturn, params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-linalgoutput.sobj")
 #|     return toreturn
-#| 
+#|
 #| @timing
 #| def serialize_ttplus_ttminus(params):
 #|         # Serialize TTPlus and TTMinus to a file
@@ -22369,10 +22080,10 @@ if __name__ == "__main__":
 #|         if len(params.use_descent_init_file) > 2:
 #|             # want to use a specific descent output
 #|             existing_target = params.use_descent_init_file
-#| 
+#|
 #|             with open(params.use_descent_init_file, "r") as fp:
 #|                 init_dict = json.load(fp)
-#| 
+#|
 #|             seed_ten = str(init_dict['seed'])[:10]
 #|             linalg_output = fast_persistent_load(params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-linalgoutput.sobj")
 #|         else:
@@ -22380,24 +22091,24 @@ if __name__ == "__main__":
 #|             with open(params.files['TGT_INFO'], "r") as fp:
 #|                 params.target_info = json.load(fp)
 #|             linalg_output = fast_persistent_load(params.dirs['TEMP_OUTPUT_DIR']+"linalgoutput.sobj")
-#| 
+#|
 #|         timeprint("Calling sol.lift_centered()")
 #|         sol = linalg_output.sol.lift_centered()
-#| 
+#|
 #|         timeprint("Making TT")
 #|         TT = [(linalg_output.row_to_aquery[i],s) for i,s in enumerate(sol)]
 #|         TT += list(linalg_output.ST_list.items())
-#| 
+#|
 #|         timeprint("Making TTplus and TTminus")
 #|         TTplus  = [((a,b),k)  for (a,b),k in TT if k>0]
 #|         TTminus = [((a,b),-k) for (a,b),k in TT if k<0]
-#| 
+#|
 #|         timeprint("Serializing TTplus and TTminus")
-#| 
+#|
 #|         out_prefix = params.dirs['TEMP_OUTPUT_DIR']
 #|         fast_persistent_save(TTplus, out_prefix + "TTplus.sobj")
 #|         fast_persistent_save(TTminus, out_prefix + "TTminus.sobj")
-#| 
+#|
 #|         # also serialize in a way that we can read through it instead of loading the whole thing into memory
 #|         timeprint("Also serializing TTplus and TTminus in text format")
 #|         with open(out_prefix + "TTplus.txt", "w") as f:
@@ -22407,7 +22118,7 @@ if __name__ == "__main__":
 #|             for (a,b),k in TTminus:
 #|                 print(a,b,k,file=f)
 #|         timeprint("Done serializing TTplus and TTminus")
-#| 
+#|
 #| @timing
 #| def run_eth_root(params, linalg_output, use_target_info_file=None):
 #|     sol = linalg_output.sol
@@ -22415,7 +22126,7 @@ if __name__ == "__main__":
 #|     T_list = linalg_output.T_list
 #|     row_to_aquery = linalg_output.row_to_aquery
 #|     S_rat_vector = linalg_output.S_rat_vector
-#| 
+#|
 #|     e = params.parameters['e']
 #|     N = params.poly.N
 #|     m = params.poly.m
@@ -22423,27 +22134,27 @@ if __name__ == "__main__":
 #|     ZN = Integers(N)
 #|     K = params.poly.K[1]
 #|     alpha = K.gen()
-#| 
+#|
 #|     R_m = ZN(0)
 #|     R_alpha = 0
-#| 
+#|
 #|     if use_target_info_file is None:
 #|         seed_pfx = ""
 #|     else:
 #|         target_info = json.load(open(use_target_info_file))
 #|         seed_ten = str(target_info['seed'])[:10]
 #|         seed_pfx = seed_ten + "-"
-#| 
+#|
 #|     major_message("----Starting R^d----")
 #|     if params.montgomery_root or params.montgomery_parallel:
-#| 
+#|
 #|         if (not params.overwrite_SC) and os.path.exists(params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"R_alpha.sobj"):
 #|             major_message("Reading R(alpha) from existing file...")
 #|             R_alpha = fast_persistent_load(params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"R_alpha.sobj")
 #|         else:
 #|             R_alpha = montgomery_ethroot.eth_root_montgomery(params, linalg_output)
 #|             fast_persistent_save(R_alpha, params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"R_alpha.sobj")
-#| 
+#|
 #|         R_m = R_alpha.polynomial().change_ring(ZN)(m)
 #|         # Recompute U_m with lift_centered coeffs
 #|         S_m = prod(ZN(a - b*m)**mult for ((a,b),mult) in ST_list.items())
@@ -22472,9 +22183,9 @@ if __name__ == "__main__":
 #|                 )
 #|             )
 #|             assert S_alpha * U_alpha / R_alpha^e == 1
-#| 
+#|
 #|     elif params.padic_gamma_fac:
-#| 
+#|
 #|         if 'n1024' in params.files['RENUMBERFILE']:
 #|             # special preprocessing case
 #|             extqueries_dict = json.load(cat_or_zcat('EXTPRIMES.dict'))
@@ -22490,7 +22201,7 @@ if __name__ == "__main__":
 #|         else:
 #|             extqueries_dict = json.load(cat_or_zcat(params.files['EXT_QUERIES_FILE']))
 #|             rqueries_dict = json.load(cat_or_zcat(params.files['RQUERIES_FILE']))
-#| 
+#|
 #|         # This is a special case.
 #|         # We have the gamma factorization stored, but it's too big to compute prod()
 #|         # so we need to recover delta a little differently.
@@ -22533,20 +22244,20 @@ if __name__ == "__main__":
 #|         assert ZN(power_mod(Integer(R_m), e, N)) == ZN(S_m * U_m), "R_m != S_m U_m mod N. Could be bug in eth_root_montgomery; try rerunning root step without -M and see whether that also fails"
 #|         timeprint("Huzzah! R_m = S_m U_m mod N!")
 #|         # We don't get R_alpha in this branch, only R_m
-#| 
+#|
 #|     elif params.padic_root:
 #|         r = padic_eth_root.padic_eth_root(params, linalg_output)
 #|         R_m = r(ZN(m))
 #|     else:
 #|         S_m, U_m, ethroot_gen, extra_abks, abm_list = get_RSU_m(ST_list, sol, row_to_aquery, f, e, N, m)
-#| 
+#|
 #|         START_ETHROOT_PRIMES = params.parameters['START_ETHROOT_PRIMES']
 #|         MAX_ETHROOT_PRIMES = params.parameters['MAX_ETHROOT_PRIMES']
 #|         current_num_primes = START_ETHROOT_PRIMES
-#| 
+#|
 #|         while(current_num_primes <= MAX_ETHROOT_PRIMES):
 #|             cand_R_m = Integer(CRT_R_m(params,current_num_primes,extra_abks,abm_list))
-#| 
+#|
 #|             # R**e = S*U
 #|             if ZN(power_mod(cand_R_m, e, N)) == ZN(S_m * U_m):
 #|                 R_m = cand_R_m
@@ -22554,20 +22265,20 @@ if __name__ == "__main__":
 #|             else:
 #|                 current_num_primes += 1000
 #|                 timeprint("Retrying the eth-root step with " + str(current_num_primes) + " primes...")
-#| 
+#|
 #|         if current_num_primes > MAX_ETHROOT_PRIMES:
 #|             raise RuntimeError("Retried too many times; giving up.")
-#| 
+#|
 #|     timeprint("Starting reconstruction of U")
 #|     ts = time.time()
 #|     # U(m)^d is computed from the algebraic queries
-#| 
+#|
 #|     aqueries_dict = json.load(cat_or_zcat(params.files['AQUERIES_FILE']))
-#| 
+#|
 #|     aqueries_num_accesses = 0
 #|     extqueries_num_accesses = 0
 #|     rqueries_num_accesses = 0
-#| 
+#|
 #|     Um_d = ZN(1)
 #|     #for i in range(len(sol)):
 #|     for i in sol.nonzero_positions():
@@ -22594,7 +22305,7 @@ if __name__ == "__main__":
 #|     endtime = time.time()
 #|     timeprint("Finished U; took",endtime-ts)
 #|     params.timing['U reconstruction'] = endtime - ts
-#| 
+#|
 #|     # If we have done things correctly, we have ST_list = S_list +
 #|     # T_list, to match the notation in the paper. The thing that is
 #|     # smooth on the rational side is u/v*S(m).  We handle T(m) by using
@@ -22602,14 +22313,14 @@ if __name__ == "__main__":
 #|     # involving both the query and extension factor bases.
 #|     # So, we compute (u/v*S(m))^d using the rational queries.
 #|     # And we compute T(m)^d using the algebraic+extension queries.
-#| 
+#|
 #|     if not params.padic_gamma_fac:
 #|         extqueries_dict = json.load(cat_or_zcat(params.files['EXT_QUERIES_FILE']))
 #|         rqueries_dict = json.load(cat_or_zcat(params.files['RQUERIES_FILE']))
-#| 
+#|
 #|     # find the e-th root of the leading coefficient of the rational
 #|     # polynomial
-#| 
+#|
 #|     g1_d = ZN(1)
 #|     for p,k in params.poly.f[0].leading_coefficient().factor(limit=params.BOUNDR):
 #|         if str(p) not in rqueries_dict:
@@ -22619,12 +22330,12 @@ if __name__ == "__main__":
 #|                                " which is not in the query logs.")
 #|         g1_d *= ZN(rqueries_dict[str(p)]) ** k
 #|         rqueries_num_accesses += 1
-#| 
+#|
 #|     # I have:
 #|     # -ZN(u/v * S_mq * prod([params.poly.f[0][1]**k for (a,b),k in S_list.items()])) == prod([ZN(Primes().unrank(i))**v for i,v in sorted(S_rat_vector.dict().items())])
-#| 
+#|
 #|     # -ZN(u/v * S_mq) == prod([ZN(Primes().unrank(i))**v for i,v in sorted(S_rat_vector.dict().items())]) / ZN(g1)**sum([k for (a,b),k in S_list.items()])
-#| 
+#|
 #|     starttime = time.time()
 #|     uvSm_d = ZN(1)
 #|     P = Primes()
@@ -22638,13 +22349,13 @@ if __name__ == "__main__":
 #|         p_i_d = Integer(rqueries_dict[str(p_i)])
 #|         uvSm_d = ZN(uvSm_d * power_mod(p_i_d, exponent, N))
 #|         rqueries_num_accesses += 1
-#| 
+#|
 #|     # This is important when we have a non monic rational polynomial
 #|     sum_ST = sum([k for (a,b),k in ST_list.items()])
 #|     sum_T  = sum([k for (a,b),k in T_list.items()])
 #|     sum_S  = sum_ST - sum_T
 #|     uvSm_d /= g1_d ** sum_S
-#| 
+#|
 #|     Tm_d = ZN(1)
 #|     for (a,b),exponent in T_list.items():
 #|         query_inp = str(a-b*m)
@@ -22665,47 +22376,47 @@ if __name__ == "__main__":
 #|     endtime = time.time()
 #|     params.timing["u/v*S(m)^d"] = endtime-starttime
 #|     timeprint("u/v*S(m)^d took", endtime-starttime)
-#| 
+#|
 #|     if use_target_info_file is None:
 #|         target_info = params.target_info #json.load(open(params.files['TGT_INFO']))
 #|     else:
 #|         target_info = json.load(open(use_target_info_file))
-#| 
+#|
 #|     mask = target_info['mask']
 #|     found = ZN(inverse_mod(Integer(mask), N) * inverse_mod(Integer(R_m), N) * uvSm_d * Um_d * Tm_d)
-#| 
+#|
 #|     fast_persistent_save(found, params.dirs['TEMP_OUTPUT_DIR']+seed_pfx+"found.sobj")
 #|     timeprint("found", str(found))
-#| 
+#|
 #|     timeprint(f"aqueries_num_accesses: {aqueries_num_accesses}")
 #|     timeprint(f"extqueries_num_accesses: {extqueries_num_accesses}")
 #|     timeprint(f"rqueries_num_accesses: {rqueries_num_accesses}")
-#| 
+#|
 #|     return found
-#| 
+#|
 #| @timing
 #| def run_indiv(params, existing_init_data=None):
-#| 
+#|
 #|     # TODO: Add an option to skip descent init,
 #|     # and pull that info from a file. (And don't overwrite the target.)
 #|     # Pending the rest of the new descent init code.
-#| 
+#|
 #|     Path(params.dirs['DESC']).mkdir(exist_ok=True)
-#| 
+#|
 #|     N = params.poly.N
 #|     ZN = Integers(N)
-#| 
+#|
 #|     target = generate_or_load_target(params)
-#| 
+#|
 #|     # The individual computation
-#| 
+#|
 #|     major_message("----Descents----")
-#| 
+#|
 #|     ratio = params.parameters.get('initial_descent_smoothness_ratio', 2.25)
 #|     ratio = float(ratio)
 #|     initial_smoothness_maxbits = params.parameters['MODULUS_BITS'] / 2 / ratio
 #|     initial_smoothness_maxbits = int(initial_smoothness_maxbits)
-#| 
+#|
 #|     for b in range(min(params.parameters['LPB0'],
 #|                        params.parameters['LPB1']),
 #|                    initial_smoothness_maxbits+1):
@@ -22722,17 +22433,17 @@ if __name__ == "__main__":
 #|             n[side] -= b
 #|             print(f"With I={I}, a {b}@{side} special-q"
 #|                   f" will have norms of {n[0]} and {n[1]} bits")
-#| 
+#|
 #|     write_hintfile(params.parameters['desc.hintfile'],params.files['HINTFILE'], params.BOUNDR, params.BOUNDA, params.I_sieving)
-#| 
+#|
 #|     if params.descent_slurm:
 #|         target_info = call_descents_slurm(target, params, existing_init_data)
 #|     else:
 #|         target_info = call_descents(target, params)
-#| 
+#|
 #|     if target_info is None:
 #|         raise RuntimeError("Uh oh! Retried descent too many times.")
-#| 
+#|
 #|     if target_info['lucky']:
 #|         timeprint("Lucky split, computing solution directly")
 #|         mask = ZN(target_info['mask'])
@@ -22744,26 +22455,26 @@ if __name__ == "__main__":
 #|         rquery = lambda p : ZN(rqueries_dict[str(p)])
 #|         found = prod([rquery(p)**mult for (p, mult) in factor(u/v)]) / mask
 #|         return found
-#| 
+#|
 #|     return True
-#| 
+#|
 #| @timing
 #| def run_descent_ecm_init(params):
 #|     # Run and save the init_data to a file, to be consumed by run_indiv.
-#| 
+#|
 #|     Path(params.dirs['DESC']).mkdir(exist_ok=True)
-#| 
+#|
 #|     N = params.poly.N
 #|     ZN = Integers(N)
-#| 
+#|
 #|     params.save_to_file()
 #|     target = generate_or_load_target(params)
-#| 
+#|
 #|     if (not params.slurm) and (not params.descent_slurm):
 #|         seedval = int(time.time()) * 10**6
 #|         call_descent_large_init(target,params,seedval)
 #|         # this will produce only one output file
-#| 
+#|
 #|     else:
 #|         # We would hope to only need one job.
 #|         # However unfortunate errors sometimes come up which cannot be
@@ -22772,7 +22483,7 @@ if __name__ == "__main__":
 #|         # In that case we hope that a different seed has better luck.
 #|         numjobs = params.parameters.get('desc_ecm_init.numjobs', 8)
 #|         processes = []
-#| 
+#|
 #|         for jobnum in range(numjobs):
 #|             seed_j = int(time.time() + jobnum) * 10**6
 #|             command_list = [
@@ -22782,14 +22493,14 @@ if __name__ == "__main__":
 #|                 "--seed", str(seed_j)
 #|             ]
 #|             processes.append(slurmit(params, " ".join(command_list), params.prefix[:-1]+"-ecminit", jobnum))
-#| 
+#|
 #|         finished_processes, cputime_slurm = slurm_wait(processes)
 #|         overall_cputime.add(cputime_slurm)
 #|         print(f"Finished running {numjobs} large descent inits!")
-#| 
+#|
 #|     return True
-#| 
-#| 
+#|
+#|
 #| def check_solution(params,found):
 #|     found_e = power_mod(found, params.parameters['e'], params.poly.N)
 #|     timeprint("Found^e:", found_e, -found_e)
@@ -22798,8 +22509,8 @@ if __name__ == "__main__":
 #|     ok = target in [found_e, -found_e]
 #|     timeprint(f"all good! {HURRAH}" if ok else f"NOK NOK NOK {NOK}")
 #|     assert ok
-#| 
-#| 
+#|
+#|
 #| def parse_config(configfilename):
 #|     """
 #|     parse the .config file, probably from the config/ subdirectory. It's
@@ -22811,7 +22522,7 @@ if __name__ == "__main__":
 #|     # preserve case
 #|     config.optionxform=str
 #|     config.read(configfilename)
-#| 
+#|
 #|     parameters = {}
 #|     for key in config['DEFAULT']:
 #|         if config['DEFAULT'][key].isnumeric():
@@ -22819,11 +22530,11 @@ if __name__ == "__main__":
 #|         else:
 #|             parameters[key] = config['DEFAULT'][key]
 #|     return(parameters)
-#| 
+#|
 #| class Params(object):
 #|     def __init__(self, args):
 #|         locationsfilename = args.locations
-#| 
+#|
 #|         locations_dict = {}
 #|         with open(locationsfilename, "r") as locations:
 #|             for l in locations.readlines():
@@ -22831,17 +22542,17 @@ if __name__ == "__main__":
 #|                     continue
 #|                 if m := re.match(r"^(\w+)=(\S+)\s*$", l.strip()):
 #|                     var,value = m.groups()
-#| 
+#|
 #|                     if var in ['SLURM_JOB_PARTITION', 'BWC_SLURM_JOB_PARTITION']:
 #|                         locations_dict[var] = value
 #|                         continue
-#| 
+#|
 #|                     if os.environ.get(var) is not None:
 #|                         timeprint(f"Using {var} from environment")
 #|                     else:
 #|                         timeprint(f"Using {var} from config file {locationsfilename}")
 #|                         os.environ[var] = value
-#| 
+#|
 #|         CADO_BUILD_DIR          = os.environ['CADO_BUILD_DIR']
 #|         TEMP_OUTPUT_DIR         = os.environ['TEMP_OUTPUT_DIR']
 #|         SAGE                    = os.environ.get('SAGE', 'sage')
@@ -22849,9 +22560,9 @@ if __name__ == "__main__":
 #|         SLURM_EXCLUDE           = os.environ.get('SLURM_EXCLUDE','')
 #|         SLURM_JOB_PARTITION     = locations_dict.get('SLURM_JOB_PARTITION', os.environ.get('SLURM_JOB_PARTITION', 'hiprio'))
 #|         BWC_SLURM_JOB_PARTITION = locations_dict.get('BWC_SLURM_JOB_PARTITION', os.environ.get('BWC_SLURM_JOB_PARTITION', 'hiprio-88-cores'))
-#| 
+#|
 #|         CadoNFSBinaries().set_build_dir(CADO_BUILD_DIR)
-#| 
+#|
 #|         self.cado_nfs_filter = True #args.cado_nfs_filter
 #|         self.sage_linalg = args.sage_linalg
 #|         self.crt_root = args.crt_root
@@ -22887,27 +22598,27 @@ if __name__ == "__main__":
 #|         self.given_A = args.given_A
 #|         self.given_mfb1 = args.given_mfb1
 #|         self.scipy_matrix = args.scipy_matrix
-#| 
+#|
 #|         self.given_prec = args.given_prec
 #|         self.given_mnb = args.given_mnb
 #|         self.given_lub = args.given_lub
 #|         self.given_fin = args.given_fin
 #|         self.given_t = args.given_t
 #|         self.given_pub = args.given_pub
-#| 
+#|
 #|         self.dirs = dict()
 #|         self.files = dict()
 #|         self.timing = dict()
-#| 
+#|
 #|         self.dirs['CADO_BUILD_DIR'] = CADO_BUILD_DIR
-#| 
+#|
 #|         ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
 #|         self.dirs['ROOT_DIR'] = ROOT_DIR
 #|         PARAMS_DIR = os.path.join(ROOT_DIR, "parameters/")
 #|         self.dirs['PARAMS_DIR'] = PARAMS_DIR
-#| 
+#|
 #|         self.parameters = parse_config(args.config)
-#| 
+#|
 #|         self.mpi = args.mpi
 #|         self.mpi_extra_args = args.mpi_extra_args
 #|         if self.mpi:
@@ -22918,16 +22629,16 @@ if __name__ == "__main__":
 #|                 if m:
 #|                     mpi_prefix = m.groups()[0].decode()
 #|                     mpi_mpirun_bin = f"{mpi_prefix}/bin/mpirun"
-#| 
+#|
 #|                     if os.path.isfile(mpi_mpirun_bin):
 #|                         self.mpi_prefix     = mpi_prefix
 #|                         self.mpi_mpirun_bin = mpi_mpirun_bin
 #|                         found_mpi_exec      = True
-#| 
+#|
 #|             if not found_mpi_exec:
 #|                 timeprint("WARNING: Cannot find MPI executable, disabling MPI!")
 #|                 self.mpi = False
-#| 
+#|
 #|             if "mpi.thr" not in self.parameters or self.parameters["mpi.thr"] == "auto":
 #|                 if "SLURM_NPROCS" in os.environ:
 #|                     # Rely on Slurm to get the number of processors available (across
@@ -22941,7 +22652,7 @@ if __name__ == "__main__":
 #|                         # Getting the number of processors is weird on macos
 #|                         self.parameters["mpi.thr"] = 1
 #|             timeprint(f"Using {self.parameters['mpi.thr']} MPI processes.")
-#| 
+#|
 #|             if "bwc.mpi" not in self.parameters or self.parameters["bwc.mpi"] == "auto":
 #|                 if "SLURM_NNODES" in os.environ:
 #|                     self.parameters["bwc.mpi"] = find_factors_close_to_square_root(
@@ -22950,14 +22661,14 @@ if __name__ == "__main__":
 #|                 else:
 #|                     timeprint("WARNING: could not find number of MPI nodes, either set 'bwc.mpi' to <a>x<b> for a*b nodes or use 'salloc' and make sure SLURM_NNODES is set.")
 #|                     self.mpi = False
-#| 
+#|
 #|             if "bwc.mpi_slurm" not in self.parameters and self.mpi and self.bwc_slurm:
 #|                 timeprint("Parameter 'bwc.mpi_slurm' not set, trying to auto detect.")
 #|                 self.parameters["bwc.mpi_slurm"] = "auto"
-#| 
+#|
 #|         if "bwc.thr" not in self.parameters:
 #|             self.parameters["bwc.thr"] = "auto"
-#| 
+#|
 #|         if not "bwc.thr.controller" in self.parameters or self.parameters["bwc.thr.controller"] == "auto":
 #|             if "SLURM_NTASKS_PER_NODE" in os.environ:
 #|                 self.parameters["bwc.thr.controller"] = find_factors_close_to_square_root(
@@ -22968,26 +22679,26 @@ if __name__ == "__main__":
 #|                 self.parameters["bwc.thr.controller"] = find_factors_close_to_square_root(
 #|                     os.cpu_count() // 2
 #|                 )
-#| 
+#|
 #|         cadopoly_in_params = self.parameters.get('cadopoly')
 #|         if cadopoly_in_params is not None:
 #|             self.cadopoly = bool(cadopoly_in_params)
-#| 
+#|
 #|         timeprint("parameters:",self.parameters)
-#| 
+#|
 #|         if m:=re.search(r"(\w+)\.config$", args.config):
 #|             self.prefix = m.group(1) + "/"
 #|         elif (nbits := self.parameters['MODULUS_BITS']) is not None:
 #|             self.prefix = f"n{nbits}/"
 #|         else:
 #|             self.prefix = ""
-#| 
+#|
 #|         temp = TEMP_OUTPUT_DIR + self.prefix
 #|         self.dirs['TEMP_OUTPUT_DIR'] = temp
-#| 
+#|
 #|         timeprint(f"Ensuring {temp} exists")
 #|         Path(temp).mkdir(exist_ok=True)
-#| 
+#|
 #|         self.dirs['DUP'] = temp+"0/"
 #|         self.dirs['BWC'] = temp+"bwc/"
 #|         self.dirs['BWCBINDIR'] = CADO_BUILD_DIR+"linalg/bwc"
@@ -22998,7 +22709,7 @@ if __name__ == "__main__":
 #|         self.files['PYTHON'] = PYTHON
 #|         self.files['LOGFILE'] = temp + "stdoutlog.log"
 #|         self.files['ERRFILE'] = temp + "stderrlog.log"
-#| 
+#|
 #|         self.files['POLYSELECT'] = temp + "polyselect"
 #|         self.files['POLYSELECTOPT'] = temp + "polyselect_ropt"
 #|         self.files['POLYFILE'] = temp + "f.poly"
@@ -23036,21 +22747,21 @@ if __name__ == "__main__":
 #|         self.files['POLYSEL_SELECT_PFX'] = temp + "select/polyselect.out"
 #|         self.files['THE_TARGET'] = temp + "thetarget"
 #|         self.files['GOOD_DESCENT_INIT'] = temp + "good_descent_inits"
-#| 
+#|
 #|         self.files['CPUBINDING_CONF_FILE'] = PARAMS_DIR + "cpubinding.conf"
-#| 
+#|
 #|         Path(temp + "select").mkdir(exist_ok=True)
 #|         Path(temp + "algrels").mkdir(exist_ok=True)
-#| 
+#|
 #|         if not os.path.isfile(CADO_BUILD_DIR + "misc/debug_renumber"):
 #|             raise RuntimeError("Missing requirement: Need to make debug_renumber in the cado-nfs directory.\n")
-#| 
-#| 
+#|
+#|
 #|         self.BOUNDA = 2**self.parameters['LPB1'] # LPB1
 #|         self.BOUNDA_queries = 2**self.parameters['LPB1_queries']
 #|         self.BOUNDR = 2**self.parameters['LPB0'] # LPB0
 #|         self.I_sieving = self.parameters['I_sieving']
-#| 
+#|
 #|         if int(self.parameters['LPB1']) > 32:
 #|             # We need a second, capped factor base file to give to las programs.
 #|             # To be used only for sieving primes, not restricting what can show up in factorizations.
@@ -23058,13 +22769,13 @@ if __name__ == "__main__":
 #|             self.files['CAPPED_FBGZ'] = temp + "capped.fb.gz"
 #|         else:
 #|             self.files['CAPPED_FBGZ'] = self.files['FBFILE']
-#| 
+#|
 #|         # LPB1 algebraic smoothness bound for linear algebra
 #|         # LPB1_queries algebraic smoothness bound for descent and queries
 #|         # LPB0 rational smoothness bound
 #|         # A_sieving precomputation las
 #|         # I_sieving las_descent
-#| 
+#|
 #|         self.has_hwloc = False
 #|         if os.uname().sysname == 'Linux':
 #|             sp = subprocess.run(["readelf", "-d",
@@ -23078,24 +22789,24 @@ if __name__ == "__main__":
 #|                                 stdout=subprocess.PIPE)
 #|             if sp.returncode == 0 and re.search(rb"libhwloc.so", sp.stdout):
 #|                 self.has_hwloc = True
-#| 
+#|
 #|         self.nthreads = multiprocessing.cpu_count()
-#| 
+#|
 #|         if self.has_hwloc:
 #|             self.polyselect_nthreads_or_auto = "auto"
 #|             self.las_job_binding_policy = self.parameters["las.hwloc_job_binding_policy"]
 #|         else:
 #|             self.polyselect_nthreads_or_auto = self.nthreads
 #|             self.las_job_binding_policy = self.nthreads
-#| 
+#|
 #|         # Superseded by self.las_job_binding_policy now.
 #|         del self.parameters["las.hwloc_job_binding_policy"]
-#| 
+#|
 #|         major_message(f"multiprocessing: -t {self.nthreads},",
 #|                       f"for polyselect: -t {self.polyselect_nthreads_or_auto}",
 #|                       f"and for las: -t {self.las_job_binding_policy}")
-#| 
-#| 
+#|
+#|
 #|     @functools.cached_property
 #|     def poly(self):
 #|         filename = self.files['POLYFILE']
@@ -23109,7 +22820,7 @@ if __name__ == "__main__":
 #|             timeprint(f"Computing maximal order of {K} with prime list {primes}")
 #|             OK = K.maximal_order(v=primes, assume_maximal=True)
 #|         return poly
-#| 
+#|
 #|     @functools.cached_property
 #|     def R(self):
 #|         """
@@ -23127,12 +22838,12 @@ if __name__ == "__main__":
 #|         R.read()
 #|         time2 = time.time()
 #|         timeprint("Woo! Finished reading R.")
-#| 
+#|
 #|         self.timing['init_renumberfile'] = time1 - time0
 #|         self.timing['read_renumberfile'] = time2 - time1
-#| 
+#|
 #|         return R
-#| 
+#|
 #|     def save_to_file(self):
 #|         self_dict = {
 #|             'files':                        self.files,
@@ -23148,10 +22859,10 @@ if __name__ == "__main__":
 #|         }
 #|         if hasattr(self,'target'):
 #|             self_dict['target'] = self.target
-#| 
+#|
 #|         with open(self.files['PARAMS'], "w") as fp:
 #|             json_custom.dump(self_dict, fp, indent=True)
-#| 
+#|
 #| if __name__=='__main__':
 #|     parser = argparse.ArgumentParser(prog='run.py', description='eth root computation')
 #|     parser.add_argument('-l','--locations', dest='locations', default="locations.config", required=False)
@@ -23215,11 +22926,11 @@ if __name__ == "__main__":
 #|     parser.add_argument("--given-t", dest='given_t', default=-1)
 #|     parser.add_argument("--given-pub", dest='given_pub', default=-1)
 #|     args = parser.parse_args()
-#| 
+#|
 #|     params = Params(args)
-#| 
+#|
 #|     FILES_TO_PATCH = ["PARAMS", "TGT_INFO"]
-#| 
+#|
 #|     if args.fix_paths:
 #|         for fname in FILES_TO_PATCH:
 #|             with open(params.files[fname], "r+") as fp:
@@ -23228,17 +22939,17 @@ if __name__ == "__main__":
 #|                     params.dirs['TEMP_OUTPUT_DIR'],
 #|                     content,
 #|                     flags=re.M)
-#| 
+#|
 #|                 if nsubs > 0:
 #|                     fp.seek(0)
 #|                     fp.write(patched_content)
-#| 
-#| 
-#| 
-#| 
+#|
+#|
+#|
+#|
 #|     slurm_nnodes = os.environ.get("SLURM_NNODES", "n/a")
 #|     slurm_ntasks_per_node = os.environ.get("SLURM_NTASKS_PER_NODE", "n/a")
-#| 
+#|
 #|     config_info = OrderedDict([
 #|         ("step", args.step),
 #|         ("cado-nfs-filter", True),
@@ -23256,7 +22967,7 @@ if __name__ == "__main__":
 #|         ("slurm_ntasks_per_node", slurm_ntasks_per_node),
 #|         ("debug", args.debug),
 #|     ])
-#| 
+#|
 #|     timing_info = OrderedDict([("run_precomp",0),
 #|                                ("polysel_higheffort_select",1),
 #|                                ("polysel_higheffort_ropt",1),
@@ -23345,8 +23056,8 @@ if __name__ == "__main__":
 #|                                ("padic_eth_root",1),
 #|                                ("U reconstruction",1),
 #|                                ("u/v*S(m)^d",1)])
-#| 
-#| 
+#|
+#|
 #|     def pretty_print(field):
 #|         indent = timing_info[field]
 #|         if field not in params.timing:
@@ -23357,12 +23068,12 @@ if __name__ == "__main__":
 #|             if field_cputime in params.timing:
 #|                 timing += f" (cputime: {params.timing[field_cputime]:.2f}s)"
 #|             print("\t"*indent + f"{field}:", timing)
-#| 
+#|
 #|     def print_config_info():
 #|         major_message("----Config Summary-----")
 #|         for k, v in config_info.items():
 #|             print(f"{k}: {v}")
-#| 
+#|
 #|     def print_timing_info(start=None, end=None):
 #|         print_config_info()
 #|         fields = list(timing_info.keys())
@@ -23371,7 +23082,7 @@ if __name__ == "__main__":
 #|         major_message("----Timing Summary-----")
 #|         for field in fields[start:end]:
 #|             pretty_print(field)
-#| 
+#|
 #|     def print_query_info(ps):
 #|         total = 0
 #|         query_fnames = {
@@ -23389,79 +23100,79 @@ if __name__ == "__main__":
 #|             else:
 #|                 print(f"\t{query_type}: n/a")
 #|         print(f"\tTotal: {total:,}")
-#| 
+#|
 #|     sys.stdout = Logger(params)
 #|     sys.stderr = Logger(params, isstdout=False)
-#| 
+#|
 #|     params.save_to_file()
-#| 
+#|
 #|     if args.step == "info":
 #|         print(params)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "update_alg_unlinked":
 #|         update_collection_of_unlinked_ideals(params, 'alg')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "update_ext_unlinked":
 #|         update_collection_of_unlinked_ideals(params, 'ext')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "gen":
 #|         gen_N(params)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "polysel_select":
 #|         polysel_higheffort_select(params)
 #|         print_timing_info(start='polysel_higheffort_select', end='polysel_higheffort_ropt')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "polysel_ropt":
 #|         polysel_higheffort_ropt(params)
 #|         print_timing_info(start='polysel_higheffort_ropt', end='polysel_higheffort_candidates')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "polysel_candidates":
 #|         polysel_higheffort_candidates(params, ncandidates=100)
 #|         print_timing_info(start='polysel_higheffort_candidates', end='run_polysel')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "precomp":
 #|         run_precomp(params)
 #|         print_timing_info(end='run_queries')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "polysel_only":
 #|         run_polysel(params)
 #|         print_timing_info(end='call_algebraic_query_sieving')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "polysel_alreadysel":
 #|         run_polysel(params, already_selected=True)
 #|         print_timing_info(end='call_algebraic_query_sieving')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "precomp_nopolysel":
 #|         run_precomp(params, nopolysel=True)
 #|         print_timing_info(end='run_queries')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "algebraic_sieving_only":
 #|         call_algebraic_query_sieving(params)
 #|         major_message("Finished query sieving!")
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "extension_only":
 #|         call_fb_extension_sieving(params)
 #|         major_message("Finished extension sieving!")
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "extra_algebraic":
 #|         assert len(params.extra_prefix) > 0, "Need to specify a file prefix for extra sieving!"
 #|         call_algebraic_query_sieving(params, is_extra=True)
 #|         print_timing_info(start='call_algebraic_query_sieving',end='call_fb_extension_sieving')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "extra_granular_algebraic":
 #|         assert len(params.extra_prefix) > 1
 #|         assert int(params.given_A) > 1
@@ -23475,7 +23186,7 @@ if __name__ == "__main__":
 #|         timeprint("Done with extra granular algebraic sieving.")
 #|         major_message("PLEASE CALL update_alg_unlinked.")
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "extra_granular_filter":
 #|         assert len(params.extra_prefix) > 1
 #|         assert int(params.given_A) > 1
@@ -23488,7 +23199,7 @@ if __name__ == "__main__":
 #|                                     is_alg_or_ext=True, is_filter=True)
 #|         timeprint("Done with extra granular algebraic (filter) sieving.")
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "extra_granular_extension":
 #|         assert len(params.extra_prefix) > 1
 #|         assert int(params.given_A) > 1
@@ -23502,70 +23213,70 @@ if __name__ == "__main__":
 #|         timeprint("Done with extra granular extension sieving.")
 #|         major_message("PLEASE CALL update_ext_unlinked.")
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "filter_only":
 #|         MM = filter_relation_file(params)
 #|         major_message("matrix:", MM)
-#| 
+#|
 #|         if 'n1024' not in params.files['RENUMBERFILE']:
 #|             fast_persistent_save(MM, params.dirs['TEMP_OUTPUT_DIR']+"MM.sobj")
-#| 
+#|
 #|         if params.cado_nfs_filter:
 #|             build_killer_rels_dict(params, MM)
 #|         print_timing_info(start='filter_relation_file',end='run_queries')
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step in ["queries", "rqueries", "aqueries", "extqueries"]:
 #|         run_queries(params, [args.step])
 #|         print_timing_info(start='run_queries',end='run_indiv')
 #|         print_query_info(params)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_init":
 #|         result = run_descent_ecm_init(params)
 #|         # TODO: timing info
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_q":
 #|         assert 'slurm.numjobs' in params.parameters
 #|         result = call_descent_large_q_slurm(params, params.use_descent_init_file)
 #|         # TODO: timing info
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "cleanup_large_q":
 #|         do_cleanup_large_q(params)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_las_start":
 #|         assert len(params.use_descent_init_file) > 5
 #|         descent_large_las.start_descent_large_las(params, params.use_descent_init_file)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_las_rebalance":
 #|         assert len(params.use_descent_init_file) > 5
 #|         with open(params.use_descent_init_file, "r") as fp:
 #|             init_dict = json.load(fp)
-#| 
+#|
 #|         seed_ten = str(init_dict['seed'])[:10]
 #|         descent_large_las.rebalance_descent_large_las(params, seed_ten, params.descent_counter)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_las_todo":
 #|         assert len(params.todofile_glob) > 5
 #|         descent_large_las.todofile_descent_large_las(params, params.todofile_glob)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_las_finish":
 #|         assert len(params.use_descent_init_file) > 5
 #|         descent_large_las.finish_descent_large_las(params, params.use_descent_init_file)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_bottom":
 #|         assert len(params.use_descent_init_file) > 5
 #|         assert params.descent_strategy in ['P','C','C1','C2']
 #|         descent_large_las.descent_rock_bottom(params, params.use_descent_init_file, params.descent_strategy)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "descent_large_las_extract":
 #|         assert len(params.use_descent_init_file) > 5
 #|         # a lot is assumed here because it's a very particular use case
@@ -23576,16 +23287,16 @@ if __name__ == "__main__":
 #|         assumed_file = working_dir + "desc.total.rels"
 #|         desired_lpb0 = params.parameters['LPB0']
 #|         desired_lpb1 = params.parameters['LPB1']
-#| 
+#|
 #|         # desired_lpb0 = params.parameters['LAS_DESCENT_UNTIL_LPB0']
 #|         # desired_lpb1 = params.parameters['LAS_DESCENT_UNTIL_LPB1']
-#| 
+#|
 #|         desired_lpb0 = 36
 #|         desired_lpb1 = 35
-#| 
+#|
 #|         descent_large_las.extract_outstanding_qs(params, desired_lpb0, desired_lpb1, assumed_file)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "indiv":
 #|         if len(params.use_descent_init_file) > 2:
 #|             # it's an existing file
@@ -23606,7 +23317,7 @@ if __name__ == "__main__":
 #|         print_timing_info(start='run_indiv')
 #|         print_query_info(params)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "indiv_only":
 #|         if len(params.use_descent_init_file) > 2:
 #|             # it's an existing file
@@ -23621,11 +23332,11 @@ if __name__ == "__main__":
 #|         print_timing_info(start='run_indiv',end='run_linalg')
 #|         print_query_info(params)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "validate_descent":
 #|         run_validate_descent(params, use_target_info_file=params.use_descent_init_file)
 #|         sys.exit(0)
-#| 
+#|
 #|     if args.step == "linalg":
 #|         if len(params.use_descent_init_file) > 2:
 #|             # want to use a specific descent output
@@ -23646,7 +23357,7 @@ if __name__ == "__main__":
 #|         check_solution(params,found)
 #|         print_timing_info(start='run_linalg')
 #|         print_query_info(params)
-#| 
+#|
 #|     if args.step == "linalg_nobwc":
 #|         # We are really only running this for the 1024 computation,
 #|         # so some of this may be geared to work in that setup only.
@@ -23656,15 +23367,15 @@ if __name__ == "__main__":
 #|         found = run_eth_root(params, linalg_output, use_target_info_file=existing_target)
 #|         check_solution(params, found)
 #|         print_timing_info(start='run_linalg_nobwc')
-#| 
+#|
 #|     if args.step == "root":
 #|         if len(params.use_descent_init_file) > 2:
 #|             # want to use a specific descent output
 #|             existing_target = params.use_descent_init_file
-#| 
+#|
 #|             with open(params.use_descent_init_file, "r") as fp:
 #|                 init_dict = json.load(fp)
-#| 
+#|
 #|             seed_ten = str(init_dict['seed'])[:10]
 #|             linalg_output = fast_persistent_load(params.dirs['TEMP_OUTPUT_DIR']+seed_ten+"-linalgoutput.sobj")
 #|         else:
@@ -23672,7 +23383,7 @@ if __name__ == "__main__":
 #|             with open(params.files['TGT_INFO'], "r") as fp:
 #|                 params.target_info = json.load(fp)
 #|             linalg_output = fast_persistent_load(params.dirs['TEMP_OUTPUT_DIR']+"linalgoutput.sobj")
-#| 
+#|
 #|         try:
 #|             found = run_eth_root(params,linalg_output, use_target_info_file=existing_target)
 #|         except Exception as ex:
@@ -23683,12 +23394,12 @@ if __name__ == "__main__":
 #|         check_solution(params,found)
 #|         print_timing_info(start="run_eth_root")
 #|         print_query_info(params)
-#| 
+#|
 #|     if args.step == "serialize_ttplus_ttminus":
 #|         serialize_ttplus_ttminus(params)
 #|         print_timing_info()
 #|         print_query_info(params)
-#| 
+#|
 #|     if args.step == "until_root":
 #|         try:
 #|             run_precomp(params)
@@ -23712,7 +23423,7 @@ if __name__ == "__main__":
 #|         print_query_info(params)
 #|         sys.exit(0)
 #|         os._exit(0)
-#| 
+#|
 #|     if args.step == "all":
 #|         # Else, run all steps
 #|         try:
@@ -23749,55 +23460,55 @@ if __name__ == "__main__":
 #| import argparse
 #| from cado_sage import CadoPolyFile
 #| import padic_eth_root
-#| 
-#| 
+#|
+#|
 #| ABSOLUTELY_NOT = 0
 #| SM_APPEND_WILL_BE_WEIRD = 1
 #| SEEMS_OK = 2
-#| 
-#| 
+#|
+#|
 #| def check_polyfile(polyfile):
 #|     poly = CadoPolyFile(polyfile)
 #|     poly.read()
-#| 
+#|
 #|     e = 65537
 #|     K = poly.K[1]
 #|     alpha = K.gen()
 #|     Kw = poly.nt[1]
 #|     sm_maps = Kw.schirokauer_maps(e)
-#| 
+#|
 #|     OK = K.maximal_order()
 #|     f = K.defining_polynomial()
 #|     lc = f.leading_coefficient()
 #|     alpha_hat = K.gen() * lc
 #|     f_hat = alpha_hat.minpoly()
 #|     disc = f.discriminant()
-#| 
+#|
 #|     if gcd(lc, e) != 1:
 #|         return ABSOLUTELY_NOT
-#| 
+#|
 #|     if valuation(disc, e) >= 2:
 #|         return ABSOLUTELY_NOT
-#| 
+#|
 #|     try:
 #|        p = padic_eth_root.find_inert_prime(poly.f[1])
 #|        assert p > 2
 #|     except ValueError:
 #|         return ABSOLUTELY_NOT
-#| 
+#|
 #|     ideal_fac = OK.fractional_ideal(e).factor()
-#| 
+#|
 #|     print(str(list(ideal_fac)))
-#| 
+#|
 #|     if len(list(ideal_fac)) > 1:
 #|         return SM_APPEND_WILL_BE_WEIRD
-#| 
+#|
 #|     assert gcd(lc, e) == 1
 #|     assert valuation(disc, e) < 2
-#| 
+#|
 #|     return SEEMS_OK
-#| 
-#| 
+#|
+#|
 #| def check_sm_append(cands):
 #|     for c in cands:
 #|         command = [
@@ -23813,8 +23524,8 @@ if __name__ == "__main__":
 #|             "-nsm", "0,6"
 #|         ]
 #|         subprocess.run(command)
-#| 
-#| 
+#|
+#|
 #| def make_fbs(cands):
 #|     for c in cands:
 #|         command = [
@@ -23827,18 +23538,18 @@ if __name__ == "__main__":
 #|             f"n1024/select/good/fb.option.{c}"
 #|         ]
 #|         subprocess.run(command)
-#| 
-#| 
+#|
+#|
 #| if __name__=='__main__':
-#| 
+#|
 #|     candidates = [
 #|         64, 26, 88, 57, 48, 90, 46, 76, 50, 42, 54, 11, 81, 36, 94, 0, 1, 2
 #|     ]
-#| 
+#|
 #|     # check_sm_append(candidates)
-#| 
+#|
 #|     make_fbs(candidates)
-#| 
+#|
 #|     #ngood = 0
 #|     #candidates = glob.glob('n1024/select/polyselect.out.poly.option.[0-9][0-9]')
 #|     #for cand in candidates:
@@ -23846,7 +23557,7 @@ if __name__ == "__main__":
 #|     #    res = check_polyfile(cand)
 #|     #    print(str(cand))
 #|     #    print(str(res))
-#| 
+#|
 #|     #    if res == SEEMS_OK:
 #|     #        ngood += 1
 #|     #        subprocess.run(
@@ -23855,10 +23566,10 @@ if __name__ == "__main__":
 #|     #        subprocess.run(
 #|     #            ["cp", cand + ".only-side1", "n1024/select/good/"]
 #|     #        )
-#| 
+#|
 #|     #print(f"found {ngood} reasonable polynomials")
-#| 
-#| 
+#|
+#|
 #|     # We should run tests for:
 #|     # las at reasonable parameters
 #|     # las_descent at large parameters, to see how skewed of a lattice we can have
@@ -23873,7 +23584,7 @@ if __name__ == "__main__":
 #|  * Use the MAX_THREADS environment variable to cap the number of threads.
 #|  */
 #| #include <cctype>
-#| 
+#|
 #| #include <array>
 #| #include <atomic>
 #| #include <chrono>
@@ -23887,12 +23598,12 @@ if __name__ == "__main__":
 #| #include <string>
 #| #include <thread>
 #| #include <vector>
-#| 
+#|
 #| std::mutex results_mutex;
 #| std::vector<std::pair<std::string, std::string>> extracted_results;
 #| std::atomic<std::uintmax_t> total_bytes_processed {0};
 #| std::atomic<std::size_t> total_extracted {0};
-#| 
+#|
 #| // Maps '0'-'9' to 0-9, and '-' to 10. Returns -1 for invalid characters.
 #| constexpr int char_to_index(char c)
 #| {
@@ -23902,23 +23613,23 @@ if __name__ == "__main__":
 #|         return 10;
 #|     return -1;
 #| }
-#| 
+#|
 #| struct TrieNode {
 #|     std::array<std::unique_ptr<TrieNode>, 11> children;
 #|     bool is_end_of_word = false;
 #| };
-#| 
+#|
 #| class NumericTrie
 #| {
 #|     std::unique_ptr<TrieNode> root;
-#| 
+#|
 #|   public:
 #|     std::size_t size = 0;
 #|     NumericTrie()
 #|         : root(std::make_unique<TrieNode>())
 #|     {
 #|     }
-#| 
+#|
 #|     void insert(std::string const & key)
 #|     {
 #|         size++;
@@ -23927,7 +23638,7 @@ if __name__ == "__main__":
 #|             int idx = char_to_index(c);
 #|             if (idx == -1)
 #|                 continue; // Skip malformed characters
-#| 
+#|
 #|             if (!current->children[idx]) {
 #|                 current->children[idx] = std::make_unique<TrieNode>();
 #|             }
@@ -23935,10 +23646,10 @@ if __name__ == "__main__":
 #|         }
 #|         current->is_end_of_word = true;
 #|     }
-#| 
+#|
 #|     TrieNode const * get_root() const { return root.get(); }
 #| };
-#| 
+#|
 #| void process_chunk_with_trie(std::string const & filename,
 #|                              std::uintmax_t start_offset,
 #|                              std::uintmax_t end_offset,
@@ -23947,12 +23658,12 @@ if __name__ == "__main__":
 #|     std::ifstream file(filename, std::ios::binary);
 #|     if (!file)
 #|         return;
-#| 
+#|
 #|     file.seekg(start_offset);
-#| 
+#|
 #|     std::uintmax_t last_sync_pos = file.tellg();
 #|     std::uintmax_t const update_threshold = 1024 * 1024;
-#| 
+#|
 #|     // Synchronize to the start of the next key/value pair
 #|     if (start_offset > 0) {
 #|         char c;
@@ -23961,7 +23672,7 @@ if __name__ == "__main__":
 #|                 break;
 #|         }
 #|     }
-#| 
+#|
 #|     auto read_until = [&](char target) -> bool {
 #|         char c;
 #|         while (file.get(c)) {
@@ -23970,12 +23681,12 @@ if __name__ == "__main__":
 #|         }
 #|         return false;
 #|     };
-#| 
+#|
 #|     std::string key_buffer;
 #|     std::string val_buffer;
 #|     key_buffer.reserve(256);
 #|     val_buffer.reserve(1024);
-#| 
+#|
 #|     while (file.tellg() != -1 &&
 #|            static_cast<std::uintmax_t>(file.tellg()) < end_offset) {
 #|         std::uintmax_t current_pos = file.tellg();
@@ -23984,21 +23695,21 @@ if __name__ == "__main__":
 #|                                             std::memory_order_relaxed);
 #|             last_sync_pos = current_pos;
 #|         }
-#| 
+#|
 #|         if (!read_until('"'))
 #|             break;
-#| 
+#|
 #|         key_buffer.clear();
 #|         TrieNode const * current_node = trie.get_root();
 #|         bool is_match = true;
 #|         char c;
-#| 
+#|
 #|         // Stream through the key character by character
 #|         while (file.get(c) && c != '"') {
 #|             if (is_match) {
 #|                 key_buffer += c; // Only append while we are matching
 #|                 int idx = char_to_index(c);
-#| 
+#|
 #|                 if (idx != -1 && current_node->children[idx]) {
 #|                     current_node = current_node->children[idx].get();
 #|                 } else {
@@ -24006,15 +23717,15 @@ if __name__ == "__main__":
 #|                 }
 #|             }
 #|         }
-#| 
+#|
 #|         if (is_match && current_node && current_node->is_end_of_word) {
 #|             if (!read_until(':'))
 #|                 break;
-#| 
+#|
 #|             val_buffer.clear();
 #|             bool in_quotes = false;
 #|             bool value_started = false;
-#| 
+#|
 #|             while (file.get(c)) {
 #|                 if (!value_started) {
 #|                     if (std::isspace(c))
@@ -24037,13 +23748,13 @@ if __name__ == "__main__":
 #|                     val_buffer += c;
 #|                 }
 #|             }
-#| 
+#|
 #|             std::lock_guard<std::mutex> lock(results_mutex);
 #|             extracted_results.emplace_back(key_buffer, val_buffer);
 #|             total_extracted.fetch_add(1, std::memory_order_relaxed);
 #|         }
 #|     }
-#| 
+#|
 #|     std::uintmax_t final_pos;
 #|     if (file.tellg() == -1) {
 #|         final_pos = end_offset;
@@ -24055,97 +23766,97 @@ if __name__ == "__main__":
 #|                                         std::memory_order_relaxed);
 #|     }
 #| }
-#| 
+#|
 #| struct ProgressSnapshot {
 #|     std::uintmax_t bytes;
 #|     std::chrono::steady_clock::time_point time;
 #| };
-#| 
+#|
 #| std::deque<ProgressSnapshot> history;
-#| 
+#|
 #| int main(int argc, char * argv[])
 #| {
 #|     if (argc != 4)
 #|         throw std::runtime_error(
 #|             "Usage: ./search_extqueries <json database> <file with "
 #|             "list of queries> <output file>");
-#| 
+#|
 #|     std::string const input_filename = argv[1];
 #|     std::string const queries_filename = argv[2];
 #|     std::string const output_filename = argv[3];
-#| 
+#|
 #|     NumericTrie T;
-#| 
+#|
 #|     {
 #|         std::ifstream queries(queries_filename);
 #|         for (std::string s; std::getline(queries, s);)
 #|             T.insert(s);
 #|     }
-#| 
+#|
 #|     std::uintmax_t file_size = std::filesystem::file_size(input_filename);
 #|     unsigned int num_threads = std::thread::hardware_concurrency();
-#| 
+#|
 #|     if (auto c = getenv("MAX_THREADS"); c != NULL) {
 #|         unsigned int n = std::atoi(c);
 #|         if (n && n < num_threads)
 #|             num_threads = n;
 #|     }
-#| 
+#|
 #|     if (num_threads == 0)
 #|         num_threads = 4;
-#| 
+#|
 #|     std::vector<std::jthread> threads;
 #|     std::uintmax_t chunk_size = file_size / num_threads;
-#| 
+#|
 #|     std::cout << "Processing " << file_size << " bytes across " << num_threads
 #|               << " threads...\n";
-#| 
+#|
 #|     for (unsigned int i = 0; i < num_threads; ++i) {
 #|         std::uintmax_t start = i * chunk_size;
 #|         std::uintmax_t end =
 #|             (i == num_threads - 1) ? file_size : (i + 1) * chunk_size;
-#| 
+#|
 #|         threads.emplace_back(process_chunk_with_trie, input_filename, start,
 #|                              end, std::cref(T));
 #|     }
-#| 
+#|
 #|     auto start_time = std::chrono::steady_clock::now();
 #|     std::uintmax_t processed = 0;
 #|     history.push_back({0, start_time});
-#| 
+#|
 #|     while (processed < file_size) {
 #|         processed = total_bytes_processed.load(std::memory_order_relaxed);
 #|         auto current_time = std::chrono::steady_clock::now();
-#| 
+#|
 #|         history.push_back({processed, current_time});
-#| 
+#|
 #|         if (history.size() > 11)
 #|             history.pop_front();
-#| 
+#|
 #|         std::chrono::duration<double> total_elapsed = current_time - start_time;
-#| 
+#|
 #|         // Prevent division by zero on the very first quick iterations
 #|         if (total_elapsed.count() > 0.1 && processed > 0) {
 #|             int percentage = (processed * 100) / file_size;
-#| 
+#|
 #|             auto const & oldest = history.front();
 #|             std::chrono::duration<double> window_elapsed =
 #|                 current_time - oldest.time;
 #|             double window_elapsed_sec = window_elapsed.count();
-#| 
+#|
 #|             double bytes_per_sec = 0.0;
 #|             if (window_elapsed_sec > 0) {
 #|                 bytes_per_sec = (processed - oldest.bytes) / window_elapsed_sec;
 #|             }
-#| 
+#|
 #|             double speed_mbps = bytes_per_sec / (1024.0 * 1024.0);
-#| 
+#|
 #|             std::uintmax_t remaining_bytes = file_size - processed;
 #|             double eta_sec = remaining_bytes / bytes_per_sec;
-#| 
+#|
 #|             int eta_mins = static_cast<int>(eta_sec) / 60;
 #|             int eta_secs_remainder = static_cast<int>(eta_sec) % 60;
-#| 
+#|
 #|             std::cout << "\rProgress: " << percentage << "% "
 #|                       << "| Speed: " << std::fixed << std::setprecision(1)
 #|                       << speed_mbps << " MB/s "
@@ -24154,16 +23865,16 @@ if __name__ == "__main__":
 #|                       << "| Extracted: " << total_extracted.load() << "/"
 #|                       << T.size << "  " << std::flush;
 #|         }
-#| 
+#|
 #|         if (processed >= file_size)
 #|             break;
 #|         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 #|     }
-#| 
+#|
 #|     std::cout << "\n";
-#| 
+#|
 #|     threads.clear();
-#| 
+#|
 #|     std::ofstream out_file(output_filename);
 #|     if (out_file) {
 #|         out_file << "{\n";
@@ -24179,13 +23890,13 @@ if __name__ == "__main__":
 #|         std::cout << "Successfully wrote " << extracted_results.size()
 #|                   << " pairs to " << output_filename << "\n";
 #|     }
-#| 
+#|
 #|     {
 #|         auto current_time = std::chrono::steady_clock::now();
 #|         std::chrono::duration<double> total_elapsed = current_time - start_time;
 #|         std::chrono::duration<double> elapsed = current_time - start_time;
 #|         double elapsed_sec = elapsed.count();
-#| 
+#|
 #|         double bytes_per_sec = 0.0;
 #|         if (elapsed_sec > 0) {
 #|             bytes_per_sec = total_bytes_processed.load() / elapsed_sec;
@@ -24196,7 +23907,7 @@ if __name__ == "__main__":
 #|                   << " in " << elapsed_sec << " s"
 #|                   << " (" << speed_mbps << " MB/s)\n";
 #|     }
-#| 
+#|
 #|     return 0;
 #| }
 
@@ -24205,35 +23916,35 @@ if __name__ == "__main__":
 #| import re
 #| import json
 #| import sys
-#| 
+#|
 #| def binary_search_json(file_path, target_key:int, chunk_size=1024):
 #|     """
 #|     Searches for a key in a massive JSON file using dichotomy.
 #|     Assumes the file is a single flat dictionary with sorted keys.
-#| 
+#|
 #|     The chunk size must be large enough to hold any key.
 #|     """
 #|     file_size = os.path.getsize(file_path)
 #|     low = 0
 #|     high = file_size
-#| 
+#|
 #|     # Regex to find a key boundary:
 #|     key_pattern = re.compile(rb'"(\d+)"\s*:')
-#| 
+#|
 #|     with open(file_path, 'rb') as f:
 #|         while low <= high:
 #|             mid = (low + high) // 2
-#| 
+#|
 #|             f.seek(mid)
 #|             chunk = f.read(chunk_size)
-#| 
+#|
 #|             if not chunk:
 #|                 # Hit EOF without finding anything; target must be before mid
 #|                 high = mid - 1
 #|                 continue
-#| 
+#|
 #|             matches = list(key_pattern.finditer(chunk))
-#| 
+#|
 #|             valid_match = None
 #|             for m in matches:
 #|                 try:
@@ -24242,36 +23953,36 @@ if __name__ == "__main__":
 #|                     break
 #|                 except ValueError:
 #|                     continue
-#| 
+#|
 #|             if not valid_match:
 #|                 # No key found after 'mid' in this chunk. This usually means
 #|                 # we landed inside a massive value or near the end of the file.
 #|                 # In either case, the target must be before 'mid'.
 #|                 high = mid - 1
 #|                 continue
-#| 
+#|
 #|             match_obj, current = valid_match
 #|             key_absolute_offset = mid + match_obj.start()
-#| 
+#|
 #|             if current == target_key:
 #|                 # KEY FOUND!
 #|                 # Move the cursor to right after the colon to parse the value
 #|                 value_start_offset = mid + match_obj.end()
 #|                 f.seek(value_start_offset)
-#| 
+#|
 #|                 decoder = json.JSONDecoder()
 #|                 buffer = ""
 #|                 read_size = 4096
-#| 
+#|
 #|                 while True:
 #|                     # Read the file in chunks until we have a JSON value
 #|                     data = f.read(read_size)
 #|                     if not data:
 #|                         # Reached EOF unexpectedly
 #|                         return None
-#| 
+#|
 #|                     buffer += data.decode('utf-8', errors='replace')
-#| 
+#|
 #|                     try:
 #|                         # raw_decode extracts exactly one complete JSON value (string, dict, list, etc.)
 #|                         val, _ = decoder.raw_decode(buffer.lstrip())
@@ -24279,7 +23990,7 @@ if __name__ == "__main__":
 #|                     except json.JSONDecodeError:
 #|                         # The buffer doesn't contain a complete JSON value yet; keep reading
 #|                         pass
-#| 
+#|
 #|             elif current < target_key:
 #|                 # The key we found is smaller than the target.
 #|                 # The target must exist strictly after this key.
@@ -24288,15 +23999,15 @@ if __name__ == "__main__":
 #|                 # The first key we found AFTER 'mid' is greater than the target.
 #|                 # Because it was the *first* one found, the target must be BEFORE 'mid'.
 #|                 high = mid - 1
-#| 
+#|
 #|     return None
-#| 
+#|
 #| if __name__ == "__main__":
 #|     if len(sys.argv) < 2:
 #|         raise RuntimeError("Usage: search_rqueries.py <file> <key1> <key2> [...]")
-#| 
+#|
 #|     file_name, *keys = sys.argv[1:]
-#| 
+#|
 #|     for k in keys:
 #|         result = binary_search_json(file_name, int(k))
 #|         if result is not None:
@@ -24306,7 +24017,7 @@ if __name__ == "__main__":
 
 #@ FILE code/sm_cado_sage_helper.py 644 1580 d7b5192942df5c6aafac230077612eeea51fa4548a6928d24654c1f06e099d7b text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| from helpers import timeprint
 #| import multiprocessing
@@ -24324,8 +24035,8 @@ if __name__ == "__main__":
 #| from cado_nfs_binaries import CadoNFS,CadoNFSBinaries
 #| import time
 #| import functools
-#| 
-#| 
+#|
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='sm_cado_sage_helper.py')
 #|     topparser.add_argument('--infile',dest='infile',required=True)
@@ -24333,7 +24044,7 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--e',dest='e',required=True)
 #|     topparser.add_argument('--poly',dest='poly',required=True)
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     e = Integer(topargs.e)
 #|     poly = CadoPolyFile(topargs.poly); poly.read()
 #|     f = poly.f[1]
@@ -24341,9 +24052,9 @@ if __name__ == "__main__":
 #|     alpha = K.gen()
 #|     Kw = poly.nt[1]
 #|     sm_maps = Kw.schirokauer_maps(e)
-#| 
+#|
 #|     outfile = open(topargs.outfile, "w")
-#| 
+#|
 #|     with open(topargs.infile, "r") as infile:
 #|         for line in infile.readlines():
 #|             line = line.strip()
@@ -24353,50 +24064,50 @@ if __name__ == "__main__":
 #|             sm_vec = vector(
 #|                         Integers(e),
 #|                         sum([s(a-b*alpha).list() for s in sm_maps], []))
-#| 
+#|
 #|             sm_str = ",".join( [str(sm_vec[i]) for i in range(len(sm_vec))] )
 #|             outfile.write(sm_str + "\n")
-#| 
+#|
 #|     outfile.close()
 
 #@ FILE code/timing.py 644 3252 45fd3099ac063c6ef3b83a6cb164c410ddd37ef38fef5bf76f3452a1a4c59431 text
 #| import datetime
 #| import inspect
 #| import time
-#| 
+#|
 #| from ast import literal_eval
 #| from functools import wraps
-#| 
+#|
 #| class CpuTime:
 #|     def __init__(self):
 #|         self.t = 0
-#| 
+#|
 #|     def __repr__(self):
 #|         return str(self.t)
-#| 
+#|
 #|     def __str__(self):
 #|         return self.__repr__()
-#| 
+#|
 #|     def add(self, i: int):
 #|         self.t += i
 #|         return self
-#| 
+#|
 #|     def get_time(self):
 #|         return self.t
-#| 
+#|
 #|     def get_time_diff(self, old_t):
 #|         return self.t - old_t
-#| 
+#|
 #| overall_cputime = CpuTime()
-#| 
+#|
 #| def timestamp(ts=None):
 #|     if not ts:
 #|         ts = time.time()
 #|     return datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-#| 
+#|
 #| def timeprint(*args, **kwargs):
 #|     print(f"{timestamp()}:", *args, **kwargs)
-#| 
+#|
 #| def timing(f):
 #|     @wraps(f)
 #|     def wrap(*args, **kw):
@@ -24407,11 +24118,11 @@ if __name__ == "__main__":
 #|         result = f(*args, **kw)
 #|         cpu_te = time.process_time_ns()
 #|         te = time.time()
-#| 
+#|
 #|         t_diff = te - ts
 #|         overall_cputime.add((cpu_te - cpu_ts) / 10**9)
 #|         f_cputime = overall_cputime.get_time_diff(cputime_s)
-#| 
+#|
 #|         timeprint("Finished", f.__name__)
 #|         timeprint(f"function {f.__name__} took {t_diff:2.4f}s wall clock time ({f_cputime:2.4f}s cputime)")
 #|         argdict = inspect.getcallargs(f,*args,**kw)
@@ -24424,12 +24135,12 @@ if __name__ == "__main__":
 #|         if f.__name__ not in params.timing:
 #|             params.timing[f.__name__] = 0
 #|         params.timing[f.__name__] += t_diff
-#| 
+#|
 #|         cpu_time_key = f.__name__ + "_cputime"
 #|         params.timing[cpu_time_key] = params.timing.get(cpu_time_key, 0) + f_cputime
 #|         return result
 #|     return wrap
-#| 
+#|
 #| def extract_time(stderr, parse_multiple=False):
 #|     """
 #|     Parse process timing of the form:
@@ -24441,7 +24152,7 @@ if __name__ == "__main__":
 #|     Look for printed time among the last ten lines
 #|     of stderr output (for robustness against special
 #|     cases add some extra output).
-#| 
+#|
 #|     :param stderr: process stderr output
 #|     :param parse_multiple: Boolean specifying if multiple,
 #|                            back to back time outputs should
@@ -24456,7 +24167,7 @@ if __name__ == "__main__":
 #|         if line_idx >= 10:
 #|             break
 #|         line = lines[line_idx]
-#| 
+#|
 #|         if keys[0] in line:
 #|             idx = 0
 #|             while keys[idx] in line:
@@ -24466,10 +24177,10 @@ if __name__ == "__main__":
 #|                 if (not parse_multiple and idx == 0) or line_idx >= len(lines):
 #|                     break
 #|                 line = lines[line_idx]
-#| 
+#|
 #|         line_idx += 1
 #|     return t
-#| 
+#|
 #| def extract_time_from_file(errfile, parse_multiple=False):
 #|     """
 #|     Read stderr from `errfile` and call extract_time.
@@ -24483,18 +24194,18 @@ if __name__ == "__main__":
 #| """
 #| Build a TOC for an indexed relations file, which must be in plain text format instead of gzipped.
 #| The TOC allows random access lookups of indexed relations by giving the byte-offset in the indexed relations file of the relevant line.
-#| 
+#|
 #| In particular the format of the TOC file is one little-endian uint64 per indexed relation, giving the byte offset of that relation in the indexed relations file.
-#| 
+#|
 #| Why not use a different format for the indexed relations file in the first place? Because the cado-nfs tooling expects the indexed relations file to be in the line-oriented format.
-#| 
+#|
 #| ASSUMPTIONS:
 #|  * The indexed relations file is in plain text instead of gzipped
 #|  * The indexed relations file contains only ASCII (we open it in binary instead of text mode so that seeks take O(1) time)
 #|  * The indexed relations file is no more than 2**64 bytes long
 #|  * Comments start with #
 #| """
-#| 
+#|
 #| class RandomAccessIndexedRelations:
 #|     """
 #|     Indexed relations file supporting array-like access with O(1) lookup time.
@@ -24502,7 +24213,7 @@ if __name__ == "__main__":
 #|     A single instance of RandomAccessIndexedRelations can't safely be used in multiple threads/processes,
 #|     but each thread/process can safely make its own RandomAccessIndexedRelations reading the same file simultaneously.
 #|     Assumes a table of contents has already been created (by running this file or by calling maketoc).
-#| 
+#|
 #|     Example usage:
 #|         with RandomAccessIndexedRelations("aqrels.out.indexed") as rels:
 #|             irel = rels[123]
@@ -24529,7 +24240,7 @@ if __name__ == "__main__":
 #|         self.close()
 #|     def __len__(self):
 #|         raise NotImplementedError("len isn't implemented for RandomAccessIndexedRelations, but it shouldn't be hard to implement if it turns out we need it")
-#|         
+#$         $
 #| def maketoc(infilename, outfilename=None):
 #|     if outfilename is None:
 #|         outfilename = infilename + ".toc"
@@ -24543,7 +24254,7 @@ if __name__ == "__main__":
 #|                     continue
 #|                 outfile.write(struct.pack("<Q", pos))
 #|                 pos = infile.tell()
-#| 
+#|
 #| if __name__ == "__main__":
 #|     from sys import argv
 #|     if len(argv) not in [2,3]:
@@ -24560,7 +24271,7 @@ if __name__ == "__main__":
 
 #@ FILE code/todo_sieving_helper.py 644 1346 cda62da57131348c4a8f7e78121faa840d2be23dfbb62a61dff1e74a6a6e1fc4 text
 #| #!/usr/bin/env sage
-#| 
+#|
 #| from sage.all import *
 #| import argparse
 #| import json
@@ -24568,10 +24279,10 @@ if __name__ == "__main__":
 #| from cado_sage import CadoPolyFile
 #| from relations import strip_rational_part_of_relations
 #| from helpers import do_todo_query_sieving
-#| 
+#|
 #| class Params(dict):
 #|     __getattr__ = dict.get
-#| 
+#|
 #| if __name__=='__main__':
 #|     topparser = argparse.ArgumentParser(prog='todo_sieving_helper.py')
 #|     topparser.add_argument('--params',dest='params')
@@ -24582,14 +24293,14 @@ if __name__ == "__main__":
 #|     topparser.add_argument('--q0',dest='q0')
 #|     topparser.add_argument('--q1',dest='q1')
 #|     topargs = topparser.parse_args()
-#| 
+#|
 #|     # Doing horrible things to fake the params object from a json exportable object
 #|     params = Params(json.loads(open(topargs.params,'r').read()))
 #|     POLYFILE = params.files['POLYFILE']
 #|     poly = CadoPolyFile(POLYFILE); poly.read()
 #|     params.poly = poly
 #|     CadoNFSBinaries().set_build_dir(params.dirs["CADO_BUILD_DIR"])
-#| 
+#|
 #|     do_todo_query_sieving(
 #|         params,
 #|         topargs.roundA,
@@ -24605,15 +24316,15 @@ if __name__ == "__main__":
 #| from sage.structure.factorization import Factorization
 #| from sage.structure.sequence import Sequence
 #| from sage.rings.integer import Integer
-#| 
+#|
 #| """
 #| sage's Factorization objects sort their contents, which is slow and not needed.
 #| It's possible to initialize Factorizations with sort=False, but many methods will
 #| internally create new Factorization objects without sort=False, and thus sort.
-#| 
+#|
 #| So we throw the whole thing out and replace it with a simple hashmap
 #| """
-#| 
+#|
 #| class UnsortedFactorization(Factorization):
 #|     def __init__(self, x, unit=None):
 #|         """
@@ -24627,25 +24338,25 @@ if __name__ == "__main__":
 #|             unit = Integer(1)
 #|         self.__unit = unit
 #|         self.__x = x
-#| 
+#|
 #|     def __iter__(self):
 #|         return iter(self.__x.items())
-#| 
+#|
 #|     def __len__(self):
 #|         return len(self.__x)
-#| 
+#|
 #|     def unit(self):
 #|         return self.__unit
-#| 
+#|
 #|     def __rmul__(self,left):
 #|         """return left * self, where left is not a factorization"""
 #|         x = self.__x.copy()
 #|         x[left] = x.get(left, 0) + 1
 #|         return UnsortedFactorization(x, unit)
-#| 
+#|
 #|     def __mul__(self, other):
 #|         unit = self.__unit
-#|         
+#$         $
 #|         if isinstance(other, UnsortedFactorization):
 #|             x = {}
 #|             for a in set(self.__x).union(set(other.__x)):
@@ -24665,16 +24376,16 @@ if __name__ == "__main__":
 #|             x = self.__x.copy()
 #|             x[other] = x.get(other, 0) + 1
 #|         return UnsortedFactorization(x, unit)
-#|                 
+#$                 $
 #|     def __pow__(self, n):
 #|         n = Integer(n)
 #|         if n == 1: return self
 #|         if n == 0: return UnsortedFactorization({})
 #|         return UnsortedFactorization({p: n*e for (p,e) in self.__x.items()}, unit=self.__unit**n)
-#| 
+#|
 #|     def __invert__(self):
 #|         return UnsortedFactorization({p: -e for (p,e) in self.__x.items()}, unit=self.__unit**(-1))
-#| 
+#|
 #|     def __truediv__(self, other):
 #|         unit = self.__unit
 #|         if not isinstance(other, UnsortedFactorization):
@@ -24688,17 +24399,17 @@ if __name__ == "__main__":
 #|                     del x[a]
 #|             unit *= other.__unit
 #|         return UnsortedFactorization(x, unit)
-#| 
+#|
 #|     def value(self):
 #|         if not hasattr(self, "_prod"):
 #|             from sage.misc.misc_c import prod
 #|             self._prod = prod([p**e for (p,e) in self.__x.items()], self.__unit)
 #|         return self._prod
-#| 
+#|
 #|     def cache_product(self, knownprod):
 #|         """
 #|         Set the cached value of self.prod() to an already-computed value.
-#| 
+#|
 #|         For parallelized Montgomery reduction, worker processes in a ProcessPool will compute I.prod(), and we want to cache that value in a way the main process can use later.
 #|         The normal caching in I.prod() won't work because the worker has a different copy of I than the main process (they communicate via pickled objects).
 #|         So the worker will include I.prod() in its return value, and the main process will cache it using this method.
@@ -24707,10 +24418,10 @@ if __name__ == "__main__":
 #|             print("Warning: called cache_product but prod was already computed!")
 #|             assert knownprod == self._prod, "The product we're tring to cache is wrong, or at least disagrees with the value we already cached"
 #|         self._prod = knownprod
-#| 
+#|
 #|     expand = value
 #|     prod = value
-#| 
+#|
 #|     def gcd(self, other):
 #|         if not isinstance(other, UnsortedFactorization):
 #|             raise TypeError("can't take gcd of factorization and non-factorization")
@@ -24718,7 +24429,7 @@ if __name__ == "__main__":
 #|         for a in set(self.__x).intersection(set(other.__x)):
 #|             x[a] = min(self.__x[a], other.__x[a])
 #|         return UnsortedFactorization(x) # unit disappears
-#| 
+#|
 #|     def lcm(self, other):
 #|         if not isinstance(other, UnsortedFactorization):
 #|             raise TypeError("can't take lcm of factorization and non-factorization")
@@ -24729,15 +24440,15 @@ if __name__ == "__main__":
 
 #@ FILE code/wait_for_file.py 644 2296 0ea0632c10f5acb8e519c5efd91a192b650a076a3b11d3efcf3828faa8aa8075 text
 #| #!/usr/bin/env python3
-#| 
+#|
 #| import argparse
 #| import time
 #| import os
 #| import glob
-#| 
+#|
 #| MAX_WAIT_DEFAULT = 120000
 #| MAX_INTERVAL_DEFAULT = 100
-#| 
+#|
 #| def wait_for_file(files, interval=MAX_INTERVAL_DEFAULT, max_wait=MAX_WAIT_DEFAULT):
 #|     """
 #|     Stall until all files specified in `files` appear, checking every `interval` ms
@@ -24746,24 +24457,24 @@ if __name__ == "__main__":
 #|     wait_time = 0
 #|     while wait_time < max_wait:
 #|         t_start = time.time() * 1000
-#| 
+#|
 #|         all_present = True
 #|         for fpath in files:
 #|             matched_files = list(glob.glob(fpath))
 #|             if len(matched_files) == 0:
 #|                 all_present = False
 #|                 break
-#| 
-#| 
+#|
+#|
 #|         if all_present:
 #|             return True
-#| 
+#|
 #|         time.sleep(interval / 1000)
-#| 
+#|
 #|         wait_time += (time.time() * 1000) - t_start
-#| 
+#|
 #|     return False
-#| 
+#|
 #| def wait_for_file_content(file, contents, interval=MAX_INTERVAL_DEFAULT, max_wait=MAX_WAIT_DEFAULT):
 #|     """
 #|     Stall until the string `content` appears in the file `file`, checking every `interval` ms
@@ -24781,24 +24492,24 @@ if __name__ == "__main__":
 #|                 return True
 #|         time.sleep(interval / 1000)
 #|         wait_time += (time.time() * 1000) - t_start
-#| 
+#|
 #|     print(f"wait_for_file_content: reached max wait time waiting for string '{content}' to appear in {file}")
 #|     return False
-#|     
+#$     $
 #| if __name__ == "__main__":
 #|     parser = argparse.ArgumentParser(prog='wait_for_file.py',
 #|         description='Helper script to stall until specified file(s) appear (on NFS).')
-#| 
+#|
 #|     parser.add_argument("-f", "--file", type=str, nargs="+", help="Files to monitor.")
 #|     parser.add_argument("-i", "--interval", type=int, default=MAX_INTERVAL_DEFAULT, help="Sleep between checks for file (in ms).")
 #|     parser.add_argument("-m", "--max", type=int, default=MAX_WAIT_DEFAULT, help="Maximum time to wait for file(s).")
-#| 
+#|
 #|     args = parser.parse_args()
-#| 
+#|
 #|     files       = args.file
 #|     interval    = args.interval
 #|     max_wait    = args.max
-#| 
+#|
 #|     if wait_for_file(files, interval, max_wait):
 #|         exit(0)
 #|     exit(1)
@@ -24816,14 +24527,14 @@ if __name__ == "__main__":
 #|     Increasing it means more queries and more precomputation relations, but easier smoothness in descent.
 #|     In precomputation, we find only 1 relation for every ideal in this factor base.
 #|     It doesn't affect linear algebra (other than constructing and truncating S).
-#| 
+#|
 #| Note that:
 #| ```
 #| BOUNDR := 2**LPB0
 #| BOUNDA := 2**LPB1
 #| BOUNDA_queries := 2**LPB1_queries
 #| ```
-#| 
+#|
 #| * `poly.admin`, `poly.admax`:
 #|     Bounds on the leading (degree-d) coefficient of the polynomial.
 #| * `poly.Bf`:
@@ -24836,44 +24547,44 @@ if __name__ == "__main__":
 #|     We only want deg(f)+1 solutions but changing bwc.numsols can be mysteriously helpful.
 #| * `descent_init.lpb`:
 #|     Currently this should not be set higher than 102, else the special-q's can be too big.
-#| 
+#|
 #| `las.hwloc_job_binding_policy`:
 #|     This parameter defines the --job-binding-policy or -t argument for las, described in a
 #|     very confusing usage string in las-parallel.cpp (see extended_usage() around line 750).
-#| 
+#|
 #|     In brief: it defines how jobs are bound to NUMA nodes, memory and CPU cores.
-#| 
+#|
 #|     The easiest options are 1) to set this to a single integer, the number of threads,
 #|     or 2) to 'auto', which is actually hard coded to "node,fit*4,fit,pu,loose" (see below).
-#| 
+#|
 #|     The larger the computation gets, the more likely it is that 'auto' might fail because
 #|     the resources don't work out anymore. In that case you need to manually tune the policy
 #|     based on the estimated memory requirement of the las jobs.
-#| 
+#|
 #|     My rough understanding of the policy "node,fit*4,fit,pu,loose" is:
 #|         - node: Bind memory to NUMA nodes.
 #|         - fit*4: Bind jobs to CPUs such that they distribute equally across "bundles" of 4 CPUs per bundle.
 #|         - fit: fit as many jobs as we have memory for across the CPU bundles above.
 #|         - pu: every job has as many threads as we have virtual cores (they call them PU).
 #|         - loose: don't abort if the jobs can't fit.
-#| 
+#|
 #|     Concretely, most of our cluster A nodes had the following topology:
 #|         - 2 NUMA nodes
 #|         - 22 physical cores per NUMA node
 #|         - 2 virtual cores (or PUs) per physical core (hyperthreading)
 #|         - 512 GB memory
-#| 
+#|
 #|     Thus, the above allocation first assigns memory to two sets of 22 physical cores. Then it equally
 #|     distributes jobs into bundles of 11 (44 = 11 * 4) cores each. Say our jobs need 10 GB of memory.
 #|     And we have 512 GB / 88 PU ~= 5.8 GB memory per PU. Thus, we need at least 2 PUs per job, which
 #|     means one physical core. Thus, we just assign one job to every physical core.
-#| 
+#|
 #|     Now, if every job need 20 GB of memory, we need 4 PUs per job, i.e., two physical cores. However,
 #|     we cannot split the bundle of 11 cores into pairs of 2 cores each and so the allocation fails with
 #|     error "las_parallel_desc::bad_specification". A working policy would be: "node,fit*2,fit,pu,loose",
 #|     because then bundles have 22 physical cores each, so we can assign 11 jobs to two physical cores
 #|     (i.e., 4 PUs) each.
-#| 
+#|
 #| A few notes on n768 and beyond:
 #| * LPBs: These can be at most `2**31` for the sieving factor base. If higher, we need
 #|             the large-LPB build, and 2+ factor base files.
@@ -24894,12 +24605,12 @@ if __name__ == "__main__":
 #| @@ -140,7 +140,7 @@ ab_pair::ab_pair(char const * p)
 #|      std::istringstream is(S);
 #|      is.imbue(std::locale(std::locale(), new relation_locale()));
-#|  
+#$  $
 #| -    if (!(is >> std::hex >> a() >> expect(",") >> b() >> expect(":")))
 #| +    if (!(is >> std::hex >> a() >> expect(",") >> b()))
 #|          throw std::runtime_error(fmt::format("parse error on {}", S));
 #|  }
-#|  
+#$  $
 
 #@ FILE patches/2026_02_25_cado_bwc_prep.patch 644 713 6a6cfc913a0ae40a06156a65886bf753867f840aaab113c3700fda09da427c69 text
 #| diff --git a/linalg/bwc/prep.cpp b/linalg/bwc/prep.cpp
@@ -24946,13 +24657,13 @@ if __name__ == "__main__":
 #| +import tqdm
 #| +
 #| +from concurrent.futures import ProcessPoolExecutor
-#|  
+#$  $
 #|  from sage.matrix.constructor import matrix
 #|  from sage.rings.finite_rings.finite_field_constructor import GF
 #| @@ -18,6 +22,53 @@ from .balancing import BwcBalancing, BwcShuffling
-#|  
+#$  $
 #|  from sage.rings.integer_ring import ZZ
-#|  
+#$  $
 #| +import numpy as np
 #| +from scipy.sparse import csr_array
 #| +
@@ -25000,7 +24711,7 @@ if __name__ == "__main__":
 #| +
 #| +    return batch_inline_col_weights, batch_inline_data
 #| +
-#|  
+#$  $
 #|  class BwcMatrix(object):
 #|      """
 #| @@ -41,9 +92,13 @@ class BwcMatrix(object):
@@ -25026,7 +24737,7 @@ if __name__ == "__main__":
 #| +            print(f"Exception while reading {self.filename} {NOK}",
 #|                    file=sys.stderr)
 #|              raise e
-#|  
+#$  $
 #| @@ -198,6 +253,7 @@ class BwcMatrix(object):
 #|          self.row_weights = []
 #|          try:
@@ -25135,15 +24846,15 @@ if __name__ == "__main__":
 #|          else:
 #|              self.row_weights = inline_row_weights
 #|              self.nrows_orig = len(self.row_weights)
-#|  
+#$  $
 #| +        print("starting col_weights asserts")
 #|          if self.col_weights:
 #|              icw = inline_col_weights
 #|              assert self.col_weights[:len(icw)] == icw
 #| @@ -295,6 +389,7 @@ class BwcMatrix(object):
-#|  
+#$  $
 #|          self.ncoeffs = len(inline_data)
-#|  
+#$  $
 #| +        print("compute r2")
 #|          if self.nrows_orig:
 #|              r2 = sum([float(x * x) for x in inline_row_weights]) / self.nrows_orig
@@ -25151,7 +24862,7 @@ if __name__ == "__main__":
 #| @@ -303,6 +398,7 @@ class BwcMatrix(object):
 #|              rmean = 0
 #|              rsdev = 0
-#|  
+#$  $
 #| +        print("compute c2")
 #|          if self.ncols_orig:
 #|              c2 = sum([float(x * x) for x in inline_col_weights]) / self.ncols_orig
@@ -25159,7 +24870,7 @@ if __name__ == "__main__":
 #| @@ -323,23 +419,43 @@ class BwcMatrix(object):
 #|              self.nrows = max(self.nrows_orig, self.ncols_orig)
 #|              self.ncols = max(self.nrows_orig, self.ncols_orig)
-#|  
+#$  $
 #| -        self.MZ = matrix(ZZ, self.nrows, self.ncols, sparse=True)
 #| -        if self.params.p == 2:
 #| -            for i, j in inline_data:
@@ -25203,9 +24914,9 @@ if __name__ == "__main__":
 #|          if self.balancing is not None:
 #|              self.balancing.read()
 #|              self.S = BwcShuffling(self.params, self)
-#|  
+#$  $
 #| -        self.M = self.MZ.change_ring(GF(self.params.p))
 #| -
 #|      def __subM(self, i, j):
 #|          return self.submatrices[i][j].M
-#|  
+#$  $
