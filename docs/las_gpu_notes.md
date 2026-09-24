@@ -132,3 +132,42 @@ PoCL (CPU OpenCL, so no GPU is needed to develop and test).
 - Whether the sieving/cofactorization split makes this worth it — measure
   with `las -v` on a small config (e.g. `config/n192.config`) before
   committing to integration.
+
+## Estimating the win on a target GPU cluster
+
+Two measured inputs decide the end-to-end speedup; neither should be guessed:
+
+1. **Cofactorization fraction `f` of `las`** (Amdahl ceiling). Measure with
+   `code/gpu/las_profiling.md` + `las_split.py`. It is strongly `mfb`-driven:
+   on the c60 test poly, cofactorization went 8% -> 45% -> 79% of
+   sieve+cofactor as `mfb1` went 38 -> 60 -> 80. The production configs use
+   larger `mfb` (n1024: `sieve.mfb1=120`, `desc.mfb1=150`), so
+   cofactorization is expected to dominate there. Ceiling = `1/(1-f)`
+   (e.g. f=0.8 -> 5x).
+
+2. **Kernel throughput on the actual device** (curves/sec). Measure with
+   `code/gpu/ecm_bench.py` on the target (it reports kernel-only and
+   end-to-end curves/sec, and runs on any OpenCL device incl. PoCL/CPU).
+
+End-to-end speedup over an N-core CPU socket:
+
+    speedup ~= 1 / ( (1 - f) + f / (cluster_cps / cpu_socket_cps) )
+
+with `cpu_socket_cps ~= 92k * cores` from the CADO baseline at B1=600.
+
+### Notes for an AMD Radeon Pro V340 cluster (2x Vega 10 / GCN5 per card)
+- The kernels are **64-bit-integer** heavy (`mul_hi(ulong,ulong)`). GCN5 runs
+  32-bit integer at full rate but **synthesizes 64-bit multiply**, so the
+  current 2x64-bit-limb kernel leaves a large factor on the table on Vega. A
+  **32-bit-limb rewrite** (4 limbs for 128-bit, explicit carries) is the main
+  optimization for this hardware and is the standard approach in GPU-ECM
+  literature (Bernstein et al.; NVIDIA CGBN).
+- Confirm ROCm/OpenCL compute actually runs on the V340 (it is an MxGPU/
+  SR-IOV virtualization card) before benchmarking.
+- Cofactorization is embarrassingly parallel (independent survivor x curve
+  work items), so it scales ~linearly across GPUs and nodes; the cluster
+  multiplies the per-GPU `curves/sec`. The bottleneck is `f` and host<->device
+  feed rate, not scaling.
+- Do not trust the PoCL-on-CPU throughput here (~12k curves/sec, 4 cores) as a
+  GPU predictor: PoCL adds overhead and the 64-bit path is slow; it is a
+  correctness/development number only.
