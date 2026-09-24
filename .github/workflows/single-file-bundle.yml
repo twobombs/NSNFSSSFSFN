@@ -1,0 +1,43 @@
+name: single-file bundle
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract bundle and verify checksums
+        run: bash NSNFSSSFSFN.bundle.sh -C "$RUNNER_TEMP/extracted"
+
+      - name: Bundle matches the repository tree
+        run: |
+          # Every tracked file (except the bundle itself) must be reproduced
+          # byte for byte; otherwise regenerate with tools/make_single_file.py.
+          status=0
+          while IFS= read -r -d '' line; do
+            mode=${line%% *}; path=${line#*$'\t'}
+            [ "$path" = NSNFSSSFSFN.bundle.sh ] && continue
+            out="$RUNNER_TEMP/extracted/$path"
+            case "$mode" in
+              160000) [ -d "$out" ] || { echo "missing submodule dir: $path"; status=1; } ;;
+              120000) [ "$(readlink "$out")" = "$(readlink "$path")" ] || { echo "symlink differs: $path"; status=1; } ;;
+              *) cmp -s "$path" "$out" || { echo "stale or missing: $path"; status=1; } ;;
+            esac
+          done < <(git ls-files -s -z)
+          extra=$(cd "$RUNNER_TEMP/extracted" && find . \( -type f -o -type l \) | sed 's|^\./||' | sort)
+          tracked=$(git ls-files | grep -vx NSNFSSSFSFN.bundle.sh | sort)
+          if [ "$(comm -23 <(echo "$extra") <(echo "$tracked"))" != "" ]; then
+            echo "bundle contains files no longer tracked:"; comm -23 <(echo "$extra") <(echo "$tracked"); status=1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::NSNFSSSFSFN.bundle.sh is out of date; run: python3 tools/make_single_file.py"
+          fi
+          exit "$status"
+
+      - name: Generator still runs
+        run: python3 tools/make_single_file.py -o "$RUNNER_TEMP/regenerated.sh" && bash "$RUNNER_TEMP/regenerated.sh" --list > /dev/null
