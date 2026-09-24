@@ -64,10 +64,76 @@ which wins there. The 32-bit backend now covers stage 1 **and** stage 2.
 - Integration into `las`'s batch cofactorization path (`ecm/batch.cpp`) is a
   separate, larger effort (see the notes doc).
 
-## Run
+## Command-line usage
+
+Install the dependencies once (PoCL provides a CPU OpenCL device, so no GPU is
+required to develop):
 
 ```bash
-pip install pyopencl numpy sympy pocl-binary-distribution   # PoCL = CPU OpenCL
-PYOPENCL_CTX=0 python3 test_mont128.py
-PYOPENCL_CTX=0 python3 ecm_ocl.py   # stage 1+2 self-test
+pip install pyopencl numpy sympy pocl-binary-distribution
+```
+
+Every tool selects its OpenCL device from the `PYOPENCL_CTX` environment
+variable (e.g. `PYOPENCL_CTX=0`); omit it to be prompted interactively.
+
+### `ecm_bench.py` — throughput benchmark
+
+The benchmark is this script itself (there is no `--bench` flag). Each run
+prints **kernel-only** curves/sec (pure device time — this is what scales
+across a GPU or cluster) and **end-to-end** curves/sec (including the
+host-side Brent-Suyama parameterization).
+
+| option | default | meaning |
+|--------|---------|---------|
+| `--list-devices` | off | list OpenCL platforms/devices (name, type, compute units, clock, memory), then exit |
+| `--curves N` | 100000 | number of `(cofactor, sigma)` work items |
+| `--b1 N` | 600 | stage-1 smoothness bound B1 |
+| `--b2 N` | 0 | stage-2 bound; `> --b1` enables stage 2, `0` = stage 1 only |
+| `--d N` | 32 | stage-2 giant/baby-step size |
+| `--reps N` | 5 | timed repetitions (reports the best) |
+| `--limb {64,32}` | 64 | arithmetic backend: `64` = `mont128` (2×64-bit), `32` = `mont32` (4×32-bit, GPU-friendly) |
+
+```bash
+# see what OpenCL devices exist and pick an index for PYOPENCL_CTX
+PYOPENCL_CTX=0 python3 ecm_bench.py --list-devices
+
+# default stage-1 benchmark (100k curves, B1=600, 64-bit limbs)
+PYOPENCL_CTX=0 python3 ecm_bench.py
+
+# the comparison that matters on a GPU (e.g. Radeon Pro V340): 64- vs 32-bit
+PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600 --limb 64
+PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600 --limb 32
+
+# full stage 1+2 (enable stage 2 with --b2 > --b1), both backends
+PYOPENCL_CTX=0 python3 ecm_bench.py --curves 100000 --b1 600 --b2 5000 --limb 64
+PYOPENCL_CTX=0 python3 ecm_bench.py --curves 100000 --b1 600 --b2 5000 --limb 32
+
+# sweep B1 to see throughput drop as stage-1 work grows
+for b1 in 315 600 3000; do PYOPENCL_CTX=0 python3 ecm_bench.py --b1 $b1; done
+
+# a quick, low-variance smoke run
+PYOPENCL_CTX=0 python3 ecm_bench.py --curves 20000 --reps 3
+```
+
+### Validation / self-tests (no options)
+
+These take no CLI options; each runs a fixed check and prints a pass/fail
+summary. Device is still `PYOPENCL_CTX`.
+
+```bash
+PYOPENCL_CTX=0 python3 ecm_ocl.py         # 64-bit stage 1+2 self-test (bit-exact vs reference)
+PYOPENCL_CTX=0 python3 ecm32_validate.py  # 32-bit stage 1+2 validation vs reference & 64-bit
+PYOPENCL_CTX=0 python3 test_mont128.py    # 64-bit Montgomery arithmetic unit tests
+PYOPENCL_CTX=0 python3 test_mont32.py     # 32-bit Montgomery arithmetic unit tests
+```
+
+### `las_split.py` — sieving-vs-cofactorization split
+
+Takes a `las -v -v` log on **stdin** or as a **file argument** (no other
+options); prints the split and the Amdahl ceiling. See `las_profiling.md` for
+producing the input.
+
+```bash
+<las> ... -v -v | python3 las_split.py     # pipe a live run
+python3 las_split.py las_output.log        # or parse a saved log
 ```
