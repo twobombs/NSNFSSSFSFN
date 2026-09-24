@@ -161,7 +161,11 @@ with `cpu_socket_cps ~= 92k * cores` from the CADO baseline at B1=600.
   current 2x64-bit-limb kernel leaves a large factor on the table on Vega. A
   **32-bit-limb rewrite** (4 limbs for 128-bit, explicit carries) is the main
   optimization for this hardware and is the standard approach in GPU-ECM
-  literature (Bernstein et al.; NVIDIA CGBN).
+  literature (Bernstein et al.; NVIDIA CGBN). This is now implemented as
+  `code/gpu/mont32.cl` + `ecm32.cl` (stage 1), validated bit-for-bit against
+  the reference and against the 64-bit kernel. On CPU/PoCL it is slower than
+  the 64-bit backend (native 64-bit multiply), as expected; the win is on the
+  GPU -- benchmark with `ecm_bench.py --limb 32` on the V340 to confirm.
 - Confirm ROCm/OpenCL compute actually runs on the V340 (it is an MxGPU/
   SR-IOV virtualization card) before benchmarking.
 - Cofactorization is embarrassingly parallel (independent survivor x curve

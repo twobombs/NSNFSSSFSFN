@@ -16,10 +16,24 @@ This directory holds a standalone, validated OpenCL implementation:
 | `ecm_ocl.py` | host driver + Brent-Suyama parameterization (exact, matches CADO `-ecm`), stage-2 plan, and a self-test |
 | `ecm_bench.py` | throughput benchmark (curves/sec) for any OpenCL device (run it on your GPU) |
 | `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
+| `mont32.cl` | 128-bit Montgomery arithmetic with **32-bit limbs** (GPU-friendly: no 64-bit `mul_hi`) |
+| `ecm32.cl` | ECM stage 1 on the 32-bit-limb field (same formulas as `ecm.cl`) |
+| `test_mont32.py`, `ecm32_validate.py` | unit tests + bit-for-bit validation of the 32-bit kernel |
 
 Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
 exactly on the host so a given sigma yields the same curve CADO uses. Stage 1
 multiplies `P0` by `E = prod p^k ≤ B1`.
+
+## 64-bit vs 32-bit limbs
+
+Two arithmetic backends compute the same results: `mont128.cl` uses 2x64-bit
+limbs (`mul_hi(ulong,ulong)`), `mont32.cl` uses 4x32-bit limbs (only
+`uint*uint` products). On a **CPU** (incl. PoCL) the 64-bit backend is faster
+because the CPU multiplies 64-bit natively — measured here ~13k vs ~9k
+curves/sec. On **GCN/Vega and most GPUs**, 64-bit integer multiply is
+synthesized from 32-bit ops, so the **32-bit backend is expected to be
+faster**; that is the whole reason it exists. Benchmark both on the target
+(`ecm_bench.py --limb 32` vs `--limb 64`) to see which wins there.
 
 ## Validation (PoCL CPU OpenCL — no GPU needed to develop)
 

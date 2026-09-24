@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+Validate the 32-bit-limb ECM stage-1 kernel (ecm32.cl) against the pure-Python
+reference ECM in ecm_ocl.py, bit-for-bit, and check the two kernels (64-bit
+mont128 and 32-bit mont32) agree on the factors they find.
+"""
+import os
+import random
+import numpy as np
+import pyopencl as cl
+
+import ecm_ocl as e
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MASK32 = (1 << 32) - 1
+
+
+def to4(x):
+    return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+
+
+def from4(a):
+    return sum(int(v) << (32 * i) for i, v in enumerate(a))
+
+
+def run32(cofactors, sigmas, B1, ctx):
+    q = cl.CommandQueue(ctx)
+    src = open(os.path.join(HERE, "mont32.cl")).read() + "\n" + \
+        open(os.path.join(HERE, "ecm32.cl")).read()
+    prog = cl.Program(ctx, src).build()
+    mf = cl.mem_flags
+    E = e.stage1_E(B1)
+    ebits = e.ebits_msb(E)
+    R = 1 << 128
+    items = []
+    for ci, n in enumerate(cofactors):
+        ninv = (-pow(n, -1, 1 << 32)) & MASK32
+        for sg in sigmas:
+            bs = e.brent_suyama(n, sg)
+            if bs[0] == "factor":
+                continue
+            x0, z0, b = bs
+            items.append((n, ninv, x0 * R % n, z0 * R % n, b * R % n, ci, sg))
+    cnt = len(items)
+    n_np = np.stack([to4(it[0]) for it in items])
+    ninv_np = np.array([it[1] for it in items], dtype=np.uint32)
+    x0_np = np.stack([to4(it[2]) for it in items])
+    z0_np = np.stack([to4(it[3]) for it in items])
+    b_np = np.stack([to4(it[4]) for it in items])
+    eb_np = np.array(ebits, dtype=np.uint8)
+
+    def buf(a):
+        return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
+    d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
+    xz = np.empty((cnt * 2, 4), dtype=np.uint32)
+    g = np.empty((cnt, 4), dtype=np.uint32)
+    d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, xz.nbytes)
+    d_g = cl.Buffer(ctx, mf.WRITE_ONLY, g.nbytes)
+    k = cl.Kernel(prog, "ecm32_stage1")
+    k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+    cl.enqueue_nd_range_kernel(q, k, (cnt,), None)
+    cl.enqueue_copy(q, xz, d_xz)
+    cl.enqueue_copy(q, g, d_g)
+    q.finish()
+    return items, xz, g, ebits
+
+
+def main():
+    rng = random.Random(77)
+    from sympy import nextprime
+    cof = []
+    for _ in range(300):
+        p = int(nextprime(rng.getrandbits(rng.randint(24, 34))))
+        qq = int(nextprime(rng.getrandbits(rng.randint(60, 80))))
+        if (p * qq).bit_length() < 127:
+            cof.append(p * qq)
+    sigmas = list(range(6, 26))
+    B1 = 600
+    ctx = cl.create_some_context()
+
+    items, xz, g, ebits = run32(cof, sigmas, B1, ctx)
+    R = 1 << 128
+    # 1) 32-bit kernel ladder == python reference, bit-for-bit
+    mism = 0
+    for idx, it in enumerate(items):
+        n = it[0]
+        x0 = it[2] * pow(R, -1, n) % n
+        z0 = it[3] * pow(R, -1, n) % n
+        b = it[4] * pow(R, -1, n) % n
+        rx, rz = e.ref_ladder((x0, z0), ebits, n, b)
+        kx = from4(xz[2 * idx]) * pow(R, -1, n) % n
+        kz = from4(xz[2 * idx + 1]) * pow(R, -1, n) % n
+        if (kx, kz) != (rx, rz):
+            mism += 1
+    print("mont32 kernel ladder == python reference for all %d items: %s"
+          % (len(items), mism == 0))
+
+    # 2) factors valid, and same finds as the 64-bit kernel
+    found32 = {(it[5], it[6]) for idx, it in enumerate(items)
+               if 1 < from4(g[idx]) < it[0] and it[0] % from4(g[idx]) == 0}
+    r64 = e.run(cof, sigmas, B1, ctx=ctx)
+    found64 = {(ci, sg) for ci, sg, f in r64[0]}
+    print("mont32 finds %d, mont128 finds %d, identical set: %s"
+          % (len(found32), len(found64), found32 == found64))
+    ok = (mism == 0 and found32 == found64)
+    print("32-BIT VALIDATION OK" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
