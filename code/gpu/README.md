@@ -14,6 +14,8 @@ This directory holds a standalone, validated OpenCL implementation:
 | `ecm_stage2.cl` | ECM **stage 2**: baby-step/giant-step "product of point differences" over primes in `(B1,B2]`, one `gcd` |
 | `test_mont128.py` | unit tests for the 128-bit ops vs Python (6 moduli × 20k samples) |
 | `ecm_ocl.py` | host driver + Brent-Suyama parameterization (exact, matches CADO `-ecm`), stage-2 plan, and a self-test |
+| `ecm_bench.py` | throughput benchmark (curves/sec) for any OpenCL device (run it on your GPU) |
+| `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
 
 Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
 exactly on the host so a given sigma yields the same curve CADO uses. Stage 1

@@ -15,9 +15,9 @@
 #  GENERATED FILE -- do not edit by hand. Regenerate with:
 #      python3 tools/make_single_file.py
 #
-#  Generated from commit: c06206eebd2f60f96af4dd4597bf0dd797425591
-#  Files: 140 regular, 1 symlink(s), 1 submodule(s)
-#  Total unpacked size: 67965631 bytes
+#  Generated from commit: c58d5c7a748030a434c4c3aa61c87338b5750d75
+#  Files: 143 regular, 1 symlink(s), 1 submodule(s)
+#  Total unpacked size: 67995092 bytes
 #
 # -----------------------------------------------------------------------------
 #  USAGE
@@ -126,7 +126,7 @@
 
 set -euo pipefail
 
-BUNDLE_COMMIT='c06206eebd2f60f96af4dd4597bf0dd797425591'
+BUNDLE_COMMIT='c58d5c7a748030a434c4c3aa61c87338b5750d75'
 DEST='NSNFSSSFSFN'
 MODE=extract
 FORCE=0
@@ -266,8 +266,11 @@ if [ "$MODE" != list ]; then mkdir -p "$DEST"; fi
 #   file      code/fb_extension_sieving_helper.py
 #   file      code/gpu/README.md
 #   file      code/gpu/ecm.cl
+#   file      code/gpu/ecm_bench.py
 #   file      code/gpu/ecm_ocl.py
 #   file      code/gpu/ecm_stage2.cl
+#   file      code/gpu/las_profiling.md
+#   file      code/gpu/las_split.py
 #   file      code/gpu/mont128.cl
 #   file      code/gpu/test_mont128.py
 #   file      code/helpers.py
@@ -5096,8 +5099,8 @@ if __name__=='__main__':
 
 NSNF_EOF_bf8ddf5cd6cdf07d
 
-# ===== FILE: code/gpu/README.md (2914 bytes, 55 lines) =====
-f 'code/gpu/README.md' 644 2914 9836d23238c370f771de03a78dafbe4492ed602a4cca0f650e0752213327bf60 text <<'NSNF_EOF_9836d23238c370f7'
+# ===== FILE: code/gpu/README.md (3129 bytes, 57 lines) =====
+f 'code/gpu/README.md' 644 3129 0c57e5cffdabf91b9022b85e7dfa60c3946e2e67e9f8d83f5f2e876e58e643e4 text <<'NSNF_EOF_0c57e5cffdabf91b'
 # GPU ECM cofactorization for CADO `las`
 
 Toward GPU-accelerating the dominant cost of the computation (CADO `las`,
@@ -5114,6 +5117,8 @@ This directory holds a standalone, validated OpenCL implementation:
 | `ecm_stage2.cl` | ECM **stage 2**: baby-step/giant-step "product of point differences" over primes in `(B1,B2]`, one `gcd` |
 | `test_mont128.py` | unit tests for the 128-bit ops vs Python (6 moduli × 20k samples) |
 | `ecm_ocl.py` | host driver + Brent-Suyama parameterization (exact, matches CADO `-ecm`), stage-2 plan, and a self-test |
+| `ecm_bench.py` | throughput benchmark (curves/sec) for any OpenCL device (run it on your GPU) |
+| `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
 
 Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
 exactly on the host so a given sigma yields the same curve CADO uses. Stage 1
@@ -5154,7 +5159,7 @@ PYOPENCL_CTX=0 python3 test_mont128.py
 PYOPENCL_CTX=0 python3 ecm_ocl.py   # stage 1+2 self-test
 ```
 
-NSNF_EOF_9836d23238c370f7
+NSNF_EOF_0c57e5cffdabf91b
 
 # ===== FILE: code/gpu/ecm.cl (3638 bytes, 89 lines) =====
 f 'code/gpu/ecm.cl' 644 3638 16ccef03aab70e62fe3e2bf8643f13694707cdffd6b221571ef6f02370a94d88 text <<'NSNF_EOF_16ccef03aab70e62'
@@ -5249,6 +5254,206 @@ __kernel void ecm_stage1(__global const u128* n_g,
 /* Stage 2 lives in ecm_stage2.cl (added and validated separately). */
 
 NSNF_EOF_16ccef03aab70e62
+
+# ===== FILE: code/gpu/ecm_bench.py (7724 bytes, 195 lines) =====
+f 'code/gpu/ecm_bench.py' 644 7724 49663dfd34a1b71dc27527e74a5dd8e7eb061416dfdaf87d16112f7b7fd63434 text <<'NSNF_EOF_49663dfd34a1b71d'
+#!/usr/bin/env python3
+"""
+Throughput benchmark for the OpenCL ECM cofactorization kernels, to run on a
+real target device (e.g. a Radeon Pro V340 GPU) and replace the estimates in
+docs/las_gpu_notes.md with a measured curves/sec number.
+
+It reports two numbers, because they scale differently:
+
+  * kernel-only curves/sec  -- pure device dispatch time (enqueue -> finish),
+    everything already resident on the device. This is what scales with GPU
+    lanes and across a cluster.
+  * end-to-end curves/sec   -- including the host-side Brent-Suyama
+    parameterization (currently pure-Python bignum) and the host<->device
+    copies. The parameterization is negligible next to the ladder and can be
+    moved on-device or pipelined; this number is the pessimistic bound today.
+
+Select the device with PYOPENCL_CTX (e.g. PYOPENCL_CTX=0). With no GPU it runs
+on any OpenCL platform including PoCL (CPU), which is how it was developed.
+
+Examples:
+  PYOPENCL_CTX=0 python3 ecm_bench.py --list-devices
+  PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600
+  PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600 --b2 5000
+"""
+import argparse
+import os
+import random
+import time
+
+import numpy as np
+import pyopencl as cl
+
+import ecm_ocl as e   # same directory
+
+
+def list_devices():
+    for pi, p in enumerate(cl.get_platforms()):
+        for di, d in enumerate(p.get_devices()):
+            gmhz = d.max_clock_frequency
+            print("platform %d / device %d: %s | %s | %d CU @ %d MHz | "
+                  "%.1f GB | OpenCL %s"
+                  % (pi, di, d.name.strip(), cl.device_type.to_string(d.type),
+                     d.max_compute_units, gmhz,
+                     d.global_mem_size / 2**30, d.opencl_c_version))
+
+
+def _rand_cofactors(count, rng):
+    """count semiprimes < 2^127 with a ~26-34 bit factor (realistic leftovers)."""
+    from sympy import nextprime
+    out = []
+    while len(out) < count:
+        p = int(nextprime(rng.getrandbits(rng.randint(26, 34))))
+        q = int(nextprime(rng.getrandbits(70)))
+        n = p * q
+        if n.bit_length() < 127:
+            out.append(n)
+    return out
+
+
+def bench(curves, B1, B2, D, reps, ctx):
+    """Time the device kernels over `curves` (cofactor,sigma) work items."""
+    q = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
+    src = (open(os.path.join(e.HERE, "mont128.cl")).read() + "\n" +
+           open(os.path.join(e.HERE, "ecm.cl")).read() + "\n" +
+           open(os.path.join(e.HERE, "ecm_stage2.cl")).read())
+
+    rng = random.Random(1234)
+    # one sigma per cofactor keeps host prep proportional to `curves`
+    cofs = _rand_cofactors(curves, rng)
+    sigmas_per = [11]
+
+    do_stage2 = B2 > B1
+    E = e.stage1_E(B1)
+    ebits = e.ebits_msb(E)
+    pj, pk, n_giant = e.stage2_pairs(B1, B2, D) if do_stage2 else ([], [], 1)
+
+    opts = ["-DMAXD=%d" % (D + 1), "-DMAXG=%d" % (n_giant + 1)]
+    prog = cl.Program(ctx, src).build(options=opts)
+    mf = cl.mem_flags
+
+    # ---- host-side parameterization (timed as "host prep") ----
+    t0 = time.perf_counter()
+    R = 1 << 128
+    items = []
+    for n in cofs:
+        invm = (-pow(n, -1, 1 << 64)) & e.MASK64
+        for sg in sigmas_per:
+            bs = e.brent_suyama(n, sg)
+            if bs[0] == "factor":
+                continue
+            x0, z0, b = bs
+            items.append((n, invm, x0 * R % n, z0 * R % n, b * R % n))
+    cnt = len(items)
+    n_np = np.stack([e.u128_np(it[0]) for it in items]).astype(np.uint64)
+    invm_np = np.array([it[1] for it in items], dtype=np.uint64)
+    x0_np = np.stack([e.u128_np(it[2]) for it in items]).astype(np.uint64)
+    z0_np = np.stack([e.u128_np(it[3]) for it in items]).astype(np.uint64)
+    b_np = np.stack([e.u128_np(it[4]) for it in items]).astype(np.uint64)
+    eb_np = np.array(ebits, dtype=np.uint8)
+    host_prep = time.perf_counter() - t0
+
+    def buf(a):
+        return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                         hostbuf=np.ascontiguousarray(a))
+    d_n = buf(n_np); d_invm = buf(invm_np)
+    d_x0 = buf(x0_np); d_z0 = buf(z0_np); d_b = buf(b_np); d_eb = buf(eb_np)
+    d_xz = cl.Buffer(ctx, mf.READ_WRITE, cnt * 2 * 16)
+    d_g1 = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+    k1 = cl.Kernel(prog, "ecm_stage1")
+    k1.set_args(d_n, d_invm, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g1)
+
+    k2 = d_g2 = d_pj = d_pk = None
+    if do_stage2:
+        d_pj = buf(np.array(pj, dtype=np.uint32))
+        d_pk = buf(np.array(pk, dtype=np.uint32))
+        d_g2 = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+        k2 = cl.Kernel(prog, "ecm_stage2")
+        k2.set_args(d_n, d_invm, d_b, d_xz, np.uint32(D), np.uint32(n_giant),
+                    d_pj, d_pk, np.uint32(len(pj)), d_g2)
+
+    # Dispatch in chunks via a global-work offset. A real GPU could take the
+    # whole batch at once, but PoCL is unstable launching a huge global size
+    # over the stage-2 kernel's private-memory tables; chunking is also how a
+    # streaming batch would feed the device. All buffers stay resident, so this
+    # still measures device throughput, not host copies.
+    CHUNK = 4096
+
+    def dispatch():
+        for s in range(0, cnt, CHUNK):
+            m = min(CHUNK, cnt - s)
+            cl.enqueue_nd_range_kernel(q, k1, (m,), None, global_work_offset=(s,))
+            if do_stage2:
+                cl.enqueue_nd_range_kernel(q, k2, (m,), None, global_work_offset=(s,))
+        q.finish()
+
+    dispatch()   # warm-up
+
+    best = float("inf")
+    total = 0.0
+    for _ in range(reps):
+        t = time.perf_counter()
+        dispatch()
+        dt = time.perf_counter() - t
+        best = min(best, dt)
+        total += dt
+    kernel_avg = total / reps
+
+    return {
+        "curves": cnt, "B1": B1, "B2": B2, "stage2": do_stage2,
+        "kernel_best_s": best, "kernel_avg_s": kernel_avg,
+        "host_prep_s": host_prep,
+        "kernel_cps": cnt / best,
+        "endtoend_cps": cnt / (best + host_prep),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument("--list-devices", action="store_true")
+    ap.add_argument("--curves", type=int, default=100000,
+                    help="number of (cofactor,sigma) work items")
+    ap.add_argument("--b1", type=int, default=600)
+    ap.add_argument("--b2", type=int, default=0,
+                    help="stage-2 bound; >b1 enables stage 2 (0 = stage 1 only)")
+    ap.add_argument("--d", type=int, default=32, help="stage-2 giant/baby size")
+    ap.add_argument("--reps", type=int, default=5)
+    args = ap.parse_args()
+
+    ctx = cl.create_some_context()
+    dev = ctx.devices[0]
+    print("device: %s (%s, %d CU @ %d MHz)"
+          % (dev.name.strip(), cl.device_type.to_string(dev.type),
+             dev.max_compute_units, dev.max_clock_frequency))
+    if args.list_devices:
+        list_devices()
+        return 0
+
+    r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
+    stage = "stage 1+2" if r["stage2"] else "stage 1"
+    print("\n%s  B1=%d%s  work items=%d  reps=%d"
+          % (stage, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
+             r["curves"], args.reps))
+    print("  kernel-only : best %.4f s  -> %s curves/sec"
+          % (r["kernel_best_s"], f"{r['kernel_cps']:,.0f}"))
+    print("  host prep   : %.4f s (pure-Python Brent-Suyama, movable on-device)"
+          % r["host_prep_s"])
+    print("  end-to-end  : %s curves/sec (kernel + host prep)"
+          % f"{r['endtoend_cps']:,.0f}")
+    print("\nCompare to the CPU baseline in docs/las_gpu_notes.md")
+    print("(CADO ECM ~92k curves/sec/core at B1=600 on the dev Xeon).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+NSNF_EOF_49663dfd34a1b71d
 
 # ===== FILE: code/gpu/ecm_ocl.py (12457 bytes, 361 lines) =====
 f 'code/gpu/ecm_ocl.py' 644 12457 a17b31eb2bc49041a05919518f319b251a798e87a5b64da2f25946b9b05f5063 text <<'NSNF_EOF_a17b31eb2bc49041'
@@ -5683,6 +5888,150 @@ __kernel void ecm_stage2(__global const u128* n_g,
 }
 
 NSNF_EOF_78b3ca8344cec6e2
+
+# ===== FILE: code/gpu/las_profiling.md (2449 bytes, 59 lines) =====
+f 'code/gpu/las_profiling.md' 644 2449 82234399a3b766d62657ac3f166da9264aae25943489c7df1f6933df646f165b text <<'NSNF_EOF_82234399a3b766d6'
+# Measuring the sieving vs cofactorization split in `las`
+
+The GPU ECM kernels here accelerate **cofactorization** only. How much that
+helps end to end is capped by cofactorization's share of `las` time (Amdahl).
+That share is **not fixed** — it grows sharply with `mfb` (the large-prime
+cofactor bound), and the real configs use large `mfb`. Measure it on your own
+config rather than assuming; `las_split.py` does the arithmetic.
+
+## Build `las`
+
+On top of the `testbench` recipe in `../../docs/las_gpu_notes.md`, `las` also
+needs hwloc:
+
+```bash
+apt-get install -y libgmp-dev libhwloc-dev python3-flask python3-requests
+cd code/cado
+make las makefb          # -> build/<host>/sieve/{las,makefb}
+```
+
+`las` prints the split only when built **without** `-production` (the default
+`make` build is fine) and run at **verbose level 2** (`-v -v`).
+
+## Run and parse
+
+Quickest self-contained check, using a bundled test polynomial:
+
+```bash
+B=code/cado/build/vm/sieve
+P=code/cado/tests/misc/c60.poly
+$B/makefb -poly $P -lim 111342 -maxbits 10 -out /tmp/c60.fb1
+$B/las -poly $P -fb1 /tmp/c60.fb1 -lim0 78682 -lim1 111342 \
+       -lpb0 18 -lpb1 19 -mfb0 17 -mfb1 80 -I 10 \
+       -q0 200000 -q1 202000 -v -v -t 1 \
+  | python3 code/gpu/las_split.py
+```
+
+`las_split.py` reads the `# Total cpu time … sieving S … factor F …` line and
+prints the cofactorization fraction plus the Amdahl ceiling for a
+cofactorization-only GPU speedup.
+
+To profile a **real** config from this repo, run `las` with that config's
+`lpb`/`mfb`/`A`/`lim` (see `code/config/nNNN.config` and the `las` calls in
+`code/helpers.py` `do_algebraic_query_sieving` / `do_fb_extension_sieving`) on
+its generated poly + factor base, adding `-v -v`, and pipe to `las_split.py`.
+
+## Measured on this box (c60 poly, one q-block) — the split is mfb-driven
+
+| `mfb1` | sieving | cofactor | cofactor share |
+|------:|--------:|---------:|---------------:|
+| 38 | 1.1 s | 0.1 s | **8%** |
+| 60 | 1.2 s | 1.0 s | 45% |
+| 80 | 1.2 s | 4.6 s | **79%** |
+
+At `mfb1=80` cofactorization is ~79% of sieve+cofactor, so moving only
+cofactorization to the GPU has an Amdahl ceiling of `1/(1-0.79) ≈ 4.8×`
+end to end. The production configs use larger `mfb` still (e.g. n1024:
+`sieve.mfb1=120`, `desc.mfb1=150`), so cofactorization is expected to be the
+**dominant** `las` cost there — which is exactly where a fast GPU cofactorizer
+pays off. Measure your real config to get the exact ceiling.
+
+NSNF_EOF_82234399a3b766d6
+
+# ===== FILE: code/gpu/las_split.py (2680 bytes, 75 lines) =====
+f 'code/gpu/las_split.py' 644 2680 2e4bedf481c3b7a43bf58095976b475e40ffecd3f83c6e8ed6202f89881bb082 text <<'NSNF_EOF_2e4bedf481c3b7a4'
+#!/usr/bin/env python3
+"""
+Parse a CADO `las` verbose run and report the sieving-vs-cofactorization
+split -- the Amdahl fraction that caps how much GPU cofactorization can help
+end to end.
+
+`las` (built WITHOUT -production, run at verbose level 2, e.g. `-v -v`) prints:
+
+  # Total cpu time T s, useful U s [norm a+b, sieving S (...), factor F (...),
+    rest R], wasted+waited W s, rest ...
+
+where `sieving S` is total sieve time and `factor F` is cofactorization time.
+The cofactorization fraction of the *useful* CPU time is F / (norm + S + F + R);
+the fraction of sieve+cofac is F / (S + F).
+
+Usage:
+  <las> -v -v <las-args...>  2>&1 | python3 las_split.py
+  python3 las_split.py las_output.log
+
+See las_profiling.md for how to produce the input on a real config.
+"""
+import re
+import sys
+
+LINE = re.compile(
+    r"# Total cpu time ([\d.]+)s, useful ([\d.]+)s \[norm ([\d.]+)\+([\d.]+), "
+    r"sieving ([\d.]+).*?factor ([\d.]+)")
+
+
+def parse(text):
+    rows = []
+    for m in LINE.finditer(text):
+        total, useful, n0, n1, sieving, factor = map(float, m.groups())
+        rows.append(dict(total=total, useful=useful, norm=n0 + n1,
+                         sieving=sieving, factor=factor))
+    return rows
+
+
+def main():
+    text = open(sys.argv[1]).read() if len(sys.argv) > 1 else sys.stdin.read()
+    rows = parse(text)
+    if not rows:
+        sys.stderr.write(
+            "no '# Total cpu time ... sieving ... factor ...' line found.\n"
+            "Build las WITHOUT -production and run it at verbose level 2 "
+            "(-v -v); see las_profiling.md.\n")
+        return 2
+    # aggregate (a run may print several special-q blocks)
+    norm = sum(r["norm"] for r in rows)
+    siev = sum(r["sieving"] for r in rows)
+    fact = sum(r["factor"] for r in rows)
+    useful = sum(r["useful"] for r in rows)
+    sf = siev + fact
+    print("las timing over %d block(s):" % len(rows))
+    print("  norm       : %10.2f s" % norm)
+    print("  sieving    : %10.2f s" % siev)
+    print("  cofactor   : %10.2f s" % fact)
+    print("  useful cpu : %10.2f s" % useful)
+    print()
+    if sf > 0:
+        print("  cofactorization / (sieving+cofactor) = %.1f%%" % (100 * fact / sf))
+    if useful > 0:
+        f = fact / useful
+        print("  cofactorization / useful cpu         = %.1f%%" % (100 * f))
+        print()
+        print("  Amdahl ceiling if ONLY cofactorization is moved to the GPU:")
+        for sp in (5, 10, 50, 1e9):
+            cap = 1.0 / ((1 - f) + f / sp)
+            tag = "inf" if sp > 1e8 else "%gx" % sp
+            print("    kernel %-4s faster -> %.2fx end-to-end" % (tag, cap))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+NSNF_EOF_2e4bedf481c3b7a4
 
 # ===== FILE: code/gpu/mont128.cl (4154 bytes, 126 lines) =====
 f 'code/gpu/mont128.cl' 644 4154 8127ca85ab4b507b6bb446d21d1e136004d7776bb42d63c66778639813684937 text <<'NSNF_EOF_8127ca85ab4b507b'
@@ -75442,8 +75791,8 @@ f 'data1024/thetarget' 644 309 7ed183d75d59ba87b70d3bc6ae7eb59e394cf779719e888c2
 
 NSNF_EOF_7ed183d75d59ba87
 
-# ===== FILE: docs/las_gpu_notes.md (6647 bytes, 134 lines) =====
-f 'docs/las_gpu_notes.md' 644 6647 e939015c6f8da5a3c402bd74418e1050e8cf28926021b9fe2b6af2b81f0ac7ca text <<'NSNF_EOF_e939015c6f8da5a3'
+# ===== FILE: docs/las_gpu_notes.md (8699 bytes, 173 lines) =====
+f 'docs/las_gpu_notes.md' 644 8699 43cfcd58141d348f7dc6521cdc1ab4b76ff87ba496ae31b74b70f95006186b6d text <<'NSNF_EOF_43cfcd58141d348f'
 # Moving `las` toward the GPU: target, build recipe, and baseline
 
 Working notes for accelerating the dominant cost of the computation. The
@@ -75579,10 +75928,49 @@ PoCL (CPU OpenCL, so no GPU is needed to develop and test).
   with `las -v` on a small config (e.g. `config/n192.config`) before
   committing to integration.
 
-NSNF_EOF_e939015c6f8da5a3
+## Estimating the win on a target GPU cluster
 
-# ===== FILE: nsnfsssfsfn.py (1100492 bytes, 26034 lines) =====
-f 'nsnfsssfsfn.py' 755 1100492 356c4f1dc8cc423b77f32601f25e6d6ea7c820563942ddb61eb3aa5a9e06d580 text <<'NSNF_EOF_356c4f1dc8cc423b'
+Two measured inputs decide the end-to-end speedup; neither should be guessed:
+
+1. **Cofactorization fraction `f` of `las`** (Amdahl ceiling). Measure with
+   `code/gpu/las_profiling.md` + `las_split.py`. It is strongly `mfb`-driven:
+   on the c60 test poly, cofactorization went 8% -> 45% -> 79% of
+   sieve+cofactor as `mfb1` went 38 -> 60 -> 80. The production configs use
+   larger `mfb` (n1024: `sieve.mfb1=120`, `desc.mfb1=150`), so
+   cofactorization is expected to dominate there. Ceiling = `1/(1-f)`
+   (e.g. f=0.8 -> 5x).
+
+2. **Kernel throughput on the actual device** (curves/sec). Measure with
+   `code/gpu/ecm_bench.py` on the target (it reports kernel-only and
+   end-to-end curves/sec, and runs on any OpenCL device incl. PoCL/CPU).
+
+End-to-end speedup over an N-core CPU socket:
+
+    speedup ~= 1 / ( (1 - f) + f / (cluster_cps / cpu_socket_cps) )
+
+with `cpu_socket_cps ~= 92k * cores` from the CADO baseline at B1=600.
+
+### Notes for an AMD Radeon Pro V340 cluster (2x Vega 10 / GCN5 per card)
+- The kernels are **64-bit-integer** heavy (`mul_hi(ulong,ulong)`). GCN5 runs
+  32-bit integer at full rate but **synthesizes 64-bit multiply**, so the
+  current 2x64-bit-limb kernel leaves a large factor on the table on Vega. A
+  **32-bit-limb rewrite** (4 limbs for 128-bit, explicit carries) is the main
+  optimization for this hardware and is the standard approach in GPU-ECM
+  literature (Bernstein et al.; NVIDIA CGBN).
+- Confirm ROCm/OpenCL compute actually runs on the V340 (it is an MxGPU/
+  SR-IOV virtualization card) before benchmarking.
+- Cofactorization is embarrassingly parallel (independent survivor x curve
+  work items), so it scales ~linearly across GPUs and nodes; the cluster
+  multiplies the per-GPU `curves/sec`. The bottleneck is `f` and host<->device
+  feed rate, not scaling.
+- Do not trust the PoCL-on-CPU throughput here (~12k curves/sec, 4 cores) as a
+  GPU predictor: PoCL adds overhead and the 64-bit path is slow; it is a
+  correctness/development number only.
+
+NSNF_EOF_43cfcd58141d348f
+
+# ===== FILE: nsnfsssfsfn.py (1114833 bytes, 26371 lines) =====
+f 'nsnfsssfsfn.py' 755 1114833 3dfac1f219a68e2ef791e61cc8d22b60ae95bcf4fa1698ddd4bf111e1aec21bf text <<'NSNF_EOF_3dfac1f219a68e2e'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -75593,8 +75981,8 @@ Paper: https://eprint.iacr.org/2026/2131.pdf (eprint 2026/2131)
 GENERATED FILE -- do not edit by hand. Regenerate with:
     python3 tools/make_single_python.py
 
-Generated from commit c06206eebd2f60f96af4dd4597bf0dd797425591
-Embedded: 121 files (1009854 bytes) from code/ and patches/,
+Generated from commit c58d5c7a748030a434c4c3aa61c87338b5750d75
+Embedded: 124 files (1022922 bytes) from code/ and patches/,
 plus the code/cado submodule pin and the code/cado_sage symlink.
 
 This one file holds every source in code/ (run.py, helpers.py, descent,
@@ -80610,7 +80998,7 @@ if __name__ == "__main__":
 #$     $
 #|     do_fb_extension_sieving(params,jobnum=topargs.jobnum,q0=topargs.q0,q1=topargs.q1)
 
-#@ FILE code/gpu/README.md 644 2914 9836d23238c370f771de03a78dafbe4492ed602a4cca0f650e0752213327bf60 text
+#@ FILE code/gpu/README.md 644 3129 0c57e5cffdabf91b9022b85e7dfa60c3946e2e67e9f8d83f5f2e876e58e643e4 text
 #| # GPU ECM cofactorization for CADO `las`
 #|
 #| Toward GPU-accelerating the dominant cost of the computation (CADO `las`,
@@ -80627,6 +81015,8 @@ if __name__ == "__main__":
 #| | `ecm_stage2.cl` | ECM **stage 2**: baby-step/giant-step "product of point differences" over primes in `(B1,B2]`, one `gcd` |
 #| | `test_mont128.py` | unit tests for the 128-bit ops vs Python (6 moduli × 20k samples) |
 #| | `ecm_ocl.py` | host driver + Brent-Suyama parameterization (exact, matches CADO `-ecm`), stage-2 plan, and a self-test |
+#| | `ecm_bench.py` | throughput benchmark (curves/sec) for any OpenCL device (run it on your GPU) |
+#| | `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
 #|
 #| Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
 #| exactly on the host so a given sigma yields the same curve CADO uses. Stage 1
@@ -80757,6 +81147,203 @@ if __name__ == "__main__":
 #| }
 #|
 #| /* Stage 2 lives in ecm_stage2.cl (added and validated separately). */
+
+#@ FILE code/gpu/ecm_bench.py 644 7724 49663dfd34a1b71dc27527e74a5dd8e7eb061416dfdaf87d16112f7b7fd63434 text
+#| #!/usr/bin/env python3
+#| """
+#| Throughput benchmark for the OpenCL ECM cofactorization kernels, to run on a
+#| real target device (e.g. a Radeon Pro V340 GPU) and replace the estimates in
+#| docs/las_gpu_notes.md with a measured curves/sec number.
+#|
+#| It reports two numbers, because they scale differently:
+#|
+#|   * kernel-only curves/sec  -- pure device dispatch time (enqueue -> finish),
+#|     everything already resident on the device. This is what scales with GPU
+#|     lanes and across a cluster.
+#|   * end-to-end curves/sec   -- including the host-side Brent-Suyama
+#|     parameterization (currently pure-Python bignum) and the host<->device
+#|     copies. The parameterization is negligible next to the ladder and can be
+#|     moved on-device or pipelined; this number is the pessimistic bound today.
+#|
+#| Select the device with PYOPENCL_CTX (e.g. PYOPENCL_CTX=0). With no GPU it runs
+#| on any OpenCL platform including PoCL (CPU), which is how it was developed.
+#|
+#| Examples:
+#|   PYOPENCL_CTX=0 python3 ecm_bench.py --list-devices
+#|   PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600
+#|   PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600 --b2 5000
+#| """
+#| import argparse
+#| import os
+#| import random
+#| import time
+#|
+#| import numpy as np
+#| import pyopencl as cl
+#|
+#| import ecm_ocl as e   # same directory
+#|
+#|
+#| def list_devices():
+#|     for pi, p in enumerate(cl.get_platforms()):
+#|         for di, d in enumerate(p.get_devices()):
+#|             gmhz = d.max_clock_frequency
+#|             print("platform %d / device %d: %s | %s | %d CU @ %d MHz | "
+#|                   "%.1f GB | OpenCL %s"
+#|                   % (pi, di, d.name.strip(), cl.device_type.to_string(d.type),
+#|                      d.max_compute_units, gmhz,
+#|                      d.global_mem_size / 2**30, d.opencl_c_version))
+#|
+#|
+#| def _rand_cofactors(count, rng):
+#|     """count semiprimes < 2^127 with a ~26-34 bit factor (realistic leftovers)."""
+#|     from sympy import nextprime
+#|     out = []
+#|     while len(out) < count:
+#|         p = int(nextprime(rng.getrandbits(rng.randint(26, 34))))
+#|         q = int(nextprime(rng.getrandbits(70)))
+#|         n = p * q
+#|         if n.bit_length() < 127:
+#|             out.append(n)
+#|     return out
+#|
+#|
+#| def bench(curves, B1, B2, D, reps, ctx):
+#|     """Time the device kernels over `curves` (cofactor,sigma) work items."""
+#|     q = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
+#|     src = (open(os.path.join(e.HERE, "mont128.cl")).read() + "\n" +
+#|            open(os.path.join(e.HERE, "ecm.cl")).read() + "\n" +
+#|            open(os.path.join(e.HERE, "ecm_stage2.cl")).read())
+#|
+#|     rng = random.Random(1234)
+#|     # one sigma per cofactor keeps host prep proportional to `curves`
+#|     cofs = _rand_cofactors(curves, rng)
+#|     sigmas_per = [11]
+#|
+#|     do_stage2 = B2 > B1
+#|     E = e.stage1_E(B1)
+#|     ebits = e.ebits_msb(E)
+#|     pj, pk, n_giant = e.stage2_pairs(B1, B2, D) if do_stage2 else ([], [], 1)
+#|
+#|     opts = ["-DMAXD=%d" % (D + 1), "-DMAXG=%d" % (n_giant + 1)]
+#|     prog = cl.Program(ctx, src).build(options=opts)
+#|     mf = cl.mem_flags
+#|
+#|     # ---- host-side parameterization (timed as "host prep") ----
+#|     t0 = time.perf_counter()
+#|     R = 1 << 128
+#|     items = []
+#|     for n in cofs:
+#|         invm = (-pow(n, -1, 1 << 64)) & e.MASK64
+#|         for sg in sigmas_per:
+#|             bs = e.brent_suyama(n, sg)
+#|             if bs[0] == "factor":
+#|                 continue
+#|             x0, z0, b = bs
+#|             items.append((n, invm, x0 * R % n, z0 * R % n, b * R % n))
+#|     cnt = len(items)
+#|     n_np = np.stack([e.u128_np(it[0]) for it in items]).astype(np.uint64)
+#|     invm_np = np.array([it[1] for it in items], dtype=np.uint64)
+#|     x0_np = np.stack([e.u128_np(it[2]) for it in items]).astype(np.uint64)
+#|     z0_np = np.stack([e.u128_np(it[3]) for it in items]).astype(np.uint64)
+#|     b_np = np.stack([e.u128_np(it[4]) for it in items]).astype(np.uint64)
+#|     eb_np = np.array(ebits, dtype=np.uint8)
+#|     host_prep = time.perf_counter() - t0
+#|
+#|     def buf(a):
+#|         return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+#|                          hostbuf=np.ascontiguousarray(a))
+#|     d_n = buf(n_np); d_invm = buf(invm_np)
+#|     d_x0 = buf(x0_np); d_z0 = buf(z0_np); d_b = buf(b_np); d_eb = buf(eb_np)
+#|     d_xz = cl.Buffer(ctx, mf.READ_WRITE, cnt * 2 * 16)
+#|     d_g1 = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+#|     k1 = cl.Kernel(prog, "ecm_stage1")
+#|     k1.set_args(d_n, d_invm, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g1)
+#|
+#|     k2 = d_g2 = d_pj = d_pk = None
+#|     if do_stage2:
+#|         d_pj = buf(np.array(pj, dtype=np.uint32))
+#|         d_pk = buf(np.array(pk, dtype=np.uint32))
+#|         d_g2 = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+#|         k2 = cl.Kernel(prog, "ecm_stage2")
+#|         k2.set_args(d_n, d_invm, d_b, d_xz, np.uint32(D), np.uint32(n_giant),
+#|                     d_pj, d_pk, np.uint32(len(pj)), d_g2)
+#|
+#|     # Dispatch in chunks via a global-work offset. A real GPU could take the
+#|     # whole batch at once, but PoCL is unstable launching a huge global size
+#|     # over the stage-2 kernel's private-memory tables; chunking is also how a
+#|     # streaming batch would feed the device. All buffers stay resident, so this
+#|     # still measures device throughput, not host copies.
+#|     CHUNK = 4096
+#|
+#|     def dispatch():
+#|         for s in range(0, cnt, CHUNK):
+#|             m = min(CHUNK, cnt - s)
+#|             cl.enqueue_nd_range_kernel(q, k1, (m,), None, global_work_offset=(s,))
+#|             if do_stage2:
+#|                 cl.enqueue_nd_range_kernel(q, k2, (m,), None, global_work_offset=(s,))
+#|         q.finish()
+#|
+#|     dispatch()   # warm-up
+#|
+#|     best = float("inf")
+#|     total = 0.0
+#|     for _ in range(reps):
+#|         t = time.perf_counter()
+#|         dispatch()
+#|         dt = time.perf_counter() - t
+#|         best = min(best, dt)
+#|         total += dt
+#|     kernel_avg = total / reps
+#|
+#|     return {
+#|         "curves": cnt, "B1": B1, "B2": B2, "stage2": do_stage2,
+#|         "kernel_best_s": best, "kernel_avg_s": kernel_avg,
+#|         "host_prep_s": host_prep,
+#|         "kernel_cps": cnt / best,
+#|         "endtoend_cps": cnt / (best + host_prep),
+#|     }
+#|
+#|
+#| def main():
+#|     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+#|     ap.add_argument("--list-devices", action="store_true")
+#|     ap.add_argument("--curves", type=int, default=100000,
+#|                     help="number of (cofactor,sigma) work items")
+#|     ap.add_argument("--b1", type=int, default=600)
+#|     ap.add_argument("--b2", type=int, default=0,
+#|                     help="stage-2 bound; >b1 enables stage 2 (0 = stage 1 only)")
+#|     ap.add_argument("--d", type=int, default=32, help="stage-2 giant/baby size")
+#|     ap.add_argument("--reps", type=int, default=5)
+#|     args = ap.parse_args()
+#|
+#|     ctx = cl.create_some_context()
+#|     dev = ctx.devices[0]
+#|     print("device: %s (%s, %d CU @ %d MHz)"
+#|           % (dev.name.strip(), cl.device_type.to_string(dev.type),
+#|              dev.max_compute_units, dev.max_clock_frequency))
+#|     if args.list_devices:
+#|         list_devices()
+#|         return 0
+#|
+#|     r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
+#|     stage = "stage 1+2" if r["stage2"] else "stage 1"
+#|     print("\n%s  B1=%d%s  work items=%d  reps=%d"
+#|           % (stage, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
+#|              r["curves"], args.reps))
+#|     print("  kernel-only : best %.4f s  -> %s curves/sec"
+#|           % (r["kernel_best_s"], f"{r['kernel_cps']:,.0f}"))
+#|     print("  host prep   : %.4f s (pure-Python Brent-Suyama, movable on-device)"
+#|           % r["host_prep_s"])
+#|     print("  end-to-end  : %s curves/sec (kernel + host prep)"
+#|           % f"{r['endtoend_cps']:,.0f}")
+#|     print("\nCompare to the CPU baseline in docs/las_gpu_notes.md")
+#|     print("(CADO ECM ~92k curves/sec/core at B1=600 on the dev Xeon).")
+#|     return 0
+#|
+#|
+#| if __name__ == "__main__":
+#|     raise SystemExit(main())
 
 #@ FILE code/gpu/ecm_ocl.py 644 12457 a17b31eb2bc49041a05919518f319b251a798e87a5b64da2f25946b9b05f5063 text
 #| #!/usr/bin/env python3
@@ -81185,6 +81772,144 @@ if __name__ == "__main__":
 #|     if (have) a = from_mont(acc, n, invm);
 #|     g_out[i] = gcd128(a, n);
 #| }
+
+#@ FILE code/gpu/las_profiling.md 644 2449 82234399a3b766d62657ac3f166da9264aae25943489c7df1f6933df646f165b text
+#| # Measuring the sieving vs cofactorization split in `las`
+#|
+#| The GPU ECM kernels here accelerate **cofactorization** only. How much that
+#| helps end to end is capped by cofactorization's share of `las` time (Amdahl).
+#| That share is **not fixed** — it grows sharply with `mfb` (the large-prime
+#| cofactor bound), and the real configs use large `mfb`. Measure it on your own
+#| config rather than assuming; `las_split.py` does the arithmetic.
+#|
+#| ## Build `las`
+#|
+#| On top of the `testbench` recipe in `../../docs/las_gpu_notes.md`, `las` also
+#| needs hwloc:
+#|
+#| ```bash
+#| apt-get install -y libgmp-dev libhwloc-dev python3-flask python3-requests
+#| cd code/cado
+#| make las makefb          # -> build/<host>/sieve/{las,makefb}
+#| ```
+#|
+#| `las` prints the split only when built **without** `-production` (the default
+#| `make` build is fine) and run at **verbose level 2** (`-v -v`).
+#|
+#| ## Run and parse
+#|
+#| Quickest self-contained check, using a bundled test polynomial:
+#|
+#| ```bash
+#| B=code/cado/build/vm/sieve
+#| P=code/cado/tests/misc/c60.poly
+#| $B/makefb -poly $P -lim 111342 -maxbits 10 -out /tmp/c60.fb1
+#| $B/las -poly $P -fb1 /tmp/c60.fb1 -lim0 78682 -lim1 111342 \
+#|        -lpb0 18 -lpb1 19 -mfb0 17 -mfb1 80 -I 10 \
+#|        -q0 200000 -q1 202000 -v -v -t 1 \
+#|   | python3 code/gpu/las_split.py
+#| ```
+#|
+#| `las_split.py` reads the `# Total cpu time … sieving S … factor F …` line and
+#| prints the cofactorization fraction plus the Amdahl ceiling for a
+#| cofactorization-only GPU speedup.
+#|
+#| To profile a **real** config from this repo, run `las` with that config's
+#| `lpb`/`mfb`/`A`/`lim` (see `code/config/nNNN.config` and the `las` calls in
+#| `code/helpers.py` `do_algebraic_query_sieving` / `do_fb_extension_sieving`) on
+#| its generated poly + factor base, adding `-v -v`, and pipe to `las_split.py`.
+#|
+#| ## Measured on this box (c60 poly, one q-block) — the split is mfb-driven
+#|
+#| | `mfb1` | sieving | cofactor | cofactor share |
+#| |------:|--------:|---------:|---------------:|
+#| | 38 | 1.1 s | 0.1 s | **8%** |
+#| | 60 | 1.2 s | 1.0 s | 45% |
+#| | 80 | 1.2 s | 4.6 s | **79%** |
+#|
+#| At `mfb1=80` cofactorization is ~79% of sieve+cofactor, so moving only
+#| cofactorization to the GPU has an Amdahl ceiling of `1/(1-0.79) ≈ 4.8×`
+#| end to end. The production configs use larger `mfb` still (e.g. n1024:
+#| `sieve.mfb1=120`, `desc.mfb1=150`), so cofactorization is expected to be the
+#| **dominant** `las` cost there — which is exactly where a fast GPU cofactorizer
+#| pays off. Measure your real config to get the exact ceiling.
+
+#@ FILE code/gpu/las_split.py 644 2680 2e4bedf481c3b7a43bf58095976b475e40ffecd3f83c6e8ed6202f89881bb082 text
+#| #!/usr/bin/env python3
+#| """
+#| Parse a CADO `las` verbose run and report the sieving-vs-cofactorization
+#| split -- the Amdahl fraction that caps how much GPU cofactorization can help
+#| end to end.
+#|
+#| `las` (built WITHOUT -production, run at verbose level 2, e.g. `-v -v`) prints:
+#|
+#|   # Total cpu time T s, useful U s [norm a+b, sieving S (...), factor F (...),
+#|     rest R], wasted+waited W s, rest ...
+#|
+#| where `sieving S` is total sieve time and `factor F` is cofactorization time.
+#| The cofactorization fraction of the *useful* CPU time is F / (norm + S + F + R);
+#| the fraction of sieve+cofac is F / (S + F).
+#|
+#| Usage:
+#|   <las> -v -v <las-args...>  2>&1 | python3 las_split.py
+#|   python3 las_split.py las_output.log
+#|
+#| See las_profiling.md for how to produce the input on a real config.
+#| """
+#| import re
+#| import sys
+#|
+#| LINE = re.compile(
+#|     r"# Total cpu time ([\d.]+)s, useful ([\d.]+)s \[norm ([\d.]+)\+([\d.]+), "
+#|     r"sieving ([\d.]+).*?factor ([\d.]+)")
+#|
+#|
+#| def parse(text):
+#|     rows = []
+#|     for m in LINE.finditer(text):
+#|         total, useful, n0, n1, sieving, factor = map(float, m.groups())
+#|         rows.append(dict(total=total, useful=useful, norm=n0 + n1,
+#|                          sieving=sieving, factor=factor))
+#|     return rows
+#|
+#|
+#| def main():
+#|     text = open(sys.argv[1]).read() if len(sys.argv) > 1 else sys.stdin.read()
+#|     rows = parse(text)
+#|     if not rows:
+#|         sys.stderr.write(
+#|             "no '# Total cpu time ... sieving ... factor ...' line found.\n"
+#|             "Build las WITHOUT -production and run it at verbose level 2 "
+#|             "(-v -v); see las_profiling.md.\n")
+#|         return 2
+#|     # aggregate (a run may print several special-q blocks)
+#|     norm = sum(r["norm"] for r in rows)
+#|     siev = sum(r["sieving"] for r in rows)
+#|     fact = sum(r["factor"] for r in rows)
+#|     useful = sum(r["useful"] for r in rows)
+#|     sf = siev + fact
+#|     print("las timing over %d block(s):" % len(rows))
+#|     print("  norm       : %10.2f s" % norm)
+#|     print("  sieving    : %10.2f s" % siev)
+#|     print("  cofactor   : %10.2f s" % fact)
+#|     print("  useful cpu : %10.2f s" % useful)
+#|     print()
+#|     if sf > 0:
+#|         print("  cofactorization / (sieving+cofactor) = %.1f%%" % (100 * fact / sf))
+#|     if useful > 0:
+#|         f = fact / useful
+#|         print("  cofactorization / useful cpu         = %.1f%%" % (100 * f))
+#|         print()
+#|         print("  Amdahl ceiling if ONLY cofactorization is moved to the GPU:")
+#|         for sp in (5, 10, 50, 1e9):
+#|             cap = 1.0 / ((1 - f) + f / sp)
+#|             tag = "inf" if sp > 1e8 else "%gx" % sp
+#|             print("    kernel %-4s faster -> %.2fx end-to-end" % (tag, cap))
+#|     return 0
+#|
+#|
+#| if __name__ == "__main__":
+#|     raise SystemExit(main())
 
 #@ FILE code/gpu/mont128.cl 644 4154 8127ca85ab4b507b6bb446d21d1e136004d7776bb42d63c66778639813684937 text
 #| /*
@@ -101618,7 +102343,7 @@ if __name__ == "__main__":
 #|          return self.submatrices[i][j].M
 #$  $
 
-NSNF_EOF_356c4f1dc8cc423b
+NSNF_EOF_3dfac1f219a68e2e
 
 # ===== FILE: paper.pdf (725438 bytes, xz+base64, 708692 bytes compressed) =====
 f 'paper.pdf' 644 725438 80638371e99cb53a49fa87190c11d82684c0054a73bbace6141858414b9c9466 b64xz <<'NSNF_EOF_80638371e99cb53a'
