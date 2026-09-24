@@ -8,8 +8,8 @@ Paper: https://eprint.iacr.org/2026/2131.pdf (eprint 2026/2131)
 GENERATED FILE -- do not edit by hand. Regenerate with:
     python3 tools/make_single_python.py
 
-Generated from commit 676ce38a1e5fb3871e1792631a54bc08142b851f
-Embedded: 129 files (1047436 bytes) from code/ and patches/,
+Generated from commit ec15f6d9b0a8bc30f3f3a344228d2f05cdc66bb0
+Embedded: 129 files (1050298 bytes) from code/ and patches/,
 plus the code/cado submodule pin and the code/cado_sage symlink.
 
 This one file holds every source in code/ (run.py, helpers.py, descent,
@@ -5025,7 +5025,7 @@ if __name__ == "__main__":
 #$     $
 #|     do_fb_extension_sieving(params,jobnum=topargs.jobnum,q0=topargs.q0,q1=topargs.q1)
 
-#@ FILE code/gpu/README.md 644 4199 72649580cb70b97bd4f038027cf7efb1bb2dcf6c5eb000738c27257ebeef6aa9 text
+#@ FILE code/gpu/README.md 644 7061 c6c573e36da6b8c717eccb9314dc01d40eee24ec607ff3f8b6c0434a5afa772c text
 #| # GPU ECM cofactorization for CADO `las`
 #|
 #| Toward GPU-accelerating the dominant cost of the computation (CADO `las`,
@@ -5092,12 +5092,78 @@ if __name__ == "__main__":
 #| - Integration into `las`'s batch cofactorization path (`ecm/batch.cpp`) is a
 #|   separate, larger effort (see the notes doc).
 #|
-#| ## Run
+#| ## Command-line usage
+#|
+#| Install the dependencies once (PoCL provides a CPU OpenCL device, so no GPU is
+#| required to develop):
 #|
 #| ```bash
-#| pip install pyopencl numpy sympy pocl-binary-distribution   # PoCL = CPU OpenCL
-#| PYOPENCL_CTX=0 python3 test_mont128.py
-#| PYOPENCL_CTX=0 python3 ecm_ocl.py   # stage 1+2 self-test
+#| pip install pyopencl numpy sympy pocl-binary-distribution
+#| ```
+#|
+#| Every tool selects its OpenCL device from the `PYOPENCL_CTX` environment
+#| variable (e.g. `PYOPENCL_CTX=0`); omit it to be prompted interactively.
+#|
+#| ### `ecm_bench.py` — throughput benchmark
+#|
+#| The benchmark is this script itself (there is no `--bench` flag). Each run
+#| prints **kernel-only** curves/sec (pure device time — this is what scales
+#| across a GPU or cluster) and **end-to-end** curves/sec (including the
+#| host-side Brent-Suyama parameterization).
+#|
+#| | option | default | meaning |
+#| |--------|---------|---------|
+#| | `--list-devices` | off | list OpenCL platforms/devices (name, type, compute units, clock, memory), then exit |
+#| | `--curves N` | 100000 | number of `(cofactor, sigma)` work items |
+#| | `--b1 N` | 600 | stage-1 smoothness bound B1 |
+#| | `--b2 N` | 0 | stage-2 bound; `> --b1` enables stage 2, `0` = stage 1 only |
+#| | `--d N` | 32 | stage-2 giant/baby-step size |
+#| | `--reps N` | 5 | timed repetitions (reports the best) |
+#| | `--limb {64,32}` | 64 | arithmetic backend: `64` = `mont128` (2×64-bit), `32` = `mont32` (4×32-bit, GPU-friendly) |
+#|
+#| ```bash
+#| # see what OpenCL devices exist and pick an index for PYOPENCL_CTX
+#| PYOPENCL_CTX=0 python3 ecm_bench.py --list-devices
+#|
+#| # default stage-1 benchmark (100k curves, B1=600, 64-bit limbs)
+#| PYOPENCL_CTX=0 python3 ecm_bench.py
+#|
+#| # the comparison that matters on a GPU (e.g. Radeon Pro V340): 64- vs 32-bit
+#| PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600 --limb 64
+#| PYOPENCL_CTX=0 python3 ecm_bench.py --curves 200000 --b1 600 --limb 32
+#|
+#| # full stage 1+2 (enable stage 2 with --b2 > --b1), both backends
+#| PYOPENCL_CTX=0 python3 ecm_bench.py --curves 100000 --b1 600 --b2 5000 --limb 64
+#| PYOPENCL_CTX=0 python3 ecm_bench.py --curves 100000 --b1 600 --b2 5000 --limb 32
+#|
+#| # sweep B1 to see throughput drop as stage-1 work grows
+#| for b1 in 315 600 3000; do PYOPENCL_CTX=0 python3 ecm_bench.py --b1 $b1; done
+#|
+#| # a quick, low-variance smoke run
+#| PYOPENCL_CTX=0 python3 ecm_bench.py --curves 20000 --reps 3
+#| ```
+#|
+#| ### Validation / self-tests (no options)
+#|
+#| These take no CLI options; each runs a fixed check and prints a pass/fail
+#| summary. Device is still `PYOPENCL_CTX`.
+#|
+#| ```bash
+#| PYOPENCL_CTX=0 python3 ecm_ocl.py         # 64-bit stage 1+2 self-test (bit-exact vs reference)
+#| PYOPENCL_CTX=0 python3 ecm32_validate.py  # 32-bit stage 1+2 validation vs reference & 64-bit
+#| PYOPENCL_CTX=0 python3 test_mont128.py    # 64-bit Montgomery arithmetic unit tests
+#| PYOPENCL_CTX=0 python3 test_mont32.py     # 32-bit Montgomery arithmetic unit tests
+#| ```
+#|
+#| ### `las_split.py` — sieving-vs-cofactorization split
+#|
+#| Takes a `las -v -v` log on **stdin** or as a **file argument** (no other
+#| options); prints the split and the Amdahl ceiling. See `las_profiling.md` for
+#| producing the input.
+#|
+#| ```bash
+#| <las> ... -v -v | python3 las_split.py     # pipe a live run
+#| python3 las_split.py las_output.log        # or parse a saved log
 #| ```
 
 #@ FILE code/gpu/ecm.cl 644 3638 16ccef03aab70e62fe3e2bf8643f13694707cdffd6b221571ef6f02370a94d88 text
