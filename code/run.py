@@ -1492,7 +1492,7 @@ if __name__=='__main__':
     parser.add_argument('--descent-counter', dest='descent_counter')
     parser.add_argument('--desc-todofile-glob', dest='todofile_glob', default='')
     parser.add_argument('--bwc-slurm', action='store_true')
-    parser.add_argument('--oracle', choices=['sage', 'luna_k6', 'remote_luna_S750'], required=False, default='sage')
+    parser.add_argument('--oracle', choices=['sage', 'opencl', 'luna_k6', 'remote_luna_S750'], required=False, default='sage')
     parser.add_argument('--save-intermediate',dest='save_intermediate', action='store_true')
     parser.add_argument('--use-intermediate',dest='use_intermediate', action='store_true')
     parser.add_argument('--overwrite-MC',dest='overwrite_MC',action='store_true')
