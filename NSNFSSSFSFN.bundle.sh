@@ -15,9 +15,9 @@
 #  GENERATED FILE -- do not edit by hand. Regenerate with:
 #      python3 tools/make_single_file.py
 #
-#  Generated from commit: 6f5385d8dfb58c06a664482f935858dacc9412aa
-#  Files: 131 regular, 1 symlink(s), 1 submodule(s)
-#  Total unpacked size: 67875010 bytes
+#  Generated from commit: a9cd46494ebd274a10aab0c000b21c76e9d7efd3
+#  Files: 133 regular, 1 symlink(s), 1 submodule(s)
+#  Total unpacked size: 67896431 bytes
 #
 # -----------------------------------------------------------------------------
 #  USAGE
@@ -126,7 +126,7 @@
 
 set -euo pipefail
 
-BUNDLE_COMMIT='6f5385d8dfb58c06a664482f935858dacc9412aa'
+BUNDLE_COMMIT='a9cd46494ebd274a10aab0c000b21c76e9d7efd3'
 DEST='NSNFSSSFSFN'
 MODE=extract
 FORCE=0
@@ -298,6 +298,8 @@ if [ "$MODE" != list ]; then mkdir -p "$DEST"; fi
 #   file      code/oracles/luna_k6_hsm_oracle_client.py
 #   file      code/oracles/luna_k6_hsm_oracle_server.py
 #   file      code/oracles/misc_tools.py
+#   file      code/oracles/opencl_oracle.cl
+#   file      code/oracles/opencl_oracle.py
 #   file      code/oracles/oracle_client.py
 #   file      code/oracles/oracle_helpers.py
 #   file      code/oracles/oracle_server.py
@@ -5087,8 +5089,8 @@ if __name__=='__main__':
 
 NSNF_EOF_bf8ddf5cd6cdf07d
 
-# ===== FILE: code/helpers.py (250484 bytes, 6470 lines) =====
-f 'code/helpers.py' 644 250484 fa2a770d202f81631d5c4dee93741d060704f55b190a64961949d7b71654eb09 text <<'NSNF_EOF_fa2a770d202f8163'
+# ===== FILE: code/helpers.py (250781 bytes, 6480 lines) =====
+f 'code/helpers.py' 644 250781 7e835c93bc0fc2f150cb0d0f50f11465a091530a1da7b0b6514c527894a0a2ef text <<'NSNF_EOF_7e835c93bc0fc2f1'
 from sage.all import *
 from sage.modules.free_module_element import vector
 from sage.rings.integer_ring import ZZ
@@ -5762,6 +5764,16 @@ def run_oracle(params, todofilename, jsonfilename):
                 "--mpi",
                 "--thr", str(params.parameters['mpi.thr'])
             ]
+    elif params.oracle == "opencl":
+        N, d, e = check_N_d_and_e(params)
+
+        command_line = [params.files['PYTHON'],
+            "oracles/opencl_oracle.py",
+            "-d", str(d),
+            "-N", str(N),
+            "--in", todofilename,
+            "--out", jsonfilename
+        ]
     elif params.oracle == "luna_k6":
         bits = params.parameters['MODULUS_BITS']
         N = params.parameters['N']
@@ -11560,7 +11572,7 @@ def handle_bottom_special_q_composites(
     else:
         return -1, -1, [], []
 
-NSNF_EOF_fa2a770d202f8163
+NSNF_EOF_7e835c93bc0fc2f1
 
 # ===== FILE: code/hintfile_estimate.py (4012 bytes, 108 lines) =====
 f 'code/hintfile_estimate.py' 644 4012 1eba37c49a5c59aa92a0d214a0816dd581324cde8ee2b002060f0ffa10d30133 text <<'NSNF_EOF_1eba37c49a5c59aa'
@@ -15979,8 +15991,8 @@ oracle_keys
 
 NSNF_EOF_f11412e0b680d24c
 
-# ===== FILE: code/oracles/README.md (5930 bytes, 82 lines) =====
-f 'code/oracles/README.md' 644 5930 ae6cd8da94c92e48fea29b92fc1451f5b0e36739f77b0f4a147d860ced266394 text <<'NSNF_EOF_ae6cd8da94c92e48'
+# ===== FILE: code/oracles/README.md (7148 bytes, 106 lines) =====
+f 'code/oracles/README.md' 644 7148 aebdce8e74b23b8f74be42712679fbd85e9abded96cc4c1ee56e70c4df939563 text <<'NSNF_EOF_aebdce8e74b23b8f'
 # Oracles
 
 This folder contains different oracle implementations.
@@ -16063,7 +16075,32 @@ Example call:
 ```bash
 python3.8 luna_k6_hsm_oracle_server.py --logs_dir /var/log/luna-oracle --exec_threads 1 --userpin "XXXX-XXXX-XXXX-XXXX"
 ```
-NSNF_EOF_ae6cd8da94c92e48
+## OpenCL Oracle
+
+File: [opencl_oracle.py](opencl_oracle.py) (kernel: [opencl_oracle.cl](opencl_oracle.cl))
+
+A drop-in replacement for the sage oracle that computes `a^d mod N` for a whole
+batch of bases on an OpenCL device, one work-item per base, using Montgomery
+(CIOS) big-integer arithmetic. Like the sage oracle, `N` and `d` are the
+software-simulated private key, so this only speeds up the local simulation
+used for experiments, not any real signing oracle.
+
+It takes the same arguments as the sage oracle and writes the same JSON output:
+```bash
+python3 oracles/opencl_oracle.py -d <d> -N <N> --in queries.todo --out queries.json
+```
+Select `--oracle opencl` when running `run.py` to use it for the query steps.
+
+Requirements: `pyopencl` and `numpy`, plus any OpenCL platform. A CPU platform
+such as [PoCL](https://portablecl.org/) works, so a GPU is not required. Choose
+the device with the `PYOPENCL_CTX` environment variable. If OpenCL is
+unavailable it falls back to a pure-Python `pow()` so the output is always
+correct; `--force-cpu` selects that path explicitly.
+
+`N` must be odd (true for any RSA modulus). Verified to produce output
+identical to the sage/Python oracle from 128- to 1024-bit moduli.
+
+NSNF_EOF_aebdce8e74b23b8f
 
 # ===== FILE: code/oracles/luna_k6_hsm_crypto_helpers.py (4047 bytes, 126 lines) =====
 f 'code/oracles/luna_k6_hsm_crypto_helpers.py' 644 4047 e5be6831e33e79b2be85fbbd14fbbb4e255f5623628ddd5548420f78b3a0cacd text <<'NSNF_EOF_e5be6831e33e79b2'
@@ -16854,6 +16891,275 @@ def find_factors_close_to_square_root(i):
     return f"{a}x{b}"
 
 NSNF_EOF_5d07ff0ec21931cb
+
+# ===== FILE: code/oracles/opencl_oracle.cl (3755 bytes, 113 lines) =====
+f 'code/oracles/opencl_oracle.cl' 644 3755 d9964a63c4c78dea38d314afc1c4a3b240f63777d7672358a35347cec07d35ce text <<'NSNF_EOF_d9964a63c4c78dea'
+/*
+ * Batch RSA "raw" signing oracle: compute a^d mod N for many bases a, with N
+ * and d fixed across the batch. One work-item per base.
+ *
+ * Fixed-width big integers of LIMBS 32-bit limbs, little-endian. Modular
+ * multiplication is CIOS Montgomery multiplication (Koc et al.), so the host
+ * supplies n0inv = -N^{-1} mod 2^32 and R2 = R^2 mod N with R = 2^(32*LIMBS).
+ *
+ * LIMBS and DBITS are supplied by the host as -D defines when building.
+ */
+
+#ifndef LIMBS
+#error "define LIMBS"
+#endif
+#ifndef DBITS
+#error "define DBITS"
+#endif
+
+typedef uint limb;
+
+/* t = a*b*R^{-1} mod n, all LIMBS-limb; needs n0inv. CIOS, t scratch LIMBS+2. */
+static void mulmont(const limb *a, const limb *b, const limb *n,
+                    limb n0inv, limb *out)
+{
+    limb t[LIMBS + 2];
+    for (int i = 0; i < LIMBS + 2; i++)
+        t[i] = 0;
+
+    for (int i = 0; i < LIMBS; i++) {
+        ulong C = 0;
+        for (int j = 0; j < LIMBS; j++) {
+            ulong s = (ulong)t[j] + (ulong)a[j] * (ulong)b[i] + C;
+            t[j] = (limb)s;
+            C = s >> 32;
+        }
+        ulong s = (ulong)t[LIMBS] + C;
+        t[LIMBS] = (limb)s;
+        t[LIMBS + 1] = (limb)(s >> 32);
+
+        limb m = (limb)((ulong)t[0] * (ulong)n0inv);
+        ulong cs = (ulong)t[0] + (ulong)m * (ulong)n[0];
+        C = cs >> 32;
+        for (int j = 1; j < LIMBS; j++) {
+            cs = (ulong)t[j] + (ulong)m * (ulong)n[j] + C;
+            t[j - 1] = (limb)cs;
+            C = cs >> 32;
+        }
+        cs = (ulong)t[LIMBS] + C;
+        t[LIMBS - 1] = (limb)cs;
+        t[LIMBS] = t[LIMBS + 1] + (limb)(cs >> 32);
+    }
+
+    /* conditional final subtraction: if t >= n then t -= n */
+    limb borrow = 0, diff[LIMBS];
+    for (int j = 0; j < LIMBS; j++) {
+        long d = (long)t[j] - (long)n[j] - (long)borrow;
+        diff[j] = (limb)d;
+        borrow = (d < 0) ? 1 : 0;
+    }
+    /* subtract when there was no borrow out of the top, or t had a carry limb */
+    limb ge = (t[LIMBS] != 0) | (borrow == 0);
+    for (int j = 0; j < LIMBS; j++)
+        out[j] = ge ? diff[j] : t[j];
+}
+
+__kernel void powmod(__global const limb *bases,   /* count * LIMBS */
+                     __global const limb *n_g,     /* LIMBS */
+                     __global const limb *r2_g,    /* LIMBS, = R^2 mod n */
+                     __global const limb *d_g,     /* LIMBS, exponent */
+                     const limb n0inv,
+                     const uint count,
+                     __global limb *out)           /* count * LIMBS */
+{
+    uint gid = get_global_id(0);
+    if (gid >= count)
+        return;
+
+    limb n[LIMBS], r2[LIMBS], d[LIMBS], base[LIMBS];
+    for (int j = 0; j < LIMBS; j++) {
+        n[j] = n_g[j];
+        r2[j] = r2_g[j];
+        d[j] = d_g[j];
+        base[j] = bases[(size_t)gid * LIMBS + j];
+    }
+
+    /* aM = base * R mod n  (= mulmont(base, R^2)) */
+    limb aM[LIMBS];
+    mulmont(base, r2, n, n0inv, aM);
+
+    /* result = R mod n = Montgomery form of 1 = mulmont(1, R^2) */
+    limb one[LIMBS], result[LIMBS], tmp[LIMBS];
+    for (int j = 0; j < LIMBS; j++)
+        one[j] = 0;
+    one[0] = 1;
+    mulmont(one, r2, n, n0inv, result);
+
+    /* left-to-right square-and-multiply over the bits of d, MSB first */
+    for (int bit = DBITS - 1; bit >= 0; bit--) {
+        mulmont(result, result, n, n0inv, tmp);
+        for (int j = 0; j < LIMBS; j++)
+            result[j] = tmp[j];
+        if ((d[bit >> 5] >> (bit & 31)) & 1u) {
+            mulmont(result, aM, n, n0inv, tmp);
+            for (int j = 0; j < LIMBS; j++)
+                result[j] = tmp[j];
+        }
+    }
+
+    /* convert out of Montgomery form: mulmont(result, 1) */
+    mulmont(result, one, n, n0inv, tmp);
+    for (int j = 0; j < LIMBS; j++)
+        out[(size_t)gid * LIMBS + j] = tmp[j];
+}
+
+NSNF_EOF_d9964a63c4c78dea
+
+# ===== FILE: code/oracles/opencl_oracle.py (4900 bytes, 146 lines) =====
+f 'code/oracles/opencl_oracle.py' 644 4900 5ebc9d5086256937cc758787599b5a63b0989c0c79a4301e54bed51acc4e0f01 text <<'NSNF_EOF_5ebc9d5086256937'
+#!/usr/bin/env python3
+"""
+OpenCL batch signing oracle: compute a^d mod N for many bases a on an OpenCL
+device (GPU, or any CPU device such as PoCL). Drop-in for sage_oracle.py --
+same -d/-N/--in/--out interface and the same JSON output {str(a): str(a^d)}.
+
+The heavy per-query work (a fixed-N, fixed-d modular exponentiation) is done
+on the device with Montgomery (CIOS) big-integer arithmetic; one work-item
+per base. N and d are the SOFTWARE-SIMULATED private key, exactly as in
+sage_oracle.py -- this only speeds up the local simulation used for
+experiments, not any real oracle.
+
+Needs pyopencl and numpy. Select the device with PYOPENCL_CTX, e.g.
+PYOPENCL_CTX=0 (or run interactively to be prompted). Falls back to a pure
+Python pow() if OpenCL is unavailable, so it always produces correct output.
+"""
+
+import argparse
+import os
+import sys
+from datetime import datetime
+from math import ceil
+from time import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from misc_tools import fast_json_dump  # noqa: E402
+
+LIMB_BITS = 32
+LIMB_MASK = (1 << LIMB_BITS) - 1
+_KERNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opencl_oracle.cl")
+
+
+def timestamp(ts=None):
+    return datetime.fromtimestamp(ts or time()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def timeprint(*args):
+    print("%s:" % timestamp(), *args)
+    sys.stdout.flush()
+
+
+def n_limbs(x):
+    return max(1, ceil(x.bit_length() / LIMB_BITS))
+
+
+def to_limbs(x, limbs):
+    return [(x >> (LIMB_BITS * i)) & LIMB_MASK for i in range(limbs)]
+
+
+def from_limbs(arr):
+    return sum(int(v) << (LIMB_BITS * i) for i, v in enumerate(arr))
+
+
+def mont_n0inv(n):
+    """-n^{-1} mod 2^32 (n odd)."""
+    inv = pow(n % (1 << LIMB_BITS), -1, 1 << LIMB_BITS)
+    return (-inv) & LIMB_MASK
+
+
+def run_python(d, N, bases):
+    """Reference/fallback path."""
+    return {str(a): str(pow(a, d, N)) for a in bases}
+
+
+def run_opencl(d, N, bases):
+    import numpy as np
+    import pyopencl as cl
+
+    if N % 2 == 0:
+        raise ValueError("N must be odd for Montgomery arithmetic")
+
+    limbs = n_limbs(N)
+    dbits = max(1, d.bit_length())
+    R = 1 << (LIMB_BITS * limbs)
+    r2 = (R * R) % N
+    n0inv = mont_n0inv(N)
+
+    count = len(bases)
+    base_flat = np.zeros(count * limbs, dtype=np.uint32)
+    for i, a in enumerate(bases):
+        base_flat[i * limbs:(i + 1) * limbs] = to_limbs(a % N, limbs)
+    n_arr = np.array(to_limbs(N, limbs), dtype=np.uint32)
+    r2_arr = np.array(to_limbs(r2, limbs), dtype=np.uint32)
+    d_arr = np.array(to_limbs(d, limbs), dtype=np.uint32)
+
+    ctx = cl.create_some_context()
+    queue = cl.CommandQueue(ctx)
+    with open(_KERNEL) as fh:
+        src = fh.read()
+    prog = cl.Program(ctx, src).build(
+        options=["-DLIMBS=%d" % limbs, "-DDBITS=%d" % dbits])
+
+    mf = cl.mem_flags
+    d_base = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=base_flat)
+    d_n = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=n_arr)
+    d_r2 = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=r2_arr)
+    d_d = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=d_arr)
+    out = np.empty(count * limbs, dtype=np.uint32)
+    d_out = cl.Buffer(ctx, mf.WRITE_ONLY, out.nbytes)
+
+    prog.powmod(queue, (count,), None, d_base, d_n, d_r2, d_d,
+                np.uint32(n0inv), np.uint32(count), d_out)
+    cl.enqueue_copy(queue, out, d_out)
+    queue.finish()
+
+    rdict = {}
+    for i, a in enumerate(bases):
+        rdict[str(a)] = str(from_limbs(out[i * limbs:(i + 1) * limbs]))
+    return rdict
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="opencl_oracle.py",
+        description="OpenCL batch a^d mod N signing oracle (sage_oracle.py drop-in)")
+    parser.add_argument("-d", "--d", dest="d", required=True)
+    parser.add_argument("-N", "--N", dest="N", required=True)
+    parser.add_argument("--in", dest="infile", required=True)
+    parser.add_argument("--out", dest="outfile", required=True)
+    parser.add_argument("--force-cpu", action="store_true",
+                        help="skip OpenCL, use the pure-Python reference path")
+    args = parser.parse_args()
+
+    d = int(args.d)
+    N = int(args.N)
+    with open(args.infile) as fh:
+        bases = [int(line) for line in fh if line.strip()]
+
+    use_opencl = not args.force_cpu
+    if use_opencl:
+        try:
+            timeprint("Running OpenCL oracle on %d queries" % len(bases))
+            rdict = run_opencl(d, N, bases)
+        except Exception as ex:  # noqa: BLE001 -- correctness must not depend on the device
+            timeprint("OpenCL unavailable (%s); falling back to Python pow()" % ex)
+            use_opencl = False
+    if not use_opencl:
+        timeprint("Running Python oracle on %d queries" % len(bases))
+        rdict = run_python(d, N, bases)
+
+    timeprint("Finished oracle queries")
+    fast_json_dump(rdict, args.outfile)
+
+
+if __name__ == "__main__":
+    main()
+
+NSNF_EOF_5ebc9d5086256937
 
 # ===== FILE: code/oracles/oracle_client.py (6856 bytes, 200 lines) =====
 f 'code/oracles/oracle_client.py' 644 6856 7c90854b3c1313c559b4b840ef24f2f6a6f2728344a6661ca2104f91f8b5650a text <<'NSNF_EOF_7c90854b3c1313c5'
@@ -22131,8 +22437,8 @@ scipy
 sparse_dot_mkl
 NSNF_EOF_23244338d725f069
 
-# ===== FILE: code/run.py (86615 bytes, 2037 lines) =====
-f 'code/run.py' 644 86615 ef7e91f70dda98379ac91c146b97b4f5bfad26c42dc8d7d8db3c5c8f7db98fae text <<'NSNF_EOF_ef7e91f70dda9837'
+# ===== FILE: code/run.py (86625 bytes, 2037 lines) =====
+f 'code/run.py' 644 86625 6505041a630be671eb7ebc49a7017d051baba31558c36c27178d8e075065dac0 text <<'NSNF_EOF_6505041a630be671'
 from sage.all import *
 from crt_ethroot import *
 from helpers import *
@@ -23627,7 +23933,7 @@ if __name__=='__main__':
     parser.add_argument('--descent-counter', dest='descent_counter')
     parser.add_argument('--desc-todofile-glob', dest='todofile_glob', default='')
     parser.add_argument('--bwc-slurm', action='store_true')
-    parser.add_argument('--oracle', choices=['sage', 'luna_k6', 'remote_luna_S750'], required=False, default='sage')
+    parser.add_argument('--oracle', choices=['sage', 'opencl', 'luna_k6', 'remote_luna_S750'], required=False, default='sage')
     parser.add_argument('--save-intermediate',dest='save_intermediate', action='store_true')
     parser.add_argument('--use-intermediate',dest='use_intermediate', action='store_true')
     parser.add_argument('--overwrite-MC',dest='overwrite_MC',action='store_true')
@@ -24171,7 +24477,7 @@ if __name__=='__main__':
         sys.exit(0)
         os._exit(0)
 
-NSNF_EOF_ef7e91f70dda9837
+NSNF_EOF_6505041a630be671
 
 # ===== FILE: code/sanity_check_polynomials.py (3000 bytes, 123 lines) =====
 f 'code/sanity_check_polynomials.py' 644 3000 dd81ef2ed61d0e51484c30fcf2dc7dcee6b13fa6449314957dae4119638035d5 text <<'NSNF_EOF_dd81ef2ed61d0e51'
@@ -74296,8 +74602,8 @@ f 'data1024/thetarget' 644 309 7ed183d75d59ba87b70d3bc6ae7eb59e394cf779719e888c2
 
 NSNF_EOF_7ed183d75d59ba87
 
-# ===== FILE: nsnfsssfsfn.py (1056496 bytes, 24922 lines) =====
-f 'nsnfsssfsfn.py' 755 1056496 dd496f098a4b325f3c5b0d3894f8880bf593e779274bfb71d64803ae18493642 text <<'NSNF_EOF_dd496f098a4b325f'
+# ===== FILE: nsnfsssfsfn.py (1067737 bytes, 25219 lines) =====
+f 'nsnfsssfsfn.py' 755 1067737 2a5d3d5ed9c22eb2fadb0d2daf82de8557ab7d632a57233915c2895dee32aaa1 text <<'NSNF_EOF_2a5d3d5ed9c22eb2'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -74308,8 +74614,8 @@ Paper: https://eprint.iacr.org/2026/2131.pdf (eprint 2026/2131)
 GENERATED FILE -- do not edit by hand. Regenerate with:
     python3 tools/make_single_python.py
 
-Generated from commit 6f5385d8dfb58c06a664482f935858dacc9412aa
-Embedded: 113 files (969876 bytes) from code/ and patches/,
+Generated from commit a9cd46494ebd274a10aab0c000b21c76e9d7efd3
+Embedded: 115 files (980056 bytes) from code/ and patches/,
 plus the code/cado submodule pin and the code/cado_sage symlink.
 
 This one file holds every source in code/ (run.py, helpers.py, descent,
@@ -79325,7 +79631,7 @@ if __name__ == "__main__":
 #$     $
 #|     do_fb_extension_sieving(params,jobnum=topargs.jobnum,q0=topargs.q0,q1=topargs.q1)
 
-#@ FILE code/helpers.py 644 250484 fa2a770d202f81631d5c4dee93741d060704f55b190a64961949d7b71654eb09 text
+#@ FILE code/helpers.py 644 250781 7e835c93bc0fc2f150cb0d0f50f11465a091530a1da7b0b6514c527894a0a2ef text
 #| from sage.all import *
 #| from sage.modules.free_module_element import vector
 #| from sage.rings.integer_ring import ZZ
@@ -79999,6 +80305,16 @@ if __name__ == "__main__":
 #|                 "--mpi",
 #|                 "--thr", str(params.parameters['mpi.thr'])
 #|             ]
+#|     elif params.oracle == "opencl":
+#|         N, d, e = check_N_d_and_e(params)
+#|
+#|         command_line = [params.files['PYTHON'],
+#|             "oracles/opencl_oracle.py",
+#|             "-d", str(d),
+#|             "-N", str(N),
+#|             "--in", todofilename,
+#|             "--out", jsonfilename
+#|         ]
 #|     elif params.oracle == "luna_k6":
 #|         bits = params.parameters['MODULUS_BITS']
 #|         N = params.parameters['N']
@@ -90135,7 +90451,7 @@ if __name__ == "__main__":
 #| logs
 #| oracle_keys
 
-#@ FILE code/oracles/README.md 644 5930 ae6cd8da94c92e48fea29b92fc1451f5b0e36739f77b0f4a147d860ced266394 text
+#@ FILE code/oracles/README.md 644 7148 aebdce8e74b23b8f74be42712679fbd85e9abded96cc4c1ee56e70c4df939563 text
 #| # Oracles
 #|
 #| This folder contains different oracle implementations.
@@ -90218,6 +90534,30 @@ if __name__ == "__main__":
 #| ```bash
 #| python3.8 luna_k6_hsm_oracle_server.py --logs_dir /var/log/luna-oracle --exec_threads 1 --userpin "XXXX-XXXX-XXXX-XXXX"
 #| ```
+#| ## OpenCL Oracle
+#|
+#| File: [opencl_oracle.py](opencl_oracle.py) (kernel: [opencl_oracle.cl](opencl_oracle.cl))
+#|
+#| A drop-in replacement for the sage oracle that computes `a^d mod N` for a whole
+#| batch of bases on an OpenCL device, one work-item per base, using Montgomery
+#| (CIOS) big-integer arithmetic. Like the sage oracle, `N` and `d` are the
+#| software-simulated private key, so this only speeds up the local simulation
+#| used for experiments, not any real signing oracle.
+#|
+#| It takes the same arguments as the sage oracle and writes the same JSON output:
+#| ```bash
+#| python3 oracles/opencl_oracle.py -d <d> -N <N> --in queries.todo --out queries.json
+#| ```
+#| Select `--oracle opencl` when running `run.py` to use it for the query steps.
+#|
+#| Requirements: `pyopencl` and `numpy`, plus any OpenCL platform. A CPU platform
+#| such as [PoCL](https://portablecl.org/) works, so a GPU is not required. Choose
+#| the device with the `PYOPENCL_CTX` environment variable. If OpenCL is
+#| unavailable it falls back to a pure-Python `pow()` so the output is always
+#| correct; `--force-cpu` selects that path explicitly.
+#|
+#| `N` must be odd (true for any RSA modulus). Verified to produce output
+#| identical to the sage/Python oracle from 128- to 1024-bit moduli.
 
 #@ FILE code/oracles/luna_k6_hsm_crypto_helpers.py 644 4047 e5be6831e33e79b2be85fbbd14fbbb4e255f5623628ddd5548420f78b3a0cacd text
 #| from pycryptoki.default_templates import *
@@ -90755,6 +91095,269 @@ if __name__ == "__main__":
 #|     oracle.run()
 
 #@ FILE code/oracles/misc_tools.py 644 7296 5d07ff0ec21931cba5861334160cf070e94e5efad60d401803f723eb7e316be4 dup:code/misc_tools.py
+
+#@ FILE code/oracles/opencl_oracle.cl 644 3755 d9964a63c4c78dea38d314afc1c4a3b240f63777d7672358a35347cec07d35ce text
+#| /*
+#|  * Batch RSA "raw" signing oracle: compute a^d mod N for many bases a, with N
+#|  * and d fixed across the batch. One work-item per base.
+#|  *
+#|  * Fixed-width big integers of LIMBS 32-bit limbs, little-endian. Modular
+#|  * multiplication is CIOS Montgomery multiplication (Koc et al.), so the host
+#|  * supplies n0inv = -N^{-1} mod 2^32 and R2 = R^2 mod N with R = 2^(32*LIMBS).
+#|  *
+#|  * LIMBS and DBITS are supplied by the host as -D defines when building.
+#|  */
+#|
+#| #ifndef LIMBS
+#| #error "define LIMBS"
+#| #endif
+#| #ifndef DBITS
+#| #error "define DBITS"
+#| #endif
+#|
+#| typedef uint limb;
+#|
+#| /* t = a*b*R^{-1} mod n, all LIMBS-limb; needs n0inv. CIOS, t scratch LIMBS+2. */
+#| static void mulmont(const limb *a, const limb *b, const limb *n,
+#|                     limb n0inv, limb *out)
+#| {
+#|     limb t[LIMBS + 2];
+#|     for (int i = 0; i < LIMBS + 2; i++)
+#|         t[i] = 0;
+#|
+#|     for (int i = 0; i < LIMBS; i++) {
+#|         ulong C = 0;
+#|         for (int j = 0; j < LIMBS; j++) {
+#|             ulong s = (ulong)t[j] + (ulong)a[j] * (ulong)b[i] + C;
+#|             t[j] = (limb)s;
+#|             C = s >> 32;
+#|         }
+#|         ulong s = (ulong)t[LIMBS] + C;
+#|         t[LIMBS] = (limb)s;
+#|         t[LIMBS + 1] = (limb)(s >> 32);
+#|
+#|         limb m = (limb)((ulong)t[0] * (ulong)n0inv);
+#|         ulong cs = (ulong)t[0] + (ulong)m * (ulong)n[0];
+#|         C = cs >> 32;
+#|         for (int j = 1; j < LIMBS; j++) {
+#|             cs = (ulong)t[j] + (ulong)m * (ulong)n[j] + C;
+#|             t[j - 1] = (limb)cs;
+#|             C = cs >> 32;
+#|         }
+#|         cs = (ulong)t[LIMBS] + C;
+#|         t[LIMBS - 1] = (limb)cs;
+#|         t[LIMBS] = t[LIMBS + 1] + (limb)(cs >> 32);
+#|     }
+#|
+#|     /* conditional final subtraction: if t >= n then t -= n */
+#|     limb borrow = 0, diff[LIMBS];
+#|     for (int j = 0; j < LIMBS; j++) {
+#|         long d = (long)t[j] - (long)n[j] - (long)borrow;
+#|         diff[j] = (limb)d;
+#|         borrow = (d < 0) ? 1 : 0;
+#|     }
+#|     /* subtract when there was no borrow out of the top, or t had a carry limb */
+#|     limb ge = (t[LIMBS] != 0) | (borrow == 0);
+#|     for (int j = 0; j < LIMBS; j++)
+#|         out[j] = ge ? diff[j] : t[j];
+#| }
+#|
+#| __kernel void powmod(__global const limb *bases,   /* count * LIMBS */
+#|                      __global const limb *n_g,     /* LIMBS */
+#|                      __global const limb *r2_g,    /* LIMBS, = R^2 mod n */
+#|                      __global const limb *d_g,     /* LIMBS, exponent */
+#|                      const limb n0inv,
+#|                      const uint count,
+#|                      __global limb *out)           /* count * LIMBS */
+#| {
+#|     uint gid = get_global_id(0);
+#|     if (gid >= count)
+#|         return;
+#|
+#|     limb n[LIMBS], r2[LIMBS], d[LIMBS], base[LIMBS];
+#|     for (int j = 0; j < LIMBS; j++) {
+#|         n[j] = n_g[j];
+#|         r2[j] = r2_g[j];
+#|         d[j] = d_g[j];
+#|         base[j] = bases[(size_t)gid * LIMBS + j];
+#|     }
+#|
+#|     /* aM = base * R mod n  (= mulmont(base, R^2)) */
+#|     limb aM[LIMBS];
+#|     mulmont(base, r2, n, n0inv, aM);
+#|
+#|     /* result = R mod n = Montgomery form of 1 = mulmont(1, R^2) */
+#|     limb one[LIMBS], result[LIMBS], tmp[LIMBS];
+#|     for (int j = 0; j < LIMBS; j++)
+#|         one[j] = 0;
+#|     one[0] = 1;
+#|     mulmont(one, r2, n, n0inv, result);
+#|
+#|     /* left-to-right square-and-multiply over the bits of d, MSB first */
+#|     for (int bit = DBITS - 1; bit >= 0; bit--) {
+#|         mulmont(result, result, n, n0inv, tmp);
+#|         for (int j = 0; j < LIMBS; j++)
+#|             result[j] = tmp[j];
+#|         if ((d[bit >> 5] >> (bit & 31)) & 1u) {
+#|             mulmont(result, aM, n, n0inv, tmp);
+#|             for (int j = 0; j < LIMBS; j++)
+#|                 result[j] = tmp[j];
+#|         }
+#|     }
+#|
+#|     /* convert out of Montgomery form: mulmont(result, 1) */
+#|     mulmont(result, one, n, n0inv, tmp);
+#|     for (int j = 0; j < LIMBS; j++)
+#|         out[(size_t)gid * LIMBS + j] = tmp[j];
+#| }
+
+#@ FILE code/oracles/opencl_oracle.py 644 4900 5ebc9d5086256937cc758787599b5a63b0989c0c79a4301e54bed51acc4e0f01 text
+#| #!/usr/bin/env python3
+#| """
+#| OpenCL batch signing oracle: compute a^d mod N for many bases a on an OpenCL
+#| device (GPU, or any CPU device such as PoCL). Drop-in for sage_oracle.py --
+#| same -d/-N/--in/--out interface and the same JSON output {str(a): str(a^d)}.
+#|
+#| The heavy per-query work (a fixed-N, fixed-d modular exponentiation) is done
+#| on the device with Montgomery (CIOS) big-integer arithmetic; one work-item
+#| per base. N and d are the SOFTWARE-SIMULATED private key, exactly as in
+#| sage_oracle.py -- this only speeds up the local simulation used for
+#| experiments, not any real oracle.
+#|
+#| Needs pyopencl and numpy. Select the device with PYOPENCL_CTX, e.g.
+#| PYOPENCL_CTX=0 (or run interactively to be prompted). Falls back to a pure
+#| Python pow() if OpenCL is unavailable, so it always produces correct output.
+#| """
+#|
+#| import argparse
+#| import os
+#| import sys
+#| from datetime import datetime
+#| from math import ceil
+#| from time import time
+#|
+#| sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+#| from misc_tools import fast_json_dump  # noqa: E402
+#|
+#| LIMB_BITS = 32
+#| LIMB_MASK = (1 << LIMB_BITS) - 1
+#| _KERNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opencl_oracle.cl")
+#|
+#|
+#| def timestamp(ts=None):
+#|     return datetime.fromtimestamp(ts or time()).strftime("%Y-%m-%d %H:%M:%S")
+#|
+#|
+#| def timeprint(*args):
+#|     print("%s:" % timestamp(), *args)
+#|     sys.stdout.flush()
+#|
+#|
+#| def n_limbs(x):
+#|     return max(1, ceil(x.bit_length() / LIMB_BITS))
+#|
+#|
+#| def to_limbs(x, limbs):
+#|     return [(x >> (LIMB_BITS * i)) & LIMB_MASK for i in range(limbs)]
+#|
+#|
+#| def from_limbs(arr):
+#|     return sum(int(v) << (LIMB_BITS * i) for i, v in enumerate(arr))
+#|
+#|
+#| def mont_n0inv(n):
+#|     """-n^{-1} mod 2^32 (n odd)."""
+#|     inv = pow(n % (1 << LIMB_BITS), -1, 1 << LIMB_BITS)
+#|     return (-inv) & LIMB_MASK
+#|
+#|
+#| def run_python(d, N, bases):
+#|     """Reference/fallback path."""
+#|     return {str(a): str(pow(a, d, N)) for a in bases}
+#|
+#|
+#| def run_opencl(d, N, bases):
+#|     import numpy as np
+#|     import pyopencl as cl
+#|
+#|     if N % 2 == 0:
+#|         raise ValueError("N must be odd for Montgomery arithmetic")
+#|
+#|     limbs = n_limbs(N)
+#|     dbits = max(1, d.bit_length())
+#|     R = 1 << (LIMB_BITS * limbs)
+#|     r2 = (R * R) % N
+#|     n0inv = mont_n0inv(N)
+#|
+#|     count = len(bases)
+#|     base_flat = np.zeros(count * limbs, dtype=np.uint32)
+#|     for i, a in enumerate(bases):
+#|         base_flat[i * limbs:(i + 1) * limbs] = to_limbs(a % N, limbs)
+#|     n_arr = np.array(to_limbs(N, limbs), dtype=np.uint32)
+#|     r2_arr = np.array(to_limbs(r2, limbs), dtype=np.uint32)
+#|     d_arr = np.array(to_limbs(d, limbs), dtype=np.uint32)
+#|
+#|     ctx = cl.create_some_context()
+#|     queue = cl.CommandQueue(ctx)
+#|     with open(_KERNEL) as fh:
+#|         src = fh.read()
+#|     prog = cl.Program(ctx, src).build(
+#|         options=["-DLIMBS=%d" % limbs, "-DDBITS=%d" % dbits])
+#|
+#|     mf = cl.mem_flags
+#|     d_base = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=base_flat)
+#|     d_n = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=n_arr)
+#|     d_r2 = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=r2_arr)
+#|     d_d = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=d_arr)
+#|     out = np.empty(count * limbs, dtype=np.uint32)
+#|     d_out = cl.Buffer(ctx, mf.WRITE_ONLY, out.nbytes)
+#|
+#|     prog.powmod(queue, (count,), None, d_base, d_n, d_r2, d_d,
+#|                 np.uint32(n0inv), np.uint32(count), d_out)
+#|     cl.enqueue_copy(queue, out, d_out)
+#|     queue.finish()
+#|
+#|     rdict = {}
+#|     for i, a in enumerate(bases):
+#|         rdict[str(a)] = str(from_limbs(out[i * limbs:(i + 1) * limbs]))
+#|     return rdict
+#|
+#|
+#| def main():
+#|     parser = argparse.ArgumentParser(
+#|         prog="opencl_oracle.py",
+#|         description="OpenCL batch a^d mod N signing oracle (sage_oracle.py drop-in)")
+#|     parser.add_argument("-d", "--d", dest="d", required=True)
+#|     parser.add_argument("-N", "--N", dest="N", required=True)
+#|     parser.add_argument("--in", dest="infile", required=True)
+#|     parser.add_argument("--out", dest="outfile", required=True)
+#|     parser.add_argument("--force-cpu", action="store_true",
+#|                         help="skip OpenCL, use the pure-Python reference path")
+#|     args = parser.parse_args()
+#|
+#|     d = int(args.d)
+#|     N = int(args.N)
+#|     with open(args.infile) as fh:
+#|         bases = [int(line) for line in fh if line.strip()]
+#|
+#|     use_opencl = not args.force_cpu
+#|     if use_opencl:
+#|         try:
+#|             timeprint("Running OpenCL oracle on %d queries" % len(bases))
+#|             rdict = run_opencl(d, N, bases)
+#|         except Exception as ex:  # noqa: BLE001 -- correctness must not depend on the device
+#|             timeprint("OpenCL unavailable (%s); falling back to Python pow()" % ex)
+#|             use_opencl = False
+#|     if not use_opencl:
+#|         timeprint("Running Python oracle on %d queries" % len(bases))
+#|         rdict = run_python(d, N, bases)
+#|
+#|     timeprint("Finished oracle queries")
+#|     fast_json_dump(rdict, args.outfile)
+#|
+#|
+#| if __name__ == "__main__":
+#|     main()
 
 #@ FILE code/oracles/oracle_client.py 644 6856 7c90854b3c1313c559b4b840ef24f2f6a6f2728344a6661ca2104f91f8b5650a text
 #| #/usr/bin/env python3
@@ -95712,7 +96315,7 @@ if __name__ == "__main__":
 #| scipy
 #| sparse_dot_mkl
 
-#@ FILE code/run.py 644 86615 ef7e91f70dda98379ac91c146b97b4f5bfad26c42dc8d7d8db3c5c8f7db98fae text
+#@ FILE code/run.py 644 86625 6505041a630be671eb7ebc49a7017d051baba31558c36c27178d8e075065dac0 text
 #| from sage.all import *
 #| from crt_ethroot import *
 #| from helpers import *
@@ -97207,7 +97810,7 @@ if __name__ == "__main__":
 #|     parser.add_argument('--descent-counter', dest='descent_counter')
 #|     parser.add_argument('--desc-todofile-glob', dest='todofile_glob', default='')
 #|     parser.add_argument('--bwc-slurm', action='store_true')
-#|     parser.add_argument('--oracle', choices=['sage', 'luna_k6', 'remote_luna_S750'], required=False, default='sage')
+#|     parser.add_argument('--oracle', choices=['sage', 'opencl', 'luna_k6', 'remote_luna_S750'], required=False, default='sage')
 #|     parser.add_argument('--save-intermediate',dest='save_intermediate', action='store_true')
 #|     parser.add_argument('--use-intermediate',dest='use_intermediate', action='store_true')
 #|     parser.add_argument('--overwrite-MC',dest='overwrite_MC',action='store_true')
@@ -99221,7 +99824,7 @@ if __name__ == "__main__":
 #|          return self.submatrices[i][j].M
 #$  $
 
-NSNF_EOF_dd496f098a4b325f
+NSNF_EOF_2a5d3d5ed9c22eb2
 
 # ===== FILE: paper.pdf (725438 bytes, xz+base64, 708692 bytes compressed) =====
 f 'paper.pdf' 644 725438 80638371e99cb53a49fa87190c11d82684c0054a73bbace6141858414b9c9466 b64xz <<'NSNF_EOF_80638371e99cb53a'

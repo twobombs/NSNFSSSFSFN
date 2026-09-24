@@ -80,3 +80,27 @@ Example call:
 ```bash
 python3.8 luna_k6_hsm_oracle_server.py --logs_dir /var/log/luna-oracle --exec_threads 1 --userpin "XXXX-XXXX-XXXX-XXXX"
 ```
+## OpenCL Oracle
+
+File: [opencl_oracle.py](opencl_oracle.py) (kernel: [opencl_oracle.cl](opencl_oracle.cl))
+
+A drop-in replacement for the sage oracle that computes `a^d mod N` for a whole
+batch of bases on an OpenCL device, one work-item per base, using Montgomery
+(CIOS) big-integer arithmetic. Like the sage oracle, `N` and `d` are the
+software-simulated private key, so this only speeds up the local simulation
+used for experiments, not any real signing oracle.
+
+It takes the same arguments as the sage oracle and writes the same JSON output:
+```bash
+python3 oracles/opencl_oracle.py -d <d> -N <N> --in queries.todo --out queries.json
+```
+Select `--oracle opencl` when running `run.py` to use it for the query steps.
+
+Requirements: `pyopencl` and `numpy`, plus any OpenCL platform. A CPU platform
+such as [PoCL](https://portablecl.org/) works, so a GPU is not required. Choose
+the device with the `PYOPENCL_CTX` environment variable. If OpenCL is
+unavailable it falls back to a pure-Python `pow()` so the output is always
+correct; `--force-cpu` selects that path explicitly.
+
+`N` must be odd (true for any RSA modulus). Verified to produce output
+identical to the sage/Python oracle from 128- to 1024-bit moduli.

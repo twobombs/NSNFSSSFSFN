@@ -671,6 +671,16 @@ def run_oracle(params, todofilename, jsonfilename):
                 "--mpi",
                 "--thr", str(params.parameters['mpi.thr'])
             ]
+    elif params.oracle == "opencl":
+        N, d, e = check_N_d_and_e(params)
+
+        command_line = [params.files['PYTHON'],
+            "oracles/opencl_oracle.py",
+            "-d", str(d),
+            "-N", str(N),
+            "--in", todofilename,
+            "--out", jsonfilename
+        ]
     elif params.oracle == "luna_k6":
         bits = params.parameters['MODULUS_BITS']
         N = params.parameters['N']
