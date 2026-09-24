@@ -57,3 +57,12 @@ bash NSNFSSSFSFN.bundle.sh -C NSNFSSSFSFN          # extract
 bash NSNFSSSFSFN.bundle.sh -C NSNFSSSFSFN --with-submodule   # also fetch cado-nfs at the pinned commit
 ```
 Regenerate it after changing any file with `python3 tools/make_single_file.py`; the `single-file bundle` GitHub workflow fails if it is stale.
+
+`nsnfsssfsfn.py` is the code alone (`code/` and `patches/`) as a single Python file. The embedded sources are readable comment lines at the bottom:
+```bash
+python3 nsnfsssfsfn.py list                      # or: cat code/run.py
+python3 nsnfsssfsfn.py unpack mydir --with-cado  # tree + CADO-NFS at the pinned commit, patched
+sage nsnfsssfsfn.py run -l locations.config config/n192.config precomp   # runs code/run.py in ./nsnfsssfsfn
+sage nsnfsssfsfn.py exec oracles/sage_oracle.py --help                   # run a tool straight from memory
+```
+Regenerate with `python3 tools/make_single_python.py`.
