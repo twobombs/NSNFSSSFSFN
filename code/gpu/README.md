@@ -18,6 +18,7 @@ This directory holds a standalone, validated OpenCL implementation:
 | `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
 | `mont32.cl` | 128-bit Montgomery arithmetic with **32-bit limbs** (GPU-friendly: no 64-bit `mul_hi`) |
 | `ecm32.cl` | ECM stage 1 on the 32-bit-limb field (same formulas as `ecm.cl`) |
+| `ecm32_stage2.cl` | ECM stage 2 on the 32-bit-limb field (counterpart of `ecm_stage2.cl`) |
 | `test_mont32.py`, `ecm32_validate.py` | unit tests + bit-for-bit validation of the 32-bit kernel |
 
 Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
@@ -33,7 +34,8 @@ because the CPU multiplies 64-bit natively — measured here ~13k vs ~9k
 curves/sec. On **GCN/Vega and most GPUs**, 64-bit integer multiply is
 synthesized from 32-bit ops, so the **32-bit backend is expected to be
 faster**; that is the whole reason it exists. Benchmark both on the target
-(`ecm_bench.py --limb 32` vs `--limb 64`) to see which wins there.
+(`ecm_bench.py --limb 32` vs `--limb 64`, with `--b2` for stage 2) to see
+which wins there. The 32-bit backend now covers stage 1 **and** stage 2.
 
 ## Validation (PoCL CPU OpenCL — no GPU needed to develop)
 
