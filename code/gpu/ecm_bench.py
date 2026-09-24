@@ -154,6 +154,66 @@ def bench(curves, B1, B2, D, reps, ctx):
     }
 
 
+def bench32(curves, B1, reps, ctx):
+    """Stage-1 throughput of the 32-bit-limb kernel (ecm32.cl)."""
+    MASK32 = (1 << 32) - 1
+    q = cl.CommandQueue(ctx)
+    src = (open(os.path.join(e.HERE, "mont32.cl")).read() + "\n" +
+           open(os.path.join(e.HERE, "ecm32.cl")).read())
+    prog = cl.Program(ctx, src).build()
+    mf = cl.mem_flags
+    rng = random.Random(1234)
+    cofs = _rand_cofactors(curves, rng)
+    E = e.stage1_E(B1)
+    ebits = e.ebits_msb(E)
+    R = 1 << 128
+
+    def to4(x):
+        return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+
+    t0 = time.perf_counter()
+    items = []
+    for n in cofs:
+        ninv = (-pow(n, -1, 1 << 32)) & MASK32
+        bs = e.brent_suyama(n, 11)
+        if bs[0] == "factor":
+            continue
+        x0, z0, b = bs
+        items.append((to4(n), ninv, to4(x0 * R % n), to4(z0 * R % n), to4(b * R % n)))
+    cnt = len(items)
+    n_np = np.stack([it[0] for it in items])
+    ninv_np = np.array([it[1] for it in items], dtype=np.uint32)
+    x0_np = np.stack([it[2] for it in items])
+    z0_np = np.stack([it[3] for it in items])
+    b_np = np.stack([it[4] for it in items])
+    eb_np = np.array(ebits, dtype=np.uint8)
+    host_prep = time.perf_counter() - t0
+
+    def buf(a):
+        return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
+    d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
+    d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 2 * 16)
+    d_g = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+    k = cl.Kernel(prog, "ecm32_stage1")
+    k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+    CHUNK = 4096
+
+    def dispatch():
+        for s in range(0, cnt, CHUNK):
+            m = min(CHUNK, cnt - s)
+            cl.enqueue_nd_range_kernel(q, k, (m,), None, global_work_offset=(s,))
+        q.finish()
+    dispatch()
+    best = min((_timed(dispatch) for _ in range(reps)))
+    return {"curves": cnt, "B1": B1, "stage2": False, "kernel_best_s": best,
+            "host_prep_s": host_prep, "kernel_cps": cnt / best,
+            "endtoend_cps": cnt / (best + host_prep)}
+
+
+def _timed(fn):
+    t = time.perf_counter(); fn(); return time.perf_counter() - t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--list-devices", action="store_true")
@@ -164,6 +224,9 @@ def main():
                     help="stage-2 bound; >b1 enables stage 2 (0 = stage 1 only)")
     ap.add_argument("--d", type=int, default=32, help="stage-2 giant/baby size")
     ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--limb", choices=["64", "32"], default="64",
+                    help="limb width: 64 (mont128) or 32 (mont32, GPU-friendly). "
+                         "32 is stage-1 only for now.")
     args = ap.parse_args()
 
     ctx = cl.create_some_context()
@@ -175,10 +238,14 @@ def main():
         list_devices()
         return 0
 
-    r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
+    if args.limb == "32":
+        r = bench32(args.curves, args.b1, args.reps, ctx)
+        r["B2"] = 0
+    else:
+        r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
     stage = "stage 1+2" if r["stage2"] else "stage 1"
-    print("\n%s  B1=%d%s  work items=%d  reps=%d"
-          % (stage, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
+    print("\n%s  (%s-bit limbs)  B1=%d%s  work items=%d  reps=%d"
+          % (stage, args.limb, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
              r["curves"], args.reps))
     print("  kernel-only : best %.4f s  -> %s curves/sec"
           % (r["kernel_best_s"], f"{r['kernel_cps']:,.0f}"))

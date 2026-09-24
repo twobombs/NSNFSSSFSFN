@@ -15,9 +15,9 @@
 #  GENERATED FILE -- do not edit by hand. Regenerate with:
 #      python3 tools/make_single_file.py
 #
-#  Generated from commit: c58d5c7a748030a434c4c3aa61c87338b5750d75
-#  Files: 143 regular, 1 symlink(s), 1 submodule(s)
-#  Total unpacked size: 67995092 bytes
+#  Generated from commit: 40d5d38e396d5befa76dd23650e46f2d6f1370af
+#  Files: 147 regular, 1 symlink(s), 1 submodule(s)
+#  Total unpacked size: 68031898 bytes
 #
 # -----------------------------------------------------------------------------
 #  USAGE
@@ -126,7 +126,7 @@
 
 set -euo pipefail
 
-BUNDLE_COMMIT='c58d5c7a748030a434c4c3aa61c87338b5750d75'
+BUNDLE_COMMIT='40d5d38e396d5befa76dd23650e46f2d6f1370af'
 DEST='NSNFSSSFSFN'
 MODE=extract
 FORCE=0
@@ -266,13 +266,17 @@ if [ "$MODE" != list ]; then mkdir -p "$DEST"; fi
 #   file      code/fb_extension_sieving_helper.py
 #   file      code/gpu/README.md
 #   file      code/gpu/ecm.cl
+#   file      code/gpu/ecm32.cl
+#   file      code/gpu/ecm32_validate.py
 #   file      code/gpu/ecm_bench.py
 #   file      code/gpu/ecm_ocl.py
 #   file      code/gpu/ecm_stage2.cl
 #   file      code/gpu/las_profiling.md
 #   file      code/gpu/las_split.py
 #   file      code/gpu/mont128.cl
+#   file      code/gpu/mont32.cl
 #   file      code/gpu/test_mont128.py
+#   file      code/gpu/test_mont32.py
 #   file      code/helpers.py
 #   file      code/hintfile_estimate.py
 #   file      code/hintfiles/n1024.hint
@@ -5099,8 +5103,8 @@ if __name__=='__main__':
 
 NSNF_EOF_bf8ddf5cd6cdf07d
 
-# ===== FILE: code/gpu/README.md (3129 bytes, 57 lines) =====
-f 'code/gpu/README.md' 644 3129 0c57e5cffdabf91b9022b85e7dfa60c3946e2e67e9f8d83f5f2e876e58e643e4 text <<'NSNF_EOF_0c57e5cffdabf91b'
+# ===== FILE: code/gpu/README.md (4025 bytes, 71 lines) =====
+f 'code/gpu/README.md' 644 4025 c051b9ac408e51ddb499bc0f875ebd7e192d05a04f2a2b1b50c304e05d4d90a0 text <<'NSNF_EOF_c051b9ac408e51dd'
 # GPU ECM cofactorization for CADO `las`
 
 Toward GPU-accelerating the dominant cost of the computation (CADO `las`,
@@ -5119,10 +5123,24 @@ This directory holds a standalone, validated OpenCL implementation:
 | `ecm_ocl.py` | host driver + Brent-Suyama parameterization (exact, matches CADO `-ecm`), stage-2 plan, and a self-test |
 | `ecm_bench.py` | throughput benchmark (curves/sec) for any OpenCL device (run it on your GPU) |
 | `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
+| `mont32.cl` | 128-bit Montgomery arithmetic with **32-bit limbs** (GPU-friendly: no 64-bit `mul_hi`) |
+| `ecm32.cl` | ECM stage 1 on the 32-bit-limb field (same formulas as `ecm.cl`) |
+| `test_mont32.py`, `ecm32_validate.py` | unit tests + bit-for-bit validation of the 32-bit kernel |
 
 Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
 exactly on the host so a given sigma yields the same curve CADO uses. Stage 1
 multiplies `P0` by `E = prod p^k ≤ B1`.
+
+## 64-bit vs 32-bit limbs
+
+Two arithmetic backends compute the same results: `mont128.cl` uses 2x64-bit
+limbs (`mul_hi(ulong,ulong)`), `mont32.cl` uses 4x32-bit limbs (only
+`uint*uint` products). On a **CPU** (incl. PoCL) the 64-bit backend is faster
+because the CPU multiplies 64-bit natively — measured here ~13k vs ~9k
+curves/sec. On **GCN/Vega and most GPUs**, 64-bit integer multiply is
+synthesized from 32-bit ops, so the **32-bit backend is expected to be
+faster**; that is the whole reason it exists. Benchmark both on the target
+(`ecm_bench.py --limb 32` vs `--limb 64`) to see which wins there.
 
 ## Validation (PoCL CPU OpenCL — no GPU needed to develop)
 
@@ -5159,7 +5177,7 @@ PYOPENCL_CTX=0 python3 test_mont128.py
 PYOPENCL_CTX=0 python3 ecm_ocl.py   # stage 1+2 self-test
 ```
 
-NSNF_EOF_0c57e5cffdabf91b
+NSNF_EOF_c051b9ac408e51dd
 
 # ===== FILE: code/gpu/ecm.cl (3638 bytes, 89 lines) =====
 f 'code/gpu/ecm.cl' 644 3638 16ccef03aab70e62fe3e2bf8643f13694707cdffd6b221571ef6f02370a94d88 text <<'NSNF_EOF_16ccef03aab70e62'
@@ -5255,8 +5273,191 @@ __kernel void ecm_stage1(__global const u128* n_g,
 
 NSNF_EOF_16ccef03aab70e62
 
-# ===== FILE: code/gpu/ecm_bench.py (7724 bytes, 195 lines) =====
-f 'code/gpu/ecm_bench.py' 644 7724 49663dfd34a1b71dc27527e74a5dd8e7eb061416dfdaf87d16112f7b7fd63434 text <<'NSNF_EOF_49663dfd34a1b71d'
+# ===== FILE: code/gpu/ecm32.cl (2386 bytes, 62 lines) =====
+f 'code/gpu/ecm32.cl' 644 2386 0376c31b91c26c588544cde7d56523fc2a244f5fa921a68376aeb7b901bb2cf3 text <<'NSNF_EOF_0376c31b91c26c58'
+/*
+ * ECM stage 1 with 32-bit-limb Montgomery arithmetic (mont32.cl), the
+ * GPU-friendly variant for cards with slow 64-bit integer multiply.
+ * Same algorithm and formulas as ecm.cl; only the field type changes
+ * (u128_32 = uint4 instead of ulong2). One work item per (cofactor, curve).
+ *
+ * mont32.cl is prepended by the host.
+ */
+
+typedef struct { u128_32 x, z; } point32;
+
+inline point32 mdbl32(point32 P, u128_32 n, uint ninv, u128_32 b) {
+    u128_32 u = m32_add(P.x, P.z, n); u = m32_sqr(u, n, ninv);
+    u128_32 v = m32_sub(P.x, P.z, n); v = m32_sqr(v, n, ninv);
+    point32 Q;
+    Q.x = m32_mul(u, v, n, ninv);
+    u128_32 w = m32_sub(u, v, n);
+    u = m32_mul(w, b, n, ninv);
+    u = m32_add(u, v, n);
+    Q.z = m32_mul(w, u, n, ninv);
+    return Q;
+}
+
+inline point32 madd32(point32 P, point32 Q, point32 D, u128_32 n, uint ninv) {
+    u128_32 u = m32_mul(m32_sub(P.x, P.z, n), m32_add(Q.x, Q.z, n), n, ninv);
+    u128_32 v = m32_mul(m32_add(P.x, P.z, n), m32_sub(Q.x, Q.z, n), n, ninv);
+    u128_32 w = m32_add(u, v, n);
+    v = m32_sub(u, v, n);
+    w = m32_sqr(w, n, ninv);
+    v = m32_sqr(v, n, ninv);
+    point32 R;
+    R.x = m32_mul(w, D.z, n, ninv);
+    R.z = m32_mul(v, D.x, n, ninv);
+    return R;
+}
+
+inline u128_32 from_mont32(u128_32 a, u128_32 n, uint ninv) {
+    u128_32 one = (u128_32)(1, 0, 0, 0);
+    return m32_mul(a, one, n, ninv);
+}
+
+__kernel void ecm32_stage1(__global const u128_32* n_g,
+                           __global const uint* ninv_g,
+                           __global const u128_32* x0_g,
+                           __global const u128_32* z0_g,
+                           __global const u128_32* b_g,
+                           __global const uchar* ebits, const uint ebitlen,
+                           __global u128_32* xz_out,
+                           __global u128_32* g_out) {
+    uint i = get_global_id(0);
+    u128_32 n = n_g[i]; uint ninv = ninv_g[i]; u128_32 b = b_g[i];
+    point32 P0; P0.x = x0_g[i]; P0.z = z0_g[i];
+    point32 R0 = P0;
+    point32 R1 = mdbl32(P0, n, ninv, b);
+    for (uint k = 1; k < ebitlen; k++) {
+        if (ebits[k]) { R0 = madd32(R0, R1, P0, n, ninv); R1 = mdbl32(R1, n, ninv, b); }
+        else          { R1 = madd32(R0, R1, P0, n, ninv); R0 = mdbl32(R0, n, ninv, b); }
+    }
+    xz_out[2*i] = R0.x; xz_out[2*i+1] = R0.z;
+    u128_32 z = from_mont32(R0.z, n, ninv);
+    g_out[i] = m32_gcd(z, n);
+}
+
+NSNF_EOF_0376c31b91c26c58
+
+# ===== FILE: code/gpu/ecm32_validate.py (3885 bytes, 111 lines) =====
+f 'code/gpu/ecm32_validate.py' 644 3885 47ce25dadba4870eea82389b2c0d397c4e360f68c363d50bc349da99d69cb966 text <<'NSNF_EOF_47ce25dadba4870e'
+#!/usr/bin/env python3
+"""
+Validate the 32-bit-limb ECM stage-1 kernel (ecm32.cl) against the pure-Python
+reference ECM in ecm_ocl.py, bit-for-bit, and check the two kernels (64-bit
+mont128 and 32-bit mont32) agree on the factors they find.
+"""
+import os
+import random
+import numpy as np
+import pyopencl as cl
+
+import ecm_ocl as e
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MASK32 = (1 << 32) - 1
+
+
+def to4(x):
+    return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+
+
+def from4(a):
+    return sum(int(v) << (32 * i) for i, v in enumerate(a))
+
+
+def run32(cofactors, sigmas, B1, ctx):
+    q = cl.CommandQueue(ctx)
+    src = open(os.path.join(HERE, "mont32.cl")).read() + "\n" + \
+        open(os.path.join(HERE, "ecm32.cl")).read()
+    prog = cl.Program(ctx, src).build()
+    mf = cl.mem_flags
+    E = e.stage1_E(B1)
+    ebits = e.ebits_msb(E)
+    R = 1 << 128
+    items = []
+    for ci, n in enumerate(cofactors):
+        ninv = (-pow(n, -1, 1 << 32)) & MASK32
+        for sg in sigmas:
+            bs = e.brent_suyama(n, sg)
+            if bs[0] == "factor":
+                continue
+            x0, z0, b = bs
+            items.append((n, ninv, x0 * R % n, z0 * R % n, b * R % n, ci, sg))
+    cnt = len(items)
+    n_np = np.stack([to4(it[0]) for it in items])
+    ninv_np = np.array([it[1] for it in items], dtype=np.uint32)
+    x0_np = np.stack([to4(it[2]) for it in items])
+    z0_np = np.stack([to4(it[3]) for it in items])
+    b_np = np.stack([to4(it[4]) for it in items])
+    eb_np = np.array(ebits, dtype=np.uint8)
+
+    def buf(a):
+        return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
+    d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
+    xz = np.empty((cnt * 2, 4), dtype=np.uint32)
+    g = np.empty((cnt, 4), dtype=np.uint32)
+    d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, xz.nbytes)
+    d_g = cl.Buffer(ctx, mf.WRITE_ONLY, g.nbytes)
+    k = cl.Kernel(prog, "ecm32_stage1")
+    k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+    cl.enqueue_nd_range_kernel(q, k, (cnt,), None)
+    cl.enqueue_copy(q, xz, d_xz)
+    cl.enqueue_copy(q, g, d_g)
+    q.finish()
+    return items, xz, g, ebits
+
+
+def main():
+    rng = random.Random(77)
+    from sympy import nextprime
+    cof = []
+    for _ in range(300):
+        p = int(nextprime(rng.getrandbits(rng.randint(24, 34))))
+        qq = int(nextprime(rng.getrandbits(rng.randint(60, 80))))
+        if (p * qq).bit_length() < 127:
+            cof.append(p * qq)
+    sigmas = list(range(6, 26))
+    B1 = 600
+    ctx = cl.create_some_context()
+
+    items, xz, g, ebits = run32(cof, sigmas, B1, ctx)
+    R = 1 << 128
+    # 1) 32-bit kernel ladder == python reference, bit-for-bit
+    mism = 0
+    for idx, it in enumerate(items):
+        n = it[0]
+        x0 = it[2] * pow(R, -1, n) % n
+        z0 = it[3] * pow(R, -1, n) % n
+        b = it[4] * pow(R, -1, n) % n
+        rx, rz = e.ref_ladder((x0, z0), ebits, n, b)
+        kx = from4(xz[2 * idx]) * pow(R, -1, n) % n
+        kz = from4(xz[2 * idx + 1]) * pow(R, -1, n) % n
+        if (kx, kz) != (rx, rz):
+            mism += 1
+    print("mont32 kernel ladder == python reference for all %d items: %s"
+          % (len(items), mism == 0))
+
+    # 2) factors valid, and same finds as the 64-bit kernel
+    found32 = {(it[5], it[6]) for idx, it in enumerate(items)
+               if 1 < from4(g[idx]) < it[0] and it[0] % from4(g[idx]) == 0}
+    r64 = e.run(cof, sigmas, B1, ctx=ctx)
+    found64 = {(ci, sg) for ci, sg, f in r64[0]}
+    print("mont32 finds %d, mont128 finds %d, identical set: %s"
+          % (len(found32), len(found64), found32 == found64))
+    ok = (mism == 0 and found32 == found64)
+    print("32-BIT VALIDATION OK" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+NSNF_EOF_47ce25dadba4870e
+
+# ===== FILE: code/gpu/ecm_bench.py (10324 bytes, 262 lines) =====
+f 'code/gpu/ecm_bench.py' 644 10324 19d718c8260e20a787f9ae5de72d1dc932d9756b267e4df3823145ecde879e46 text <<'NSNF_EOF_19d718c8260e20a7'
 #!/usr/bin/env python3
 """
 Throughput benchmark for the OpenCL ECM cofactorization kernels, to run on a
@@ -5413,6 +5614,66 @@ def bench(curves, B1, B2, D, reps, ctx):
     }
 
 
+def bench32(curves, B1, reps, ctx):
+    """Stage-1 throughput of the 32-bit-limb kernel (ecm32.cl)."""
+    MASK32 = (1 << 32) - 1
+    q = cl.CommandQueue(ctx)
+    src = (open(os.path.join(e.HERE, "mont32.cl")).read() + "\n" +
+           open(os.path.join(e.HERE, "ecm32.cl")).read())
+    prog = cl.Program(ctx, src).build()
+    mf = cl.mem_flags
+    rng = random.Random(1234)
+    cofs = _rand_cofactors(curves, rng)
+    E = e.stage1_E(B1)
+    ebits = e.ebits_msb(E)
+    R = 1 << 128
+
+    def to4(x):
+        return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+
+    t0 = time.perf_counter()
+    items = []
+    for n in cofs:
+        ninv = (-pow(n, -1, 1 << 32)) & MASK32
+        bs = e.brent_suyama(n, 11)
+        if bs[0] == "factor":
+            continue
+        x0, z0, b = bs
+        items.append((to4(n), ninv, to4(x0 * R % n), to4(z0 * R % n), to4(b * R % n)))
+    cnt = len(items)
+    n_np = np.stack([it[0] for it in items])
+    ninv_np = np.array([it[1] for it in items], dtype=np.uint32)
+    x0_np = np.stack([it[2] for it in items])
+    z0_np = np.stack([it[3] for it in items])
+    b_np = np.stack([it[4] for it in items])
+    eb_np = np.array(ebits, dtype=np.uint8)
+    host_prep = time.perf_counter() - t0
+
+    def buf(a):
+        return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
+    d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
+    d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 2 * 16)
+    d_g = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+    k = cl.Kernel(prog, "ecm32_stage1")
+    k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+    CHUNK = 4096
+
+    def dispatch():
+        for s in range(0, cnt, CHUNK):
+            m = min(CHUNK, cnt - s)
+            cl.enqueue_nd_range_kernel(q, k, (m,), None, global_work_offset=(s,))
+        q.finish()
+    dispatch()
+    best = min((_timed(dispatch) for _ in range(reps)))
+    return {"curves": cnt, "B1": B1, "stage2": False, "kernel_best_s": best,
+            "host_prep_s": host_prep, "kernel_cps": cnt / best,
+            "endtoend_cps": cnt / (best + host_prep)}
+
+
+def _timed(fn):
+    t = time.perf_counter(); fn(); return time.perf_counter() - t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ap.add_argument("--list-devices", action="store_true")
@@ -5423,6 +5684,9 @@ def main():
                     help="stage-2 bound; >b1 enables stage 2 (0 = stage 1 only)")
     ap.add_argument("--d", type=int, default=32, help="stage-2 giant/baby size")
     ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--limb", choices=["64", "32"], default="64",
+                    help="limb width: 64 (mont128) or 32 (mont32, GPU-friendly). "
+                         "32 is stage-1 only for now.")
     args = ap.parse_args()
 
     ctx = cl.create_some_context()
@@ -5434,10 +5698,14 @@ def main():
         list_devices()
         return 0
 
-    r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
+    if args.limb == "32":
+        r = bench32(args.curves, args.b1, args.reps, ctx)
+        r["B2"] = 0
+    else:
+        r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
     stage = "stage 1+2" if r["stage2"] else "stage 1"
-    print("\n%s  B1=%d%s  work items=%d  reps=%d"
-          % (stage, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
+    print("\n%s  (%s-bit limbs)  B1=%d%s  work items=%d  reps=%d"
+          % (stage, args.limb, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
              r["curves"], args.reps))
     print("  kernel-only : best %.4f s  -> %s curves/sec"
           % (r["kernel_best_s"], f"{r['kernel_cps']:,.0f}"))
@@ -5453,7 +5721,7 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 
-NSNF_EOF_49663dfd34a1b71d
+NSNF_EOF_19d718c8260e20a7
 
 # ===== FILE: code/gpu/ecm_ocl.py (12457 bytes, 361 lines) =====
 f 'code/gpu/ecm_ocl.py' 644 12457 a17b31eb2bc49041a05919518f319b251a798e87a5b64da2f25946b9b05f5063 text <<'NSNF_EOF_a17b31eb2bc49041'
@@ -6164,6 +6432,132 @@ inline u128 gcd128(u128 a, u128 b) {
 
 NSNF_EOF_8127ca85ab4b507b
 
+# ===== FILE: code/gpu/mont32.cl (4205 bytes, 121 lines) =====
+f 'code/gpu/mont32.cl' 644 4205 0c9f3f7d5e8455141c34bdce7926dc5571c0667e0abc6a8b86ccaf93d79f1e58 text <<'NSNF_EOF_0c9f3f7d5e845514'
+/*
+ * 128-bit Montgomery arithmetic with 32-bit limbs, for GPUs whose 64-bit
+ * integer multiply is synthesized (AMD GCN / Vega, most consumer/pro cards).
+ * Every partial product here is a 32x32 -> 64 multiply (native `uint*uint`
+ * widened to `ulong`), so it needs no `mul_hi(ulong,...)`. Same math as
+ * mont128.cl (CADO modredc_2ul2), different limb width.
+ *
+ * A 128-bit value is uint4 = (limb0..limb3), little-endian. Modulus n < 2^127
+ * odd; R = 2^128; ninv = -n^{-1} mod 2^32. Residues are in Montgomery form.
+ *
+ * NLIMBS is fixed at 4 (128-bit). The CIOS loops are written generically over
+ * NLIMBS so the same code can be widened later.
+ */
+#define NLIMBS 4
+
+typedef uint4 u128_32;
+
+inline void ld(uint *l, u128_32 a) { l[0]=a.x; l[1]=a.y; l[2]=a.z; l[3]=a.w; }
+inline u128_32 st(const uint *l) { return (u128_32)(l[0], l[1], l[2], l[3]); }
+
+inline int geq(const uint *a, const uint *b) {
+    for (int i = NLIMBS - 1; i >= 0; i--) {
+        if (a[i] != b[i]) return a[i] > b[i];
+    }
+    return 1;
+}
+
+inline void sub_in(uint *a, const uint *b) {   /* a -= b (assumes a>=b) */
+    ulong borrow = 0;
+    for (int i = 0; i < NLIMBS; i++) {
+        ulong d = (ulong)a[i] - b[i] - borrow;
+        a[i] = (uint)d;
+        borrow = (d >> 63) & 1;   /* set if underflow */
+    }
+}
+
+inline u128_32 m32_add(u128_32 A, u128_32 B, u128_32 N) {
+    uint a[NLIMBS], b[NLIMBS], n[NLIMBS];
+    ld(a, A); ld(b, B); ld(n, N);
+    ulong c = 0;
+    for (int i = 0; i < NLIMBS; i++) { ulong s = (ulong)a[i] + b[i] + c; a[i] = (uint)s; c = s >> 32; }
+    if (c || geq(a, n)) sub_in(a, n);
+    return st(a);
+}
+
+inline u128_32 m32_sub(u128_32 A, u128_32 B, u128_32 N) {
+    uint a[NLIMBS], b[NLIMBS], n[NLIMBS];
+    ld(a, A); ld(b, B); ld(n, N);
+    if (geq(a, b)) { sub_in(a, b); return st(a); }
+    /* a + n - b */
+    ulong c = 0;
+    for (int i = 0; i < NLIMBS; i++) { ulong s = (ulong)a[i] + n[i] + c; a[i] = (uint)s; c = s >> 32; }
+    sub_in(a, b);
+    return st(a);
+}
+
+/* CIOS Montgomery multiply, 32-bit limbs, 64-bit accumulator. */
+inline u128_32 m32_mul(u128_32 A, u128_32 B, u128_32 N, uint ninv) {
+    uint a[NLIMBS], b[NLIMBS], n[NLIMBS];
+    ld(a, A); ld(b, B); ld(n, N);
+    uint t[NLIMBS + 2];
+    for (int i = 0; i < NLIMBS + 2; i++) t[i] = 0;
+
+    for (int i = 0; i < NLIMBS; i++) {
+        ulong C = 0;
+        uint bi = b[i];
+        for (int j = 0; j < NLIMBS; j++) {
+            ulong p = (ulong)a[j] * bi + t[j] + C;
+            t[j] = (uint)p;
+            C = p >> 32;
+        }
+        ulong s = (ulong)t[NLIMBS] + C;
+        t[NLIMBS] = (uint)s;
+        t[NLIMBS + 1] = (uint)(s >> 32);
+
+        uint m = t[0] * ninv;
+        C = ((ulong)m * n[0] + t[0]) >> 32;   /* low limb becomes 0 */
+        for (int j = 1; j < NLIMBS; j++) {
+            ulong p = (ulong)m * n[j] + t[j] + C;
+            t[j - 1] = (uint)p;
+            C = p >> 32;
+        }
+        s = (ulong)t[NLIMBS] + C;
+        t[NLIMBS - 1] = (uint)s;
+        t[NLIMBS] = t[NLIMBS + 1] + (uint)(s >> 32);
+    }
+
+    uint r[NLIMBS];
+    for (int i = 0; i < NLIMBS; i++) r[i] = t[i];
+    if (t[NLIMBS] || geq(r, n)) sub_in(r, n);
+    return st(r);
+}
+
+inline u128_32 m32_sqr(u128_32 a, u128_32 n, uint ninv) { return m32_mul(a, a, n, ninv); }
+
+/* binary gcd of two 128-bit integers (not in Montgomery form) */
+inline int is_zero(const uint *a) { return (a[0]|a[1]|a[2]|a[3]) == 0; }
+inline void shr1(uint *a) {
+    for (int i = 0; i < NLIMBS - 1; i++) a[i] = (a[i] >> 1) | (a[i+1] << 31);
+    a[NLIMBS-1] >>= 1;
+}
+inline void shl1(uint *a) {
+    for (int i = NLIMBS - 1; i > 0; i--) a[i] = (a[i] << 1) | (a[i-1] >> 31);
+    a[0] <<= 1;
+}
+inline u128_32 m32_gcd(u128_32 A, u128_32 B) {
+    uint a[NLIMBS], b[NLIMBS];
+    ld(a, A); ld(b, B);
+    if (is_zero(a)) return B;
+    if (is_zero(b)) return A;
+    int shift = 0;
+    while (((a[0] | b[0]) & 1) == 0) { shr1(a); shr1(b); shift++; }
+    while ((a[0] & 1) == 0) shr1(a);
+    do {
+        while ((b[0] & 1) == 0) shr1(b);
+        if (geq(a, b)) { uint tmp[NLIMBS]; for(int i=0;i<NLIMBS;i++){tmp[i]=a[i];a[i]=b[i];b[i]=tmp[i];} }
+        sub_in(b, a);   /* b = b - a, b was >= a */
+    } while (!is_zero(b));
+    for (int i = 0; i < shift; i++) shl1(a);
+    return st(a);
+}
+
+NSNF_EOF_0c9f3f7d5e845514
+
 # ===== FILE: code/gpu/test_mont128.py (4103 bytes, 109 lines) =====
 f 'code/gpu/test_mont128.py' 644 4103 6e9efb2f26b5fe9d6b4b23a4909df3d5fc3b8bf20107d21ea9a908870dd3cb07 text <<'NSNF_EOF_6e9efb2f26b5fe9d'
 #!/usr/bin/env python3
@@ -6277,6 +6671,92 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 NSNF_EOF_6e9efb2f26b5fe9d
+
+# ===== FILE: code/gpu/test_mont32.py (3387 bytes, 81 lines) =====
+f 'code/gpu/test_mont32.py' 644 3387 877ce7cc59f58bd1ef4dfb03cd00da916ed1b3b14d925d15011a39de01820346 text <<'NSNF_EOF_877ce7cc59f58bd1'
+#!/usr/bin/env python3
+"""Unit-test the 32-bit-limb 128-bit Montgomery ops in mont32.cl vs Python."""
+import os
+import random
+import numpy as np
+import pyopencl as cl
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MASK32 = (1 << 32) - 1
+
+
+def to4(x):
+    return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+
+
+def from4(a):
+    return sum(int(v) << (32 * i) for i, v in enumerate(a))
+
+
+KERNEL = open(os.path.join(HERE, "mont32.cl")).read() + r"""
+__kernel void t_mul(__global const uint4* a, __global const uint4* b,
+                    uint4 n, uint ninv, __global uint4* out) {
+    int i = get_global_id(0); out[i] = m32_mul(a[i], b[i], n, ninv);
+}
+__kernel void t_as(__global const uint4* a, __global const uint4* b,
+                   uint4 n, __global uint4* add, __global uint4* sub) {
+    int i = get_global_id(0); add[i]=m32_add(a[i],b[i],n); sub[i]=m32_sub(a[i],b[i],n);
+}
+__kernel void t_gcd(__global const uint4* a, __global const uint4* b, __global uint4* o){
+    int i=get_global_id(0); o[i]=m32_gcd(a[i],b[i]);
+}
+"""
+
+
+def main():
+    ctx = cl.create_some_context()
+    q = cl.CommandQueue(ctx)
+    prog = cl.Program(ctx, KERNEL).build()
+    mf = cl.mem_flags
+    rng = random.Random(999)
+    N = 20000
+    import math
+    ok = True
+    for trial in range(6):
+        n = rng.getrandbits(rng.choice([64, 96, 127])) | 1
+        R = 1 << 128
+        ninv = (-pow(n, -1, 1 << 32)) & MASK32
+        a = [rng.randrange(n) for _ in range(N)]
+        b = [rng.randrange(n) for _ in range(N)]
+        aM = [(x * R) % n for x in a]
+        bM = [(x * R) % n for x in b]
+        A = np.stack([to4(x) for x in aM]); B = np.stack([to4(x) for x in bM])
+        dA = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=A)
+        dB = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=B)
+        nvec = to4(n)
+        out = np.empty_like(A); dOut = cl.Buffer(ctx, mf.WRITE_ONLY, out.nbytes)
+        cl.Kernel(prog, "t_mul")(q, (N,), None, dA, dB, nvec, np.uint32(ninv), dOut)
+        cl.enqueue_copy(q, out, dOut); q.finish()
+        Rinv = pow(R, -1, n)
+        bad = sum(1 for i in range(N) if from4(out[i]) != (aM[i]*bM[i]*Rinv) % n)
+        add = np.empty_like(A); sub = np.empty_like(A)
+        dAdd = cl.Buffer(ctx, mf.WRITE_ONLY, add.nbytes); dSub = cl.Buffer(ctx, mf.WRITE_ONLY, sub.nbytes)
+        cl.Kernel(prog, "t_as")(q, (N,), None, dA, dB, nvec, dAdd, dSub)
+        cl.enqueue_copy(q, add, dAdd); cl.enqueue_copy(q, sub, dSub); q.finish()
+        bas = sum(1 for i in range(N)
+                  if from4(add[i]) != (aM[i]+bM[i]) % n or from4(sub[i]) != (aM[i]-bM[i]) % n)
+        gA = np.stack([to4(x) for x in a]); gB = np.stack([to4(x) for x in b])
+        dGA = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=gA)
+        dGB = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=gB)
+        g = np.empty_like(gA); dG = cl.Buffer(ctx, mf.WRITE_ONLY, g.nbytes)
+        cl.Kernel(prog, "t_gcd")(q, (N,), None, dGA, dGB, dG)
+        cl.enqueue_copy(q, g, dG); q.finish()
+        bg = sum(1 for i in range(N) if from4(g[i]) != math.gcd(a[i], b[i]))
+        ok &= (bad == 0 and bas == 0 and bg == 0)
+        print(f"trial {trial}: n={n.bit_length()}b mul_bad={bad} addsub_bad={bas} gcd_bad={bg}")
+    print("ALL OK" if ok else "FAILURES")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+NSNF_EOF_877ce7cc59f58bd1
 
 # ===== FILE: code/helpers.py (250781 bytes, 6480 lines) =====
 f 'code/helpers.py' 644 250781 7e835c93bc0fc2f150cb0d0f50f11465a091530a1da7b0b6514c527894a0a2ef text <<'NSNF_EOF_7e835c93bc0fc2f1'
@@ -75791,8 +76271,8 @@ f 'data1024/thetarget' 644 309 7ed183d75d59ba87b70d3bc6ae7eb59e394cf779719e888c2
 
 NSNF_EOF_7ed183d75d59ba87
 
-# ===== FILE: docs/las_gpu_notes.md (8699 bytes, 173 lines) =====
-f 'docs/las_gpu_notes.md' 644 8699 43cfcd58141d348f7dc6521cdc1ab4b76ff87ba496ae31b74b70f95006186b6d text <<'NSNF_EOF_43cfcd58141d348f'
+# ===== FILE: docs/las_gpu_notes.md (9031 bytes, 177 lines) =====
+f 'docs/las_gpu_notes.md' 644 9031 b0c442035ed70fc6948da6773aed731160d7624681aa0a71291d49145295673e text <<'NSNF_EOF_b0c442035ed70fc6'
 # Moving `las` toward the GPU: target, build recipe, and baseline
 
 Working notes for accelerating the dominant cost of the computation. The
@@ -75956,7 +76436,11 @@ with `cpu_socket_cps ~= 92k * cores` from the CADO baseline at B1=600.
   current 2x64-bit-limb kernel leaves a large factor on the table on Vega. A
   **32-bit-limb rewrite** (4 limbs for 128-bit, explicit carries) is the main
   optimization for this hardware and is the standard approach in GPU-ECM
-  literature (Bernstein et al.; NVIDIA CGBN).
+  literature (Bernstein et al.; NVIDIA CGBN). This is now implemented as
+  `code/gpu/mont32.cl` + `ecm32.cl` (stage 1), validated bit-for-bit against
+  the reference and against the 64-bit kernel. On CPU/PoCL it is slower than
+  the 64-bit backend (native 64-bit multiply), as expected; the win is on the
+  GPU -- benchmark with `ecm_bench.py --limb 32` on the V340 to confirm.
 - Confirm ROCm/OpenCL compute actually runs on the V340 (it is an MxGPU/
   SR-IOV virtualization card) before benchmarking.
 - Cofactorization is embarrassingly parallel (independent survivor x curve
@@ -75967,10 +76451,10 @@ with `cpu_socket_cps ~= 92k * cores` from the CADO baseline at B1=600.
   GPU predictor: PoCL adds overhead and the 64-bit path is slow; it is a
   correctness/development number only.
 
-NSNF_EOF_43cfcd58141d348f
+NSNF_EOF_b0c442035ed70fc6
 
-# ===== FILE: nsnfsssfsfn.py (1114833 bytes, 26371 lines) =====
-f 'nsnfsssfsfn.py' 755 1114833 3dfac1f219a68e2ef791e61cc8d22b60ae95bcf4fa1698ddd4bf111e1aec21bf text <<'NSNF_EOF_3dfac1f219a68e2e'
+# ===== FILE: nsnfsssfsfn.py (1133948 bytes, 26835 lines) =====
+f 'nsnfsssfsfn.py' 755 1133948 8ab207770c224c4bbebe20ff7519fa86280fc9fa800d619ba55961f5dbe208f0 text <<'NSNF_EOF_8ab207770c224c4b'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -75981,8 +76465,8 @@ Paper: https://eprint.iacr.org/2026/2131.pdf (eprint 2026/2131)
 GENERATED FILE -- do not edit by hand. Regenerate with:
     python3 tools/make_single_python.py
 
-Generated from commit c58d5c7a748030a434c4c3aa61c87338b5750d75
-Embedded: 124 files (1022922 bytes) from code/ and patches/,
+Generated from commit 40d5d38e396d5befa76dd23650e46f2d6f1370af
+Embedded: 128 files (1040281 bytes) from code/ and patches/,
 plus the code/cado submodule pin and the code/cado_sage symlink.
 
 This one file holds every source in code/ (run.py, helpers.py, descent,
@@ -80998,7 +81482,7 @@ if __name__ == "__main__":
 #$     $
 #|     do_fb_extension_sieving(params,jobnum=topargs.jobnum,q0=topargs.q0,q1=topargs.q1)
 
-#@ FILE code/gpu/README.md 644 3129 0c57e5cffdabf91b9022b85e7dfa60c3946e2e67e9f8d83f5f2e876e58e643e4 text
+#@ FILE code/gpu/README.md 644 4025 c051b9ac408e51ddb499bc0f875ebd7e192d05a04f2a2b1b50c304e05d4d90a0 text
 #| # GPU ECM cofactorization for CADO `las`
 #|
 #| Toward GPU-accelerating the dominant cost of the computation (CADO `las`,
@@ -81017,10 +81501,24 @@ if __name__ == "__main__":
 #| | `ecm_ocl.py` | host driver + Brent-Suyama parameterization (exact, matches CADO `-ecm`), stage-2 plan, and a self-test |
 #| | `ecm_bench.py` | throughput benchmark (curves/sec) for any OpenCL device (run it on your GPU) |
 #| | `las_split.py` + `las_profiling.md` | measure the sieving-vs-cofactorization split in `las` (the Amdahl ceiling) |
+#| | `mont32.cl` | 128-bit Montgomery arithmetic with **32-bit limbs** (GPU-friendly: no 64-bit `mul_hi`) |
+#| | `ecm32.cl` | ECM stage 1 on the 32-bit-limb field (same formulas as `ecm.cl`) |
+#| | `test_mont32.py`, `ecm32_validate.py` | unit tests + bit-for-bit validation of the 32-bit kernel |
 #|
 #| Curves use the Brent-Suyama parameterization (CADO's `BRENT12`), computed
 #| exactly on the host so a given sigma yields the same curve CADO uses. Stage 1
 #| multiplies `P0` by `E = prod p^k ≤ B1`.
+#|
+#| ## 64-bit vs 32-bit limbs
+#|
+#| Two arithmetic backends compute the same results: `mont128.cl` uses 2x64-bit
+#| limbs (`mul_hi(ulong,ulong)`), `mont32.cl` uses 4x32-bit limbs (only
+#| `uint*uint` products). On a **CPU** (incl. PoCL) the 64-bit backend is faster
+#| because the CPU multiplies 64-bit natively — measured here ~13k vs ~9k
+#| curves/sec. On **GCN/Vega and most GPUs**, 64-bit integer multiply is
+#| synthesized from 32-bit ops, so the **32-bit backend is expected to be
+#| faster**; that is the whole reason it exists. Benchmark both on the target
+#| (`ecm_bench.py --limb 32` vs `--limb 64`) to see which wins there.
 #|
 #| ## Validation (PoCL CPU OpenCL — no GPU needed to develop)
 #|
@@ -81148,7 +81646,184 @@ if __name__ == "__main__":
 #|
 #| /* Stage 2 lives in ecm_stage2.cl (added and validated separately). */
 
-#@ FILE code/gpu/ecm_bench.py 644 7724 49663dfd34a1b71dc27527e74a5dd8e7eb061416dfdaf87d16112f7b7fd63434 text
+#@ FILE code/gpu/ecm32.cl 644 2386 0376c31b91c26c588544cde7d56523fc2a244f5fa921a68376aeb7b901bb2cf3 text
+#| /*
+#|  * ECM stage 1 with 32-bit-limb Montgomery arithmetic (mont32.cl), the
+#|  * GPU-friendly variant for cards with slow 64-bit integer multiply.
+#|  * Same algorithm and formulas as ecm.cl; only the field type changes
+#|  * (u128_32 = uint4 instead of ulong2). One work item per (cofactor, curve).
+#|  *
+#|  * mont32.cl is prepended by the host.
+#|  */
+#|
+#| typedef struct { u128_32 x, z; } point32;
+#|
+#| inline point32 mdbl32(point32 P, u128_32 n, uint ninv, u128_32 b) {
+#|     u128_32 u = m32_add(P.x, P.z, n); u = m32_sqr(u, n, ninv);
+#|     u128_32 v = m32_sub(P.x, P.z, n); v = m32_sqr(v, n, ninv);
+#|     point32 Q;
+#|     Q.x = m32_mul(u, v, n, ninv);
+#|     u128_32 w = m32_sub(u, v, n);
+#|     u = m32_mul(w, b, n, ninv);
+#|     u = m32_add(u, v, n);
+#|     Q.z = m32_mul(w, u, n, ninv);
+#|     return Q;
+#| }
+#|
+#| inline point32 madd32(point32 P, point32 Q, point32 D, u128_32 n, uint ninv) {
+#|     u128_32 u = m32_mul(m32_sub(P.x, P.z, n), m32_add(Q.x, Q.z, n), n, ninv);
+#|     u128_32 v = m32_mul(m32_add(P.x, P.z, n), m32_sub(Q.x, Q.z, n), n, ninv);
+#|     u128_32 w = m32_add(u, v, n);
+#|     v = m32_sub(u, v, n);
+#|     w = m32_sqr(w, n, ninv);
+#|     v = m32_sqr(v, n, ninv);
+#|     point32 R;
+#|     R.x = m32_mul(w, D.z, n, ninv);
+#|     R.z = m32_mul(v, D.x, n, ninv);
+#|     return R;
+#| }
+#|
+#| inline u128_32 from_mont32(u128_32 a, u128_32 n, uint ninv) {
+#|     u128_32 one = (u128_32)(1, 0, 0, 0);
+#|     return m32_mul(a, one, n, ninv);
+#| }
+#|
+#| __kernel void ecm32_stage1(__global const u128_32* n_g,
+#|                            __global const uint* ninv_g,
+#|                            __global const u128_32* x0_g,
+#|                            __global const u128_32* z0_g,
+#|                            __global const u128_32* b_g,
+#|                            __global const uchar* ebits, const uint ebitlen,
+#|                            __global u128_32* xz_out,
+#|                            __global u128_32* g_out) {
+#|     uint i = get_global_id(0);
+#|     u128_32 n = n_g[i]; uint ninv = ninv_g[i]; u128_32 b = b_g[i];
+#|     point32 P0; P0.x = x0_g[i]; P0.z = z0_g[i];
+#|     point32 R0 = P0;
+#|     point32 R1 = mdbl32(P0, n, ninv, b);
+#|     for (uint k = 1; k < ebitlen; k++) {
+#|         if (ebits[k]) { R0 = madd32(R0, R1, P0, n, ninv); R1 = mdbl32(R1, n, ninv, b); }
+#|         else          { R1 = madd32(R0, R1, P0, n, ninv); R0 = mdbl32(R0, n, ninv, b); }
+#|     }
+#|     xz_out[2*i] = R0.x; xz_out[2*i+1] = R0.z;
+#|     u128_32 z = from_mont32(R0.z, n, ninv);
+#|     g_out[i] = m32_gcd(z, n);
+#| }
+
+#@ FILE code/gpu/ecm32_validate.py 644 3885 47ce25dadba4870eea82389b2c0d397c4e360f68c363d50bc349da99d69cb966 text
+#| #!/usr/bin/env python3
+#| """
+#| Validate the 32-bit-limb ECM stage-1 kernel (ecm32.cl) against the pure-Python
+#| reference ECM in ecm_ocl.py, bit-for-bit, and check the two kernels (64-bit
+#| mont128 and 32-bit mont32) agree on the factors they find.
+#| """
+#| import os
+#| import random
+#| import numpy as np
+#| import pyopencl as cl
+#|
+#| import ecm_ocl as e
+#|
+#| HERE = os.path.dirname(os.path.abspath(__file__))
+#| MASK32 = (1 << 32) - 1
+#|
+#|
+#| def to4(x):
+#|     return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+#|
+#|
+#| def from4(a):
+#|     return sum(int(v) << (32 * i) for i, v in enumerate(a))
+#|
+#|
+#| def run32(cofactors, sigmas, B1, ctx):
+#|     q = cl.CommandQueue(ctx)
+#|     src = open(os.path.join(HERE, "mont32.cl")).read() + "\n" + \
+#|         open(os.path.join(HERE, "ecm32.cl")).read()
+#|     prog = cl.Program(ctx, src).build()
+#|     mf = cl.mem_flags
+#|     E = e.stage1_E(B1)
+#|     ebits = e.ebits_msb(E)
+#|     R = 1 << 128
+#|     items = []
+#|     for ci, n in enumerate(cofactors):
+#|         ninv = (-pow(n, -1, 1 << 32)) & MASK32
+#|         for sg in sigmas:
+#|             bs = e.brent_suyama(n, sg)
+#|             if bs[0] == "factor":
+#|                 continue
+#|             x0, z0, b = bs
+#|             items.append((n, ninv, x0 * R % n, z0 * R % n, b * R % n, ci, sg))
+#|     cnt = len(items)
+#|     n_np = np.stack([to4(it[0]) for it in items])
+#|     ninv_np = np.array([it[1] for it in items], dtype=np.uint32)
+#|     x0_np = np.stack([to4(it[2]) for it in items])
+#|     z0_np = np.stack([to4(it[3]) for it in items])
+#|     b_np = np.stack([to4(it[4]) for it in items])
+#|     eb_np = np.array(ebits, dtype=np.uint8)
+#|
+#|     def buf(a):
+#|         return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
+#|     d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
+#|     xz = np.empty((cnt * 2, 4), dtype=np.uint32)
+#|     g = np.empty((cnt, 4), dtype=np.uint32)
+#|     d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, xz.nbytes)
+#|     d_g = cl.Buffer(ctx, mf.WRITE_ONLY, g.nbytes)
+#|     k = cl.Kernel(prog, "ecm32_stage1")
+#|     k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+#|     cl.enqueue_nd_range_kernel(q, k, (cnt,), None)
+#|     cl.enqueue_copy(q, xz, d_xz)
+#|     cl.enqueue_copy(q, g, d_g)
+#|     q.finish()
+#|     return items, xz, g, ebits
+#|
+#|
+#| def main():
+#|     rng = random.Random(77)
+#|     from sympy import nextprime
+#|     cof = []
+#|     for _ in range(300):
+#|         p = int(nextprime(rng.getrandbits(rng.randint(24, 34))))
+#|         qq = int(nextprime(rng.getrandbits(rng.randint(60, 80))))
+#|         if (p * qq).bit_length() < 127:
+#|             cof.append(p * qq)
+#|     sigmas = list(range(6, 26))
+#|     B1 = 600
+#|     ctx = cl.create_some_context()
+#|
+#|     items, xz, g, ebits = run32(cof, sigmas, B1, ctx)
+#|     R = 1 << 128
+#|     # 1) 32-bit kernel ladder == python reference, bit-for-bit
+#|     mism = 0
+#|     for idx, it in enumerate(items):
+#|         n = it[0]
+#|         x0 = it[2] * pow(R, -1, n) % n
+#|         z0 = it[3] * pow(R, -1, n) % n
+#|         b = it[4] * pow(R, -1, n) % n
+#|         rx, rz = e.ref_ladder((x0, z0), ebits, n, b)
+#|         kx = from4(xz[2 * idx]) * pow(R, -1, n) % n
+#|         kz = from4(xz[2 * idx + 1]) * pow(R, -1, n) % n
+#|         if (kx, kz) != (rx, rz):
+#|             mism += 1
+#|     print("mont32 kernel ladder == python reference for all %d items: %s"
+#|           % (len(items), mism == 0))
+#|
+#|     # 2) factors valid, and same finds as the 64-bit kernel
+#|     found32 = {(it[5], it[6]) for idx, it in enumerate(items)
+#|                if 1 < from4(g[idx]) < it[0] and it[0] % from4(g[idx]) == 0}
+#|     r64 = e.run(cof, sigmas, B1, ctx=ctx)
+#|     found64 = {(ci, sg) for ci, sg, f in r64[0]}
+#|     print("mont32 finds %d, mont128 finds %d, identical set: %s"
+#|           % (len(found32), len(found64), found32 == found64))
+#|     ok = (mism == 0 and found32 == found64)
+#|     print("32-BIT VALIDATION OK" if ok else "FAILED")
+#|     return 0 if ok else 1
+#|
+#|
+#| if __name__ == "__main__":
+#|     raise SystemExit(main())
+
+#@ FILE code/gpu/ecm_bench.py 644 10324 19d718c8260e20a787f9ae5de72d1dc932d9756b267e4df3823145ecde879e46 text
 #| #!/usr/bin/env python3
 #| """
 #| Throughput benchmark for the OpenCL ECM cofactorization kernels, to run on a
@@ -81305,6 +81980,66 @@ if __name__ == "__main__":
 #|     }
 #|
 #|
+#| def bench32(curves, B1, reps, ctx):
+#|     """Stage-1 throughput of the 32-bit-limb kernel (ecm32.cl)."""
+#|     MASK32 = (1 << 32) - 1
+#|     q = cl.CommandQueue(ctx)
+#|     src = (open(os.path.join(e.HERE, "mont32.cl")).read() + "\n" +
+#|            open(os.path.join(e.HERE, "ecm32.cl")).read())
+#|     prog = cl.Program(ctx, src).build()
+#|     mf = cl.mem_flags
+#|     rng = random.Random(1234)
+#|     cofs = _rand_cofactors(curves, rng)
+#|     E = e.stage1_E(B1)
+#|     ebits = e.ebits_msb(E)
+#|     R = 1 << 128
+#|
+#|     def to4(x):
+#|         return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+#|
+#|     t0 = time.perf_counter()
+#|     items = []
+#|     for n in cofs:
+#|         ninv = (-pow(n, -1, 1 << 32)) & MASK32
+#|         bs = e.brent_suyama(n, 11)
+#|         if bs[0] == "factor":
+#|             continue
+#|         x0, z0, b = bs
+#|         items.append((to4(n), ninv, to4(x0 * R % n), to4(z0 * R % n), to4(b * R % n)))
+#|     cnt = len(items)
+#|     n_np = np.stack([it[0] for it in items])
+#|     ninv_np = np.array([it[1] for it in items], dtype=np.uint32)
+#|     x0_np = np.stack([it[2] for it in items])
+#|     z0_np = np.stack([it[3] for it in items])
+#|     b_np = np.stack([it[4] for it in items])
+#|     eb_np = np.array(ebits, dtype=np.uint8)
+#|     host_prep = time.perf_counter() - t0
+#|
+#|     def buf(a):
+#|         return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
+#|     d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
+#|     d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 2 * 16)
+#|     d_g = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+#|     k = cl.Kernel(prog, "ecm32_stage1")
+#|     k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+#|     CHUNK = 4096
+#|
+#|     def dispatch():
+#|         for s in range(0, cnt, CHUNK):
+#|             m = min(CHUNK, cnt - s)
+#|             cl.enqueue_nd_range_kernel(q, k, (m,), None, global_work_offset=(s,))
+#|         q.finish()
+#|     dispatch()
+#|     best = min((_timed(dispatch) for _ in range(reps)))
+#|     return {"curves": cnt, "B1": B1, "stage2": False, "kernel_best_s": best,
+#|             "host_prep_s": host_prep, "kernel_cps": cnt / best,
+#|             "endtoend_cps": cnt / (best + host_prep)}
+#|
+#|
+#| def _timed(fn):
+#|     t = time.perf_counter(); fn(); return time.perf_counter() - t
+#|
+#|
 #| def main():
 #|     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
 #|     ap.add_argument("--list-devices", action="store_true")
@@ -81315,6 +82050,9 @@ if __name__ == "__main__":
 #|                     help="stage-2 bound; >b1 enables stage 2 (0 = stage 1 only)")
 #|     ap.add_argument("--d", type=int, default=32, help="stage-2 giant/baby size")
 #|     ap.add_argument("--reps", type=int, default=5)
+#|     ap.add_argument("--limb", choices=["64", "32"], default="64",
+#|                     help="limb width: 64 (mont128) or 32 (mont32, GPU-friendly). "
+#|                          "32 is stage-1 only for now.")
 #|     args = ap.parse_args()
 #|
 #|     ctx = cl.create_some_context()
@@ -81326,10 +82064,14 @@ if __name__ == "__main__":
 #|         list_devices()
 #|         return 0
 #|
-#|     r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
+#|     if args.limb == "32":
+#|         r = bench32(args.curves, args.b1, args.reps, ctx)
+#|         r["B2"] = 0
+#|     else:
+#|         r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
 #|     stage = "stage 1+2" if r["stage2"] else "stage 1"
-#|     print("\n%s  B1=%d%s  work items=%d  reps=%d"
-#|           % (stage, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
+#|     print("\n%s  (%s-bit limbs)  B1=%d%s  work items=%d  reps=%d"
+#|           % (stage, args.limb, r["B1"], ("  B2=%d" % r["B2"]) if r["stage2"] else "",
 #|              r["curves"], args.reps))
 #|     print("  kernel-only : best %.4f s  -> %s curves/sec"
 #|           % (r["kernel_best_s"], f"{r['kernel_cps']:,.0f}"))
@@ -82039,6 +82781,129 @@ if __name__ == "__main__":
 #|     return a;
 #| }
 
+#@ FILE code/gpu/mont32.cl 644 4205 0c9f3f7d5e8455141c34bdce7926dc5571c0667e0abc6a8b86ccaf93d79f1e58 text
+#| /*
+#|  * 128-bit Montgomery arithmetic with 32-bit limbs, for GPUs whose 64-bit
+#|  * integer multiply is synthesized (AMD GCN / Vega, most consumer/pro cards).
+#|  * Every partial product here is a 32x32 -> 64 multiply (native `uint*uint`
+#|  * widened to `ulong`), so it needs no `mul_hi(ulong,...)`. Same math as
+#|  * mont128.cl (CADO modredc_2ul2), different limb width.
+#|  *
+#|  * A 128-bit value is uint4 = (limb0..limb3), little-endian. Modulus n < 2^127
+#|  * odd; R = 2^128; ninv = -n^{-1} mod 2^32. Residues are in Montgomery form.
+#|  *
+#|  * NLIMBS is fixed at 4 (128-bit). The CIOS loops are written generically over
+#|  * NLIMBS so the same code can be widened later.
+#|  */
+#| #define NLIMBS 4
+#|
+#| typedef uint4 u128_32;
+#|
+#| inline void ld(uint *l, u128_32 a) { l[0]=a.x; l[1]=a.y; l[2]=a.z; l[3]=a.w; }
+#| inline u128_32 st(const uint *l) { return (u128_32)(l[0], l[1], l[2], l[3]); }
+#|
+#| inline int geq(const uint *a, const uint *b) {
+#|     for (int i = NLIMBS - 1; i >= 0; i--) {
+#|         if (a[i] != b[i]) return a[i] > b[i];
+#|     }
+#|     return 1;
+#| }
+#|
+#| inline void sub_in(uint *a, const uint *b) {   /* a -= b (assumes a>=b) */
+#|     ulong borrow = 0;
+#|     for (int i = 0; i < NLIMBS; i++) {
+#|         ulong d = (ulong)a[i] - b[i] - borrow;
+#|         a[i] = (uint)d;
+#|         borrow = (d >> 63) & 1;   /* set if underflow */
+#|     }
+#| }
+#|
+#| inline u128_32 m32_add(u128_32 A, u128_32 B, u128_32 N) {
+#|     uint a[NLIMBS], b[NLIMBS], n[NLIMBS];
+#|     ld(a, A); ld(b, B); ld(n, N);
+#|     ulong c = 0;
+#|     for (int i = 0; i < NLIMBS; i++) { ulong s = (ulong)a[i] + b[i] + c; a[i] = (uint)s; c = s >> 32; }
+#|     if (c || geq(a, n)) sub_in(a, n);
+#|     return st(a);
+#| }
+#|
+#| inline u128_32 m32_sub(u128_32 A, u128_32 B, u128_32 N) {
+#|     uint a[NLIMBS], b[NLIMBS], n[NLIMBS];
+#|     ld(a, A); ld(b, B); ld(n, N);
+#|     if (geq(a, b)) { sub_in(a, b); return st(a); }
+#|     /* a + n - b */
+#|     ulong c = 0;
+#|     for (int i = 0; i < NLIMBS; i++) { ulong s = (ulong)a[i] + n[i] + c; a[i] = (uint)s; c = s >> 32; }
+#|     sub_in(a, b);
+#|     return st(a);
+#| }
+#|
+#| /* CIOS Montgomery multiply, 32-bit limbs, 64-bit accumulator. */
+#| inline u128_32 m32_mul(u128_32 A, u128_32 B, u128_32 N, uint ninv) {
+#|     uint a[NLIMBS], b[NLIMBS], n[NLIMBS];
+#|     ld(a, A); ld(b, B); ld(n, N);
+#|     uint t[NLIMBS + 2];
+#|     for (int i = 0; i < NLIMBS + 2; i++) t[i] = 0;
+#|
+#|     for (int i = 0; i < NLIMBS; i++) {
+#|         ulong C = 0;
+#|         uint bi = b[i];
+#|         for (int j = 0; j < NLIMBS; j++) {
+#|             ulong p = (ulong)a[j] * bi + t[j] + C;
+#|             t[j] = (uint)p;
+#|             C = p >> 32;
+#|         }
+#|         ulong s = (ulong)t[NLIMBS] + C;
+#|         t[NLIMBS] = (uint)s;
+#|         t[NLIMBS + 1] = (uint)(s >> 32);
+#|
+#|         uint m = t[0] * ninv;
+#|         C = ((ulong)m * n[0] + t[0]) >> 32;   /* low limb becomes 0 */
+#|         for (int j = 1; j < NLIMBS; j++) {
+#|             ulong p = (ulong)m * n[j] + t[j] + C;
+#|             t[j - 1] = (uint)p;
+#|             C = p >> 32;
+#|         }
+#|         s = (ulong)t[NLIMBS] + C;
+#|         t[NLIMBS - 1] = (uint)s;
+#|         t[NLIMBS] = t[NLIMBS + 1] + (uint)(s >> 32);
+#|     }
+#|
+#|     uint r[NLIMBS];
+#|     for (int i = 0; i < NLIMBS; i++) r[i] = t[i];
+#|     if (t[NLIMBS] || geq(r, n)) sub_in(r, n);
+#|     return st(r);
+#| }
+#|
+#| inline u128_32 m32_sqr(u128_32 a, u128_32 n, uint ninv) { return m32_mul(a, a, n, ninv); }
+#|
+#| /* binary gcd of two 128-bit integers (not in Montgomery form) */
+#| inline int is_zero(const uint *a) { return (a[0]|a[1]|a[2]|a[3]) == 0; }
+#| inline void shr1(uint *a) {
+#|     for (int i = 0; i < NLIMBS - 1; i++) a[i] = (a[i] >> 1) | (a[i+1] << 31);
+#|     a[NLIMBS-1] >>= 1;
+#| }
+#| inline void shl1(uint *a) {
+#|     for (int i = NLIMBS - 1; i > 0; i--) a[i] = (a[i] << 1) | (a[i-1] >> 31);
+#|     a[0] <<= 1;
+#| }
+#| inline u128_32 m32_gcd(u128_32 A, u128_32 B) {
+#|     uint a[NLIMBS], b[NLIMBS];
+#|     ld(a, A); ld(b, B);
+#|     if (is_zero(a)) return B;
+#|     if (is_zero(b)) return A;
+#|     int shift = 0;
+#|     while (((a[0] | b[0]) & 1) == 0) { shr1(a); shr1(b); shift++; }
+#|     while ((a[0] & 1) == 0) shr1(a);
+#|     do {
+#|         while ((b[0] & 1) == 0) shr1(b);
+#|         if (geq(a, b)) { uint tmp[NLIMBS]; for(int i=0;i<NLIMBS;i++){tmp[i]=a[i];a[i]=b[i];b[i]=tmp[i];} }
+#|         sub_in(b, a);   /* b = b - a, b was >= a */
+#|     } while (!is_zero(b));
+#|     for (int i = 0; i < shift; i++) shl1(a);
+#|     return st(a);
+#| }
+
 #@ FILE code/gpu/test_mont128.py 644 4103 6e9efb2f26b5fe9d6b4b23a4909df3d5fc3b8bf20107d21ea9a908870dd3cb07 text
 #| #!/usr/bin/env python3
 #| """Unit-test the 128-bit Montgomery ops in mont128.cl against Python."""
@@ -82143,6 +83008,89 @@ if __name__ == "__main__":
 #|         ok &= badg == 0
 #|         print(f"trial {trial}: n={n.bit_length()}b  mul_bad={bad} addsub_bad={badas} gcd_bad={badg}")
 #|
+#|     print("ALL OK" if ok else "FAILURES")
+#|     return 0 if ok else 1
+#|
+#|
+#| if __name__ == "__main__":
+#|     raise SystemExit(main())
+
+#@ FILE code/gpu/test_mont32.py 644 3387 877ce7cc59f58bd1ef4dfb03cd00da916ed1b3b14d925d15011a39de01820346 text
+#| #!/usr/bin/env python3
+#| """Unit-test the 32-bit-limb 128-bit Montgomery ops in mont32.cl vs Python."""
+#| import os
+#| import random
+#| import numpy as np
+#| import pyopencl as cl
+#|
+#| HERE = os.path.dirname(os.path.abspath(__file__))
+#| MASK32 = (1 << 32) - 1
+#|
+#|
+#| def to4(x):
+#|     return np.array([(x >> (32 * i)) & MASK32 for i in range(4)], dtype=np.uint32)
+#|
+#|
+#| def from4(a):
+#|     return sum(int(v) << (32 * i) for i, v in enumerate(a))
+#|
+#|
+#| KERNEL = open(os.path.join(HERE, "mont32.cl")).read() + r"""
+#| __kernel void t_mul(__global const uint4* a, __global const uint4* b,
+#|                     uint4 n, uint ninv, __global uint4* out) {
+#|     int i = get_global_id(0); out[i] = m32_mul(a[i], b[i], n, ninv);
+#| }
+#| __kernel void t_as(__global const uint4* a, __global const uint4* b,
+#|                    uint4 n, __global uint4* add, __global uint4* sub) {
+#|     int i = get_global_id(0); add[i]=m32_add(a[i],b[i],n); sub[i]=m32_sub(a[i],b[i],n);
+#| }
+#| __kernel void t_gcd(__global const uint4* a, __global const uint4* b, __global uint4* o){
+#|     int i=get_global_id(0); o[i]=m32_gcd(a[i],b[i]);
+#| }
+#| """
+#|
+#|
+#| def main():
+#|     ctx = cl.create_some_context()
+#|     q = cl.CommandQueue(ctx)
+#|     prog = cl.Program(ctx, KERNEL).build()
+#|     mf = cl.mem_flags
+#|     rng = random.Random(999)
+#|     N = 20000
+#|     import math
+#|     ok = True
+#|     for trial in range(6):
+#|         n = rng.getrandbits(rng.choice([64, 96, 127])) | 1
+#|         R = 1 << 128
+#|         ninv = (-pow(n, -1, 1 << 32)) & MASK32
+#|         a = [rng.randrange(n) for _ in range(N)]
+#|         b = [rng.randrange(n) for _ in range(N)]
+#|         aM = [(x * R) % n for x in a]
+#|         bM = [(x * R) % n for x in b]
+#|         A = np.stack([to4(x) for x in aM]); B = np.stack([to4(x) for x in bM])
+#|         dA = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=A)
+#|         dB = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=B)
+#|         nvec = to4(n)
+#|         out = np.empty_like(A); dOut = cl.Buffer(ctx, mf.WRITE_ONLY, out.nbytes)
+#|         cl.Kernel(prog, "t_mul")(q, (N,), None, dA, dB, nvec, np.uint32(ninv), dOut)
+#|         cl.enqueue_copy(q, out, dOut); q.finish()
+#|         Rinv = pow(R, -1, n)
+#|         bad = sum(1 for i in range(N) if from4(out[i]) != (aM[i]*bM[i]*Rinv) % n)
+#|         add = np.empty_like(A); sub = np.empty_like(A)
+#|         dAdd = cl.Buffer(ctx, mf.WRITE_ONLY, add.nbytes); dSub = cl.Buffer(ctx, mf.WRITE_ONLY, sub.nbytes)
+#|         cl.Kernel(prog, "t_as")(q, (N,), None, dA, dB, nvec, dAdd, dSub)
+#|         cl.enqueue_copy(q, add, dAdd); cl.enqueue_copy(q, sub, dSub); q.finish()
+#|         bas = sum(1 for i in range(N)
+#|                   if from4(add[i]) != (aM[i]+bM[i]) % n or from4(sub[i]) != (aM[i]-bM[i]) % n)
+#|         gA = np.stack([to4(x) for x in a]); gB = np.stack([to4(x) for x in b])
+#|         dGA = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=gA)
+#|         dGB = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=gB)
+#|         g = np.empty_like(gA); dG = cl.Buffer(ctx, mf.WRITE_ONLY, g.nbytes)
+#|         cl.Kernel(prog, "t_gcd")(q, (N,), None, dGA, dGB, dG)
+#|         cl.enqueue_copy(q, g, dG); q.finish()
+#|         bg = sum(1 for i in range(N) if from4(g[i]) != math.gcd(a[i], b[i]))
+#|         ok &= (bad == 0 and bas == 0 and bg == 0)
+#|         print(f"trial {trial}: n={n.bit_length()}b mul_bad={bad} addsub_bad={bas} gcd_bad={bg}")
 #|     print("ALL OK" if ok else "FAILURES")
 #|     return 0 if ok else 1
 #|
@@ -102343,7 +103291,7 @@ if __name__ == "__main__":
 #|          return self.submatrices[i][j].M
 #$  $
 
-NSNF_EOF_3dfac1f219a68e2e
+NSNF_EOF_8ab207770c224c4b
 
 # ===== FILE: paper.pdf (725438 bytes, xz+base64, 708692 bytes compressed) =====
 f 'paper.pdf' 644 725438 80638371e99cb53a49fa87190c11d82684c0054a73bbace6141858414b9c9466 b64xz <<'NSNF_EOF_80638371e99cb53a'
