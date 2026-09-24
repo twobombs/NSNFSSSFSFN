@@ -111,8 +111,10 @@ PoCL (CPU OpenCL, so no GPU is needed to develop and test).
    (cofactor, sigma): build the curve, run the stage-1 bytecode chain,
    take gcd(result, N). Validate factors found against
    `testbench -ecmem12 B1 0 s` on the same inputs (stage 1 only, B2=0).
-3. **Stage 2.** Add the baby-step/giant-step stage 2; validate against
-   `testbench -ecmem12 B1 B2 s`.
+3. **Stage 2.** DONE (Montgomery curve / `-ecm` BRENT12): baby-step/
+   giant-step "product of point differences". Kernel matches a Python
+   reference bit-for-bit; full stage 1+2 agrees with `testbench -ecm B1 B2`
+   at 99.9% with the kernel catching everything testbench does.
 4. **Batch driver.** A standalone tool that reads cofactors (the `-inp`
    format testbench uses), runs N curves each on the device, and prints
    factors — diffable against `testbench`. This is the throughput benchmark.

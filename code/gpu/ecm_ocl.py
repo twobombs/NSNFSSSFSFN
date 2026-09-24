@@ -153,6 +153,136 @@ def run(cofactors, sigmas, B1, ctx=None):
     return found, items, xz, ebits
 
 
+def stage2_pairs(B1, B2, D):
+    """For each prime in (B1,B2], (j,k) with p = 2D*j +/- k, 1<=k<=D."""
+    pj, pk = [], []
+    twoD = 2 * D
+    for p in primerange(B1 + 1, B2 + 1):
+        j = (p + D) // twoD           # nearest giant index
+        k = abs(p - twoD * j)
+        if k == 0 or k > D:
+            continue                  # (shouldn't happen for D>=1, prime>2D)
+        pj.append(j)
+        pk.append(k)
+    n_giant = max(pj) if pj else 1
+    return pj, pk, n_giant
+
+
+def _ref_stage2(Qxz, n, b, D, pj, pk):
+    """Pure-Python reference matching ecm_stage2.cl."""
+    def dbl(P):
+        return ref_dbl(P, n, b)
+
+    def add(P, Q, Dp):
+        return ref_add(P, Q, Dp, n)
+    Q = Qxz
+    B = {1: Q}
+    if D >= 2:
+        B[2] = dbl(Q)
+    for k in range(3, D + 1):
+        B[k] = add(B[k - 1], Q, B[k - 2])
+    step = dbl(B[D])
+    G = {1: step}
+    ng = max(pj) if pj else 1
+    if ng >= 2:
+        G[2] = dbl(step)
+    for j in range(3, ng + 1):
+        G[j] = add(G[j - 1], step, G[j - 2])
+    acc = None
+    for j, k in zip(pj, pk):
+        diff = (G[j][0] * B[k][1] - B[k][0] * G[j][1]) % n
+        acc = diff if acc is None else acc * diff % n
+    if acc is None:
+        return 1
+    return _gcd(acc, n)
+
+
+def run_full(cofactors, sigmas, B1, B2, D=32, ctx=None):
+    """Stage 1 then stage 2 on the device. Returns (found, details)."""
+    ctx = ctx or cl.create_some_context()
+    q = cl.CommandQueue(ctx)
+    src = (open(os.path.join(HERE, "mont128.cl")).read() + "\n" +
+           open(os.path.join(HERE, "ecm.cl")).read() + "\n" +
+           open(os.path.join(HERE, "ecm_stage2.cl")).read())
+
+    E = stage1_E(B1)
+    ebits = ebits_msb(E)
+    pj, pk, n_giant = stage2_pairs(B1, B2, D)
+    # size the per-work-item tables to the actual need (private memory is scarce)
+    prog = cl.Program(ctx, src).build(
+        options=["-DMAXD=%d" % (D + 1), "-DMAXG=%d" % (n_giant + 1)])
+    mf = cl.mem_flags
+
+    items = []
+    for ci, n in enumerate(cofactors):
+        R = 1 << 128
+        invm = (-pow(n, -1, 1 << 64)) & MASK64
+        for sg in sigmas:
+            bs = brent_suyama(n, sg)
+            if bs[0] == "factor":
+                continue
+            x0, z0, b = bs
+            items.append((n, invm, x0 * R % n, z0 * R % n, b * R % n, ci, sg))
+    cnt = len(items)
+
+    def col(f, dt):
+        return np.array([f(it) for it in items], dtype=dt)
+    n_np = np.stack([u128_np(it[0]) for it in items]).astype(np.uint64)
+    invm_np = col(lambda it: it[1], np.uint64)
+    x0_np = np.stack([u128_np(it[2]) for it in items]).astype(np.uint64)
+    z0_np = np.stack([u128_np(it[3]) for it in items]).astype(np.uint64)
+    b_np = np.stack([u128_np(it[4]) for it in items]).astype(np.uint64)
+    eb_np = np.array(ebits, dtype=np.uint8)
+
+    pj_np = np.array(pj, dtype=np.uint32)
+    pk_np = np.array(pk, dtype=np.uint32)
+    d_pj = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pj_np)
+    d_pk = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pk_np)
+    eb_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=eb_np)
+    k1 = cl.Kernel(prog, "ecm_stage1")
+    k2 = cl.Kernel(prog, "ecm_stage2")
+
+    xz = np.empty((cnt * 2, 2), dtype=np.uint64)
+    g1 = np.empty((cnt, 2), dtype=np.uint64)
+    g2 = np.empty((cnt, 2), dtype=np.uint64)
+
+    # Dispatch in chunks: PoCL is unstable with very large private-memory
+    # kernels over huge global sizes, and a real batch would be chunked too.
+    CHUNK = 1024
+    for s in range(0, cnt, CHUNK):
+        e_ = min(s + CHUNK, cnt)
+        m = e_ - s
+
+        def cbuf(a):
+            return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                             hostbuf=np.ascontiguousarray(a))
+        d_n = cbuf(n_np[s:e_]); d_invm = cbuf(invm_np[s:e_])
+        d_x0 = cbuf(x0_np[s:e_]); d_z0 = cbuf(z0_np[s:e_]); d_b = cbuf(b_np[s:e_])
+        d_xz = cl.Buffer(ctx, mf.READ_WRITE, m * 2 * 16)
+        d_g1 = cl.Buffer(ctx, mf.WRITE_ONLY, m * 16)
+        d_g2 = cl.Buffer(ctx, mf.WRITE_ONLY, m * 16)
+        k1.set_args(d_n, d_invm, d_x0, d_z0, d_b, eb_buf,
+                    np.uint32(len(ebits)), d_xz, d_g1)
+        cl.enqueue_nd_range_kernel(q, k1, (m,), None)
+        k2.set_args(d_n, d_invm, d_b, d_xz, np.uint32(D), np.uint32(n_giant),
+                    d_pj, d_pk, np.uint32(len(pj)), d_g2)
+        cl.enqueue_nd_range_kernel(q, k2, (m,), None)
+        cl.enqueue_copy(q, xz[s * 2:e_ * 2], d_xz)
+        cl.enqueue_copy(q, g1[s:e_], d_g1)
+        cl.enqueue_copy(q, g2[s:e_], d_g2)
+        q.finish()
+
+    found = []
+    for idx, it in enumerate(items):
+        n = it[0]
+        for garr in (g1, g2):
+            gg = np_u128(garr[idx])
+            if 1 < gg < n and n % gg == 0:
+                found.append((it[5], it[6], gg))
+                break
+    return found, items, xz, g1, g2, (ebits, pj, pk, D)
+
+
 def _self_test():
     rng = random.Random(2024)
 
@@ -192,7 +322,37 @@ def _self_test():
             if mism <= 3:
                 print("  ladder mismatch item", idx)
     print("kernel ladder == python reference for all %d items: %s" % (len(items), mism == 0))
-    return not bad and mism == 0
+
+    # ---- stage 2 ----
+    B2 = 5000
+    D = 32
+    full = run_full(cof, sigmas, B1, B2, D=D)
+    f_found, f_items, f_xz, g1, g2, (ebits2, pj, pk, Dd) = full
+    R = 1 << 128
+    # kernel stage-2 gcd == python reference stage-2 gcd, per item
+    s2mis = 0
+    for idx, it in enumerate(f_items):
+        n, invm = it[0], it[1]
+        b = it[4] * pow(R, -1, n) % n
+        Qx = np_u128(f_xz[2 * idx]) * pow(R, -1, n) % n
+        Qz = np_u128(f_xz[2 * idx + 1]) * pow(R, -1, n) % n
+        ref = _ref_stage2((Qx, Qz), n, b, D, pj, pk)
+        ker = np_u128(g2[idx])
+        # both reduce to the same divisor structure (ref is a gcd, ker a gcd)
+        if _gcd(ref, n) != ker and ref != ker:
+            s2mis += 1
+            if s2mis <= 3:
+                print("  stage2 mismatch item", idx, ref, ker)
+    print("kernel stage2 == python reference for all %d items: %s" % (len(f_items), s2mis == 0))
+
+    # stage 1+2 finds strictly more (cofactor,sigma) than stage 1 alone
+    s1_hits = {(it[5], it[6]) for idx, it in enumerate(f_items)
+               if 1 < np_u128(g1[idx]) < it[0] and it[0] % np_u128(g1[idx]) == 0}
+    s12_hits = {(ci, sg) for ci, sg, f in f_found}
+    print("stage1 hits=%d  stage1+2 hits=%d  (stage2 added %d)"
+          % (len(s1_hits), len(s12_hits), len(s12_hits - s1_hits)))
+
+    return not bad and mism == 0 and s2mis == 0 and len(s12_hits) > len(s1_hits)
 
 
 if __name__ == "__main__":
