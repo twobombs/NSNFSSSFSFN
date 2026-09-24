@@ -154,13 +154,19 @@ def bench(curves, B1, B2, D, reps, ctx):
     }
 
 
-def bench32(curves, B1, reps, ctx):
-    """Stage-1 throughput of the 32-bit-limb kernel (ecm32.cl)."""
+def bench32(curves, B1, B2, D, reps, ctx):
+    """Throughput of the 32-bit-limb kernels (ecm32.cl [+ ecm32_stage2.cl])."""
     MASK32 = (1 << 32) - 1
     q = cl.CommandQueue(ctx)
-    src = (open(os.path.join(e.HERE, "mont32.cl")).read() + "\n" +
-           open(os.path.join(e.HERE, "ecm32.cl")).read())
-    prog = cl.Program(ctx, src).build()
+    do_stage2 = B2 > B1
+    srcs = [open(os.path.join(e.HERE, "mont32.cl")).read(),
+            open(os.path.join(e.HERE, "ecm32.cl")).read()]
+    if do_stage2:
+        srcs.append(open(os.path.join(e.HERE, "ecm32_stage2.cl")).read())
+    src = "\n".join(srcs)
+    pj, pk, n_giant = e.stage2_pairs(B1, B2, D) if do_stage2 else ([], [], 1)
+    prog = cl.Program(ctx, src).build(
+        options=["-DMAXD=%d" % (D + 1), "-DMAXG=%d" % (n_giant + 1)])
     mf = cl.mem_flags
     rng = random.Random(1234)
     cofs = _rand_cofactors(curves, rng)
@@ -192,22 +198,32 @@ def bench32(curves, B1, reps, ctx):
     def buf(a):
         return cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=np.ascontiguousarray(a))
     d_n, d_ninv, d_x0, d_z0, d_b, d_eb = map(buf, (n_np, ninv_np, x0_np, z0_np, b_np, eb_np))
-    d_xz = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 2 * 16)
+    d_xz = cl.Buffer(ctx, mf.READ_WRITE, cnt * 2 * 16)
     d_g = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
     k = cl.Kernel(prog, "ecm32_stage1")
     k.set_args(d_n, d_ninv, d_x0, d_z0, d_b, d_eb, np.uint32(len(ebits)), d_xz, d_g)
+    k2 = d_g2 = None
+    if do_stage2:
+        d_pj = buf(np.array(pj, dtype=np.uint32))
+        d_pk = buf(np.array(pk, dtype=np.uint32))
+        d_g2 = cl.Buffer(ctx, mf.WRITE_ONLY, cnt * 16)
+        k2 = cl.Kernel(prog, "ecm32_stage2")
+        k2.set_args(d_n, d_ninv, d_b, d_xz, np.uint32(D), np.uint32(n_giant),
+                    d_pj, d_pk, np.uint32(len(pj)), d_g2)
     CHUNK = 4096
 
     def dispatch():
         for s in range(0, cnt, CHUNK):
             m = min(CHUNK, cnt - s)
             cl.enqueue_nd_range_kernel(q, k, (m,), None, global_work_offset=(s,))
+            if do_stage2:
+                cl.enqueue_nd_range_kernel(q, k2, (m,), None, global_work_offset=(s,))
         q.finish()
     dispatch()
     best = min((_timed(dispatch) for _ in range(reps)))
-    return {"curves": cnt, "B1": B1, "stage2": False, "kernel_best_s": best,
-            "host_prep_s": host_prep, "kernel_cps": cnt / best,
-            "endtoend_cps": cnt / (best + host_prep)}
+    return {"curves": cnt, "B1": B1, "B2": B2, "stage2": do_stage2,
+            "kernel_best_s": best, "host_prep_s": host_prep,
+            "kernel_cps": cnt / best, "endtoend_cps": cnt / (best + host_prep)}
 
 
 def _timed(fn):
@@ -239,8 +255,7 @@ def main():
         return 0
 
     if args.limb == "32":
-        r = bench32(args.curves, args.b1, args.reps, ctx)
-        r["B2"] = 0
+        r = bench32(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
     else:
         r = bench(args.curves, args.b1, args.b2, args.d, args.reps, ctx)
     stage = "stage 1+2" if r["stage2"] else "stage 1"
