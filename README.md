@@ -46,3 +46,14 @@ The 1024-bit computation we did took significant effort (see our paper for the h
 Change your key.
 13. **When did you do this computation?** \
 The 1024-bit size took us several months. It finished on August 31, 2026.
+
+
+### Single-file edition
+
+`NSNFSSSFSFN.bundle.sh` contains the entire repository (code, configs, patches, build/run pipelines, CI workflow, data, logs and the paper) as one self-extracting, checksum-verified file:
+```bash
+bash NSNFSSSFSFN.bundle.sh --list                  # show contents
+bash NSNFSSSFSFN.bundle.sh -C NSNFSSSFSFN          # extract
+bash NSNFSSSFSFN.bundle.sh -C NSNFSSSFSFN --with-submodule   # also fetch cado-nfs at the pinned commit
+```
+Regenerate it after changing any file with `python3 tools/make_single_file.py`; the `single-file bundle` GitHub workflow fails if it is stale.
